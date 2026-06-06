@@ -1,0 +1,140 @@
+#!/usr/bin/python3
+
+import argparse
+import sys
+from pathlib import Path
+
+HELPERS_DIR = Path(__file__).resolve().parent / "helpers"
+sys.path.insert(0, str(HELPERS_DIR))
+from nagent_llm import add_llm_arguments, generate_with_upload, resolve_from_args
+
+MAX_FILE_BYTES = 50 * 1024 * 1024
+
+IMAGE_EXTENSIONS = frozenset({".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp"})
+DOCUMENT_EXTENSIONS = frozenset(
+    {
+        ".pdf",
+        ".doc",
+        ".docx",
+        ".odt",
+        ".rtf",
+        ".xlsx",
+        ".xls",
+        ".csv",
+        ".tsv",
+        ".pptx",
+        ".ppt",
+        ".txt",
+        ".md",
+        ".json",
+        ".yaml",
+        ".yml",
+        ".xml",
+        ".py",
+        ".js",
+        ".html",
+        ".htm",
+        ".css",
+        ".c",
+        ".cpp",
+        ".cc",
+        ".cxx",
+        ".h",
+        ".hpp",
+        ".hh",
+        ".java",
+        ".php",
+        ".ts",
+        ".rb",
+        ".sh",
+        ".sql",
+        ".log",
+        ".ini",
+        ".toml",
+        ".cfg",
+        ".conf",
+    }
+)
+UNSUPPORTED_EXTENSIONS = frozenset({".zip"})
+
+
+def supported_file_types_help() -> str:
+    images = ", ".join(ext.lstrip(".") for ext in sorted(IMAGE_EXTENSIONS))
+    documents = ", ".join(ext.lstrip(".") for ext in sorted(DOCUMENT_EXTENSIONS))
+    max_mb = MAX_FILE_BYTES // (1024 * 1024)
+    return f"""Supported file types:
+  Images: {images}
+  Documents and code: {documents}
+  Archives (.zip) are not supported; extract files first.
+  Max file size: {max_mb} MB per file."""
+
+
+def classify_file(path: Path) -> str:
+    extension = path.suffix.lower()
+    if extension in UNSUPPORTED_EXTENSIONS:
+        print(
+            f"Error: {extension} is not supported. "
+            "Extract the archive and upload individual files.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    if extension in IMAGE_EXTENSIONS:
+        return "image"
+    if extension in DOCUMENT_EXTENSIONS:
+        return "document"
+    print(
+        f"Error: unsupported file type {extension!r}. "
+        f"Supported images: {', '.join(sorted(IMAGE_EXTENSIONS))}. "
+        f"Supported documents include: {', '.join(sorted(DOCUMENT_EXTENSIONS))}.",
+        file=sys.stderr,
+    )
+    sys.exit(1)
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description=(
+            "Upload a file and prompt an LLM via the configured provider. "
+            "Loads provider and model from ~/.nagent/config.json (or NAGENT_CONFIG) when present."
+        ),
+        epilog=supported_file_types_help(),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument(
+        "--file",
+        required=True,
+        help="Path to the artifact file to upload.",
+    )
+    parser.add_argument(
+        "--prompt",
+        required=True,
+        help="Prompt text describing what to do with the file.",
+    )
+    add_llm_arguments(parser)
+    args = parser.parse_args()
+
+    path = Path(args.file)
+    if not path.is_file():
+        print(f"Error: file not found: {path}", file=sys.stderr)
+        sys.exit(1)
+
+    size = path.stat().st_size
+    if size > MAX_FILE_BYTES:
+        print(
+            f"Error: file exceeds limit of {MAX_FILE_BYTES} bytes: {path}",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    classify_file(path)
+    provider, model = resolve_from_args(args)
+
+    try:
+        print(generate_with_upload(path, args.prompt, provider, model))
+    except Exception as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()

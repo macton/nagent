@@ -4,21 +4,24 @@ import argparse
 import sys
 from pathlib import Path
 
-from openai import OpenAI
+HELPERS_DIR = Path(__file__).resolve().parent / "helpers"
+sys.path.insert(0, str(HELPERS_DIR))
+from nagent_llm import add_llm_arguments, generate_text, resolve_from_args
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Send text to an LLM and print the response.")
+    parser = argparse.ArgumentParser(
+        description=(
+            "Send text to an LLM and print the response. "
+            "Loads provider and model from ~/.nagent/config.json (or NAGENT_CONFIG) when present."
+        ),
+    )
     parser.add_argument(
         "--file",
         required=True,
         help="Path to a text file whose contents are sent as the message.",
     )
-    parser.add_argument(
-        "--model",
-        default="gpt-5.5",
-        help='Model to use (default: "gpt-5.5").',
-    )
+    add_llm_arguments(parser)
     args = parser.parse_args()
 
     path = Path(args.file)
@@ -26,15 +29,14 @@ def main() -> None:
         print(f"Error: file not found: {path}", file=sys.stderr)
         sys.exit(1)
 
+    provider, model = resolve_from_args(args)
     message = path.read_text(encoding="utf-8")
 
-    client = OpenAI()
-    response = client.responses.create(
-        model=args.model,
-        input=message,
-    )
-
-    print(response.output_text)
+    try:
+        print(generate_text(message, provider, model))
+    except Exception as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        sys.exit(1)
 
 
 if __name__ == "__main__":

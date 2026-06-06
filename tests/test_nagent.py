@@ -12,6 +12,7 @@ from pathlib import Path
 BIN = Path(__file__).resolve().parent.parent / "bin"
 NAGENT = BIN / "nagent"
 NAGENT_LLM_TEXT = BIN / "nagent-llm-text"
+NAGENT_LLM_UPLOAD = BIN / "nagent-llm-upload"
 
 
 def load_nagent_module():
@@ -22,6 +23,69 @@ def load_nagent_module():
     module = importlib.util.module_from_spec(spec)
     loader.exec_module(module)
     return module
+
+
+def load_nagent_llm_module():
+    from importlib.machinery import SourceFileLoader
+
+    loader = SourceFileLoader("nagent_llm_mod", str(BIN / "helpers" / "nagent_llm.py"))
+    spec = importlib.util.spec_from_loader("nagent_llm_mod", loader)
+    module = importlib.util.module_from_spec(spec)
+    loader.exec_module(module)
+    return module
+
+
+def load_nagent_llm_upload_module():
+    from importlib.machinery import SourceFileLoader
+
+    loader = SourceFileLoader("nagent_llm_upload_mod", str(NAGENT_LLM_UPLOAD))
+    spec = importlib.util.spec_from_loader("nagent_llm_upload_mod", loader)
+    module = importlib.util.module_from_spec(spec)
+    loader.exec_module(module)
+    return module
+
+
+class NagentLlmUploadTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.mod = load_nagent_llm_upload_module()
+
+    def test_classify_image_and_document(self):
+        self.assertEqual(self.mod.classify_file(Path("photo.png")), "image")
+        self.assertEqual(self.mod.classify_file(Path("report.pdf")), "document")
+        self.assertEqual(self.mod.classify_file(Path("data.csv")), "document")
+
+    def test_classify_zip_exits(self):
+        with self.assertRaises(SystemExit) as ctx:
+            self.mod.classify_file(Path("archive.zip"))
+        self.assertEqual(ctx.exception.code, 1)
+
+    def test_help_lists_supported_file_types(self):
+        result = subprocess.run(
+            [str(NAGENT_LLM_UPLOAD), "--help"],
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(result.returncode, 0)
+        self.assertIn("Supported file types:", result.stdout)
+        self.assertIn("Images:", result.stdout)
+        self.assertIn("pdf", result.stdout)
+        self.assertIn("png", result.stdout)
+
+    def test_missing_file_cli(self):
+        result = subprocess.run(
+            [
+                str(NAGENT_LLM_UPLOAD),
+                "--file",
+                "/nonexistent/upload.txt",
+                "--prompt",
+                "summarize",
+            ],
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("file not found", result.stderr)
 
 
 class ParseResponseTests(unittest.TestCase):
@@ -112,7 +176,7 @@ class ActionTests(unittest.TestCase):
                 self.mod.execute_agent(
                     "do task",
                     root,
-                    "gpt-5.5",
+                    self.mod.LlmSettings(provider="openai", model="gpt-5.5"),
                     NAGENT,
                     "parent-conv",
                     "4242",
@@ -120,6 +184,7 @@ class ActionTests(unittest.TestCase):
 
             pid_index = captured["cmd"].index("--pid")
             self.assertEqual(captured["cmd"][pid_index + 1], "4242")
+            self.assertEqual(captured["cmd"][captured["cmd"].index("--provider") + 1], "openai")
             self.assertIn("4242", captured["cmd"][captured["cmd"].index("--conversation") + 1])
 
 
@@ -142,6 +207,96 @@ class InitialTextTests(unittest.TestCase):
         self.assertIn("Delegated invocation:", text)
         self.assertIn("Still decompose and delegate", text)
         self.assertNotIn("User invocation:", text)
+
+    def test_git_repo_context_outside_repo(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertEqual(self.mod.git_repo_context(Path(tmp)), "")
+
+    def test_git_repo_context_in_repo(self):
+        with unittest.mock.patch.object(self.mod.subprocess, "run") as mock_run:
+            mock_run.side_effect = [
+                unittest.mock.Mock(returncode=0, stdout="/home/macton/nagent\n", stderr=""),
+                unittest.mock.Mock(
+                    returncode=0,
+                    stdout="origin\tgit@github.com:macton/nagent.git (fetch)\n"
+                    "origin\tgit@github.com:macton/nagent.git (push)\n",
+                    stderr="",
+                ),
+            ]
+            context = self.mod.git_repo_context(Path("/home/macton/nagent"))
+        self.assertIn("git toplevel: /home/macton/nagent", context)
+        self.assertIn("git remote -v:", context)
+        self.assertIn("origin\tgit@github.com:macton/nagent.git (fetch)", context)
+
+    def test_create_initial_text_includes_git_context_in_repo(self):
+        repo_root = Path(__file__).resolve().parent.parent
+        with unittest.mock.patch.object(self.mod, "git_repo_context", return_value="- git toplevel: /repo"):
+            text = self.mod.create_initial_text(
+                Path("/tmp/nagent-root"),
+                NAGENT.resolve(),
+                "user",
+                "conv",
+            )
+        self.assertIn("- git toplevel: /repo", text)
+
+    def test_create_initial_text_in_nagent_repo(self):
+        repo_root = Path(__file__).resolve().parent.parent
+        text = self.mod.create_initial_text(
+            repo_root / ".nagent",
+            NAGENT.resolve(),
+            "user",
+            "conv",
+        )
+        self.assertIn("git toplevel:", text)
+        self.assertIn("git remote -v:", text)
+        self.assertIn(str(repo_root), text)
+
+    def test_refresh_initial_context_replaces_existing_block(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            conversation_file = root / "conv"
+            conversation_file.write_text(
+                "header\n<initial_context>\n- cwd: /old/path\n</initial_context>\n<user-prompt>\nhello\n</user-prompt>\n",
+                encoding="utf-8",
+            )
+            with unittest.mock.patch.object(
+                self.mod,
+                "build_initial_context",
+                return_value="<initial_context>\n- cwd: /new/path\n</initial_context>",
+            ):
+                self.mod.refresh_initial_context(
+                    conversation_file,
+                    root,
+                    NAGENT.resolve(),
+                    "user",
+                    "conv",
+                )
+            contents = conversation_file.read_text(encoding="utf-8")
+            self.assertIn("- cwd: /new/path", contents)
+            self.assertNotIn("/old/path", contents)
+            self.assertIn("<user-prompt>", contents)
+            self.assertIn("hello", contents)
+
+    def test_refresh_initial_context_prepends_when_missing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            conversation_file = root / "conv"
+            conversation_file.write_text("<user-prompt>\nhello\n</user-prompt>\n", encoding="utf-8")
+            with unittest.mock.patch.object(
+                self.mod,
+                "build_initial_context",
+                return_value="<initial_context>\n- cwd: /new/path\n</initial_context>",
+            ):
+                self.mod.refresh_initial_context(
+                    conversation_file,
+                    root,
+                    NAGENT.resolve(),
+                    "user",
+                    "conv",
+                )
+            contents = conversation_file.read_text(encoding="utf-8")
+            self.assertTrue(contents.startswith("<initial_context>"))
+            self.assertIn("<user-prompt>", contents)
 
 
 class CliTests(unittest.TestCase):
@@ -206,7 +361,13 @@ class CliTests(unittest.TestCase):
                 encoding="utf-8",
             )
 
-            code = mod.run_agent_loop(conversation_file, root, "gpt-5.5", "hello", "4242")
+            code = mod.run_agent_loop(
+                conversation_file,
+                root,
+                mod.LlmSettings(provider="openai", model="gpt-5.5"),
+                "hello",
+                "4242",
+            )
             self.assertEqual(code, 0)
 
             self.assertTrue(conversation_file.exists())
@@ -234,7 +395,7 @@ class LiveIntegrationTests(unittest.TestCase):
 
         try:
             result = subprocess.run(
-                [str(NAGENT_LLM_TEXT), "--file", prompt_file, "--model", "gpt-5.5"],
+                [str(NAGENT_LLM_TEXT), "--file", prompt_file, "--provider", "openai", "--model", "gpt-5.5"],
                 capture_output=True,
                 text=True,
                 timeout=120,
@@ -253,6 +414,8 @@ class LiveIntegrationTests(unittest.TestCase):
                     tmp,
                     "--conversation",
                     "live-test",
+                    "--provider",
+                    "openai",
                     "--model",
                     "gpt-5.5",
                     "Respond only with <nagent-response>integration-ok</nagent-response>",
@@ -267,6 +430,100 @@ class LiveIntegrationTests(unittest.TestCase):
             conversation = Path(tmp) / "live-test"
             self.assertTrue(conversation.exists())
             self.assertIn("<user-prompt>", conversation.read_text(encoding="utf-8"))
+
+
+class NagentLlmConfigTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.mod = load_nagent_llm_module()
+
+    def test_resolve_settings_from_config_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = Path(tmp) / "config.json"
+            config_path.write_text(
+                '{"provider": "anthropic", "model": "claude-sonnet-4-6"}',
+                encoding="utf-8",
+            )
+            provider, model = self.mod.resolve_settings(config_path=config_path)
+            self.assertEqual(provider, "anthropic")
+            self.assertEqual(model, "claude-sonnet-4-6")
+
+    def test_cli_overrides_config(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = Path(tmp) / "config.json"
+            config_path.write_text('{"provider": "openai", "model": "gpt-5.5"}', encoding="utf-8")
+            provider, model = self.mod.resolve_settings(
+                provider="google",
+                model="gemini-2.5-pro",
+                config_path=config_path,
+            )
+            self.assertEqual(provider, "google")
+            self.assertEqual(model, "gemini-2.5-pro")
+
+    def test_missing_credentials_exits(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = Path(tmp) / "config.json"
+            message_path = Path(tmp) / "message.txt"
+            config_path.write_text('{"provider": "anthropic"}', encoding="utf-8")
+            message_path.write_text("hello", encoding="utf-8")
+            env = os.environ.copy()
+            env.pop("ANTHROPIC_API_KEY", None)
+            result = subprocess.run(
+                [
+                    str(NAGENT_LLM_TEXT),
+                    "--file",
+                    str(message_path),
+                    "--config",
+                    str(config_path),
+                ],
+                capture_output=True,
+                text=True,
+                env=env,
+            )
+            self.assertEqual(result.returncode, 1)
+            self.assertIn("missing credentials", result.stderr)
+
+    def test_resolve_settings_without_model_uses_provider_default(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = Path(tmp) / "config.json"
+            config_path.write_text('{"provider": "anthropic"}', encoding="utf-8")
+            provider, model = self.mod.resolve_settings(config_path=config_path)
+            self.assertEqual(provider, "anthropic")
+            self.assertEqual(model, self.mod.default_model("anthropic"))
+
+    def test_list_models_openai(self):
+        fake_models = [unittest.mock.Mock(id="gpt-5.5"), unittest.mock.Mock(id="gpt-4o")]
+
+        class FakeModels:
+            def list(self):
+                return fake_models
+
+        class FakeClient:
+            models = FakeModels()
+
+        mock_openai = unittest.mock.Mock(return_value=FakeClient())
+        with unittest.mock.patch.object(self.mod, "require_package", return_value=mock_openai):
+            models = self.mod.list_models("openai")
+        self.assertEqual(models, ["gpt-4o", "gpt-5.5"])
+
+    def test_utilities_autodetect_config_without_flags(self):
+        import argparse
+
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = Path(tmp) / "config.json"
+            config_path.write_text(
+                '{"provider": "openai", "model": "gpt-5.5"}',
+                encoding="utf-8",
+            )
+            args = argparse.Namespace(provider=None, model=None, config=None)
+            with unittest.mock.patch.dict(
+                os.environ,
+                {"OPENAI_API_KEY": "test-key", "NAGENT_CONFIG": str(config_path)},
+                clear=False,
+            ):
+                provider, model = self.mod.resolve_from_args(args)
+            self.assertEqual(provider, "openai")
+            self.assertEqual(model, "gpt-5.5")
 
 
 if __name__ == "__main__":
