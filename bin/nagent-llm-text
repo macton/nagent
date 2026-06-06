@@ -1,0 +1,41 @@
+#!/usr/bin/python3
+
+import argparse
+import sys
+from pathlib import Path
+
+from openai import OpenAI
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Send text to an LLM and print the response.")
+    parser.add_argument(
+        "--file",
+        required=True,
+        help="Path to a text file whose contents are sent as the message.",
+    )
+    parser.add_argument(
+        "--model",
+        default="gpt-5.5",
+        help='Model to use (default: "gpt-5.5").',
+    )
+    args = parser.parse_args()
+
+    path = Path(args.file)
+    if not path.is_file():
+        print(f"Error: file not found: {path}", file=sys.stderr)
+        sys.exit(1)
+
+    message = path.read_text(encoding="utf-8")
+
+    client = OpenAI()
+    response = client.responses.create(
+        model=args.model,
+        input=message,
+    )
+
+    print(response.output_text)
+
+
+if __name__ == "__main__":
+    main()

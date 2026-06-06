@@ -1,0 +1,489 @@
+#!/usr/bin/python3
+
+import argparse
+import os
+import re
+import socket
+import subprocess
+import sys
+import uuid
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Literal
+
+Invocation = Literal["user", "delegated"]
+TagType = Literal["response", "read", "write", "shell", "next", "agent"]
+
+TAG_PATTERNS: list[tuple[TagType, re.Pattern[str]]] = [
+    ("response", re.compile(r"<nagent-response>(.*?)</nagent-response>", re.DOTALL)),
+    ("read", re.compile(r'<nagent-read\s+path="([^"]*)"\s*/>')),
+    ("write", re.compile(r'<nagent-write\s+path="([^"]*)">(.*?)</nagent-write>', re.DOTALL)),
+    ("shell", re.compile(r"<nagent-shell>(.*?)</nagent-shell>", re.DOTALL)),
+    ("next", re.compile(r"<nagent-next>(.*?)</nagent-next>", re.DOTALL)),
+    ("agent", re.compile(r"<nagent-agent>(.*?)</nagent-agent>", re.DOTALL)),
+]
+
+MAX_FORMAT_RETRIES = 3
+NAGENT_LLM_TEXT = Path(__file__).resolve().parent / "nagent-llm-text"
+
+# Whole-output wrappers that may accidentally be nested inside
+# <nagent-response>.  These are internal protocol details and should not be
+# printed to the human user.
+USER_VISIBLE_WRAPPER_PATTERNS: list[re.Pattern[str]] = [
+    re.compile(r"\A\s*<nagent-response>(.*?)</nagent-response>\s*\Z", re.DOTALL),
+    re.compile(r"\A\s*<agent-response>(.*?)</agent-response>\s*\Z", re.DOTALL),
+]
+
+MARKDOWN_FENCE_PATTERN = re.compile(r"\A\s*```[^\n`]*\n(.*?)\n```\s*\Z", re.DOTALL)
+
+
+@dataclass
+class NagentTag:
+    kind: TagType
+    content: str
+    path: str | None = None
+
+
+def host_uname() -> str:
+    result = subprocess.run(
+        ["uname", "-a"],
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode == 0:
+        return result.stdout.strip()
+    return result.stderr.strip() or "unknown"
+
+
+def create_initial_text(
+    root: Path,
+    process_path: Path,
+    invocation: Invocation,
+    conversation_name: str,
+    parent_conversation: str | None = None,
+) -> str:
+    parent = parent_conversation or "none"
+    if invocation == "user":
+        role_instructions = """User invocation:
+- A human started this nagent instance from the command line.
+- Use <nagent-response> for human-facing replies.
+- Coordinate the overall request; delegate execution and research."""
+        response_hint = "Use <nagent-response> to communicate with the human user."
+    else:
+        role_instructions = """Delegated invocation:
+- A parent nagent spawned you for one scoped task (see <user-prompt>).
+- Use <nagent-response> for your final result to the parent—concise and structured, not conversational.
+- Still decompose and delegate when your scoped task is itself complex."""
+        response_hint = "Use <nagent-response> to return your final result to the parent nagent."
+
+    return f"""You are nagent, an autonomous agent. Respond only with one or more of these structured tags (no other text):
+
+<initial_context>
+Instance:
+- invocation: {invocation}
+- conversation: {conversation_name}
+- parent conversation: {parent}
+
+Environment:
+- nagent root: {root}
+- nagent process: {process_path}
+- cwd: {Path.cwd()}
+- host (uname -a): {host_uname()}
+
+Context management (every nagent instance, including sub-agents):
+- Each nagent instance has its own private conversation file; parent and child agents do not share context.
+- At every level, decompose complex or multistep work instead of doing it in one turn.
+- Spawn sub-agents with <nagent-agent> when work is:
+  - standalone and well-defined (specific edit, isolated fix, known command sequence)
+  - exploratory (filesystem probes, diagnostics, iterative shell work)
+  - research-heavy (many files, codebase search, comparing options)
+  - likely to produce large output (long logs, big reads) that would bloat your thread
+- Keep in your own conversation only coordination, decisions, and small direct steps for your assigned task.
+- Give each sub-agent a self-contained prompt with goal, constraints, paths, and the result format you need back.
+
+{role_instructions}
+</initial_context>
+
+<nagent-response>{{text to respond to user}}</nagent-response>
+<nagent-read path="{{file-path-to-read}}" />
+<nagent-write path="{{file-path-to-write}}">{{file content}}</nagent-write>
+<nagent-shell>{{shell commands}}</nagent-shell>
+<nagent-next>{{prompt}}</nagent-next>
+<nagent-agent>{{prompt}}</nagent-agent>
+
+{response_hint}
+Use <nagent-read> to request reading a file; results will be appended to your conversation.
+Use <nagent-write> to write a file.
+Use <nagent-shell> to run shell commands; output will be appended to your conversation.
+Use <nagent-next> to continue reasoning with an appended prompt.
+Use <nagent-agent> to delegate a sub-task to a separate nagent instance.
+"""
+
+
+def default_pid() -> str:
+    # BASHPID is not exported by bash by default; fall back to the parent shell
+    # process id so repeated terminal invocations share one conversation.
+    return os.environ.get("BASHPID") or str(os.getppid())
+
+
+def default_conversation_name(pid: str) -> str:
+    hostname = socket.gethostname()
+    return f"latest-{hostname}-{pid}"
+
+
+def parse_response(text: str) -> tuple[list[NagentTag] | None, str | None]:
+    tags: list[NagentTag] = []
+    pos = 0
+    length = len(text)
+
+    while pos < length:
+        while pos < length and text[pos].isspace():
+            pos += 1
+        if pos >= length:
+            break
+
+        matched = False
+        for kind, pattern in TAG_PATTERNS:
+            match = pattern.match(text, pos)
+            if not match:
+                continue
+
+            if kind == "read":
+                tags.append(NagentTag(kind=kind, content="", path=match.group(1)))
+            elif kind in ("write",):
+                tags.append(NagentTag(kind=kind, content=match.group(2), path=match.group(1)))
+            else:
+                tags.append(NagentTag(kind=kind, content=match.group(1)))
+
+            pos = match.end()
+            matched = True
+            break
+
+        if not matched:
+            snippet = text[pos : pos + 80].replace("\n", "\\n")
+            return None, f"Unexpected content at offset {pos}: {snippet!r}"
+
+    if not tags:
+        return None, "Response contains no nagent tags."
+
+    return tags, None
+
+
+
+def clean_user_output(text: str) -> str:
+    """Clean a <nagent-response> body before printing it to the user.
+
+    The parser normally extracts the body of <nagent-response>, but LLM output
+    can still occasionally contain an extra whole-response wrapper or a markdown
+    code fence around the actual answer.  Strip only whole-output wrappers so
+    inline examples and real code blocks remain intact.
+    """
+
+    cleaned = text.replace("\r\n", "\n").replace("\r", "\n").strip()
+
+    changed = True
+    while changed:
+        changed = False
+
+        fence_match = MARKDOWN_FENCE_PATTERN.match(cleaned)
+        if fence_match:
+            cleaned = fence_match.group(1).strip()
+            changed = True
+            continue
+
+        for pattern in USER_VISIBLE_WRAPPER_PATTERNS:
+            wrapper_match = pattern.match(cleaned)
+            if wrapper_match:
+                cleaned = wrapper_match.group(1).strip()
+                changed = True
+                break
+
+    return cleaned
+
+
+def append_to_conversation(conversation_file: Path, text: str) -> None:
+    with conversation_file.open("a", encoding="utf-8") as handle:
+        if conversation_file.stat().st_size > 0:
+            handle.write("\n")
+        handle.write(text)
+
+
+def call_llm(conversation_file: Path, model: str) -> tuple[str | None, str | None]:
+    result = subprocess.run(
+        [str(NAGENT_LLM_TEXT), "--file", str(conversation_file), "--model", model],
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        error = result.stderr.strip() or result.stdout.strip() or "nagent-llm-text failed"
+        return None, error
+    return result.stdout, None
+
+
+def execute_read(path: str) -> str:
+    file_path = Path(path)
+    if not file_path.is_file():
+        return f'<nagent-read-result path="{path}" error="file not found" />'
+    content = file_path.read_text(encoding="utf-8")
+    return f'<nagent-read-result path="{path}">\n{content}\n</nagent-read-result>'
+
+
+def execute_write(path: str, content: str) -> str:
+    file_path = Path(path)
+    try:
+        file_path.parent.mkdir(parents=True, exist_ok=True)
+        file_path.write_text(content, encoding="utf-8")
+        return f'<nagent-write-result path="{path}" status="ok" />'
+    except OSError as exc:
+        return f'<nagent-write-result path="{path}" status="error">{exc}</nagent-write-result>'
+
+
+def execute_shell(commands: str) -> str:
+    result = subprocess.run(
+        commands,
+        shell=True,
+        capture_output=True,
+        text=True,
+    )
+    stdout = result.stdout.rstrip("\n")
+    stderr = result.stderr.rstrip("\n")
+    parts = [
+        "<nagent-shell-result>",
+        f"exit_code: {result.returncode}",
+    ]
+    if stdout:
+        parts.extend(["stdout:", stdout])
+    if stderr:
+        parts.extend(["stderr:", stderr])
+    parts.append("</nagent-shell-result>")
+    return "\n".join(parts)
+
+
+def execute_agent(
+    prompt: str,
+    root: Path,
+    model: str,
+    nagent_path: Path,
+    parent_conversation: str,
+    pid: str,
+) -> str:
+    conversation_name = f"{uuid.uuid4()}-{pid}"
+    result = subprocess.run(
+        [
+            str(nagent_path),
+            "--root",
+            str(root),
+            "--conversation",
+            conversation_name,
+            "--model",
+            model,
+            "--invocation",
+            "delegated",
+            "--parent-conversation",
+            parent_conversation,
+            "--pid",
+            pid,
+            prompt,
+        ],
+        capture_output=True,
+        text=True,
+    )
+    output = result.stdout.rstrip("\n")
+    stderr = result.stderr.rstrip("\n")
+    parts = [
+        f'<nagent-agent-result conversation="{conversation_name}">',
+        f"exit_code: {result.returncode}",
+    ]
+    if output:
+        parts.extend(["output:", output])
+    if stderr:
+        parts.extend(["stderr:", stderr])
+    parts.append("</nagent-agent-result>")
+    return "\n".join(parts)
+
+
+def process_tags(
+    tags: list[NagentTag],
+    conversation_file: Path,
+    root: Path,
+    model: str,
+    nagent_path: Path,
+    pid: str,
+) -> tuple[list[str], list[str], bool]:
+    responses: list[str] = []
+    next_prompts: list[str] = []
+    should_continue = False
+
+    for tag in tags:
+        if tag.kind == "response":
+            responses.append(tag.content)
+        elif tag.kind == "read":
+            append_to_conversation(conversation_file, execute_read(tag.path or ""))
+            should_continue = True
+        elif tag.kind == "write":
+            append_to_conversation(conversation_file, execute_write(tag.path or "", tag.content))
+            should_continue = True
+        elif tag.kind == "shell":
+            append_to_conversation(conversation_file, execute_shell(tag.content))
+            should_continue = True
+        elif tag.kind == "agent":
+            append_to_conversation(
+                conversation_file,
+                execute_agent(
+                    tag.content,
+                    root,
+                    model,
+                    nagent_path,
+                    conversation_file.name,
+                    pid,
+                ),
+            )
+            should_continue = True
+        elif tag.kind == "next":
+            next_prompts.append(tag.content)
+
+    return responses, next_prompts, should_continue
+
+
+def run_agent_loop(
+    conversation_file: Path,
+    root: Path,
+    model: str,
+    initial_prompt: str | None,
+    pid: str,
+) -> int:
+    nagent_path = Path(__file__).resolve()
+
+    if initial_prompt is not None:
+        append_to_conversation(conversation_file, f"<user-prompt>\n{initial_prompt}\n</user-prompt>")
+
+    while True:
+        llm_output, error = None, None
+        for attempt in range(MAX_FORMAT_RETRIES):
+            llm_output, error = call_llm(conversation_file, model)
+            if error is not None:
+                print(f"Error: {error}", file=sys.stderr)
+                return 1
+
+            tags, parse_error = parse_response(llm_output)
+            if tags is not None:
+                break
+
+            append_to_conversation(
+                conversation_file,
+                f"<agent-response>\n{llm_output}\n</agent-response>\n"
+                f"<system>Invalid nagent response format: {parse_error}. "
+                f"Respond only with valid nagent tags.</system>",
+            )
+        else:
+            print(
+                f"Error: nagent response remained invalid after {MAX_FORMAT_RETRIES} attempts.",
+                file=sys.stderr,
+            )
+            return 1
+
+        append_to_conversation(conversation_file, f"<agent-response>\n{llm_output}\n</agent-response>")
+
+        responses, next_prompts, should_continue = process_tags(
+            tags,
+            conversation_file,
+            root,
+            model,
+            nagent_path,
+            pid,
+        )
+
+        for response in responses:
+            print(clean_user_output(response))
+
+        if next_prompts:
+            for prompt in next_prompts:
+                append_to_conversation(conversation_file, f"<nagent-next-input>\n{prompt}\n</nagent-next-input>")
+            continue
+
+        if should_continue:
+            continue
+
+        return 0
+
+
+def resolve_conversation(root: Path, conversation_name: str) -> Path:
+    return root / conversation_name
+
+
+def print_conversation_status(conversation_file: Path) -> None:
+    size = conversation_file.stat().st_size if conversation_file.is_file() else 0
+    print(conversation_file)
+    print(size)
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Run the nagent conversation loop.")
+    parser.add_argument(
+        "--root",
+        default="~/.nagent",
+        help="Root directory for conversation files (default: ~/.nagent).",
+    )
+    parser.add_argument(
+        "--conversation",
+        help='Conversation name (default: latest-{hostname}-{bashpid}).',
+    )
+    parser.add_argument(
+        "--model",
+        default="gpt-5.5",
+        help='Model passed to nagent-llm-text (default: "gpt-5.5").',
+    )
+    parser.add_argument(
+        "--invocation",
+        choices=["user", "delegated"],
+        default="user",
+        help='Whether this instance was started by a human (user) or a parent nagent (delegated).',
+    )
+    parser.add_argument(
+        "--parent-conversation",
+        help="Parent conversation name when --invocation=delegated.",
+    )
+    parser.add_argument(
+        "--pid",
+        help="Shell process ID shared across sub-agents (default: BASHPID or parent shell pid).",
+    )
+    parser.add_argument(
+        "--status",
+        action="store_true",
+        help="Print the conversation path and file size, then exit.",
+    )
+    parser.add_argument("prompt", nargs="?", help="Prompt text.")
+    args = parser.parse_args()
+
+    root = Path(args.root).expanduser()
+    pid = args.pid or default_pid()
+    conversation_name = args.conversation or default_conversation_name(pid)
+    conversation_file = resolve_conversation(root, conversation_name)
+
+    if args.status:
+        print_conversation_status(conversation_file)
+        return 0
+
+    if args.prompt is None:
+        parser.error("prompt is required unless --status is given")
+
+    root.mkdir(parents=True, exist_ok=True)
+
+    if not conversation_file.exists():
+        process_path = Path(__file__).resolve()
+        conversation_file.write_text(
+            create_initial_text(
+                root,
+                process_path,
+                args.invocation,
+                conversation_name,
+                args.parent_conversation,
+            ),
+            encoding="utf-8",
+        )
+
+    return run_agent_loop(conversation_file, root, args.model, args.prompt, pid)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
