@@ -58,6 +58,24 @@ class FileEditLibTests(unittest.TestCase):
             self.assertEqual(entry["path"], str(source.resolve()))
             self.assertTrue(name1.startswith("sample-"))
 
+    def test_resolve_appends_multiple_files_to_same_index(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            first = root / "first.py"
+            second = root / "second.py"
+            first.write_text("first\n", encoding="utf-8")
+            second.write_text("second\n", encoding="utf-8")
+
+            first_name, _, first_id = self.mod.resolve_file_edit_conversation(root, "42", first)
+            second_name, _, second_id = self.mod.resolve_file_edit_conversation(root, "42", second)
+
+            index = json.loads(self.mod.file_index_path(root, "42").read_text(encoding="utf-8"))
+            self.assertEqual(set(index["by_file_id"]), {first_id, second_id})
+            self.assertEqual(index["by_file_id"][first_id]["conversation"], first_name)
+            self.assertEqual(index["by_file_id"][second_id]["conversation"], second_name)
+            self.assertEqual(index["by_file_id"][first_id]["path"], str(first.resolve()))
+            self.assertEqual(index["by_file_id"][second_id]["path"], str(second.resolve()))
+
     def test_migrates_legacy_path_index(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -388,6 +406,57 @@ class FileEditCliTests(unittest.TestCase):
                         self.assertIn("conversation_path", payload)
                         self.assertIn("nagent", payload)
                         self.assertEqual(payload["nagent"]["responses"], ["done\n"])
+
+    def test_file_edit_json_appends_multiple_files_to_index(self):
+        loader = SourceFileLoader("nagent_file_edit_mod_json_append", str(NAGENT_FILE_EDIT))
+        spec = importlib.util.spec_from_loader("nagent_file_edit_mod_json_append", loader)
+        module = importlib.util.module_from_spec(spec)
+        loader.exec_module(module)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "nagent-root"
+            first = Path(tmp) / "first.txt"
+            second = Path(tmp) / "second.txt"
+            first.write_text("alpha\n", encoding="utf-8")
+            second.write_text("beta\n", encoding="utf-8")
+            fake_nagent = Path(tmp) / "fake-nagent"
+            fake_nagent.write_text(
+                "#!/usr/bin/python3\nimport json\nprint(json.dumps({'exit_code': 0}))\n",
+                encoding="utf-8",
+            )
+            fake_nagent.chmod(0o755)
+            module.NAGENT = fake_nagent
+
+            with unittest.mock.patch.object(module.subprocess, "run") as mock_run:
+                mock_run.return_value = unittest.mock.Mock(
+                    returncode=0,
+                    stdout=json.dumps({"exit_code": 0}),
+                    stderr="",
+                )
+                for source in (first, second):
+                    with unittest.mock.patch.object(
+                        module.sys,
+                        "argv",
+                        [
+                            "nagent-file-edit",
+                            "--file",
+                            str(source),
+                            "--root",
+                            str(root),
+                            "--pid",
+                            "99",
+                            "--json",
+                            "touch",
+                        ],
+                    ):
+                        with unittest.mock.patch.object(module.sys, "stdout", io.StringIO()):
+                            with self.assertRaises(SystemExit) as exited:
+                                module.main()
+                            self.assertEqual(exited.exception.code, 0)
+
+            index = json.loads((root / "conversations" / "file-index-99.json").read_text(encoding="utf-8"))
+            paths = {entry["path"] for entry in index["by_file_id"].values()}
+            self.assertEqual(paths, {str(first.resolve()), str(second.resolve())})
 
 
 if __name__ == "__main__":
