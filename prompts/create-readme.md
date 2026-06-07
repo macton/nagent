@@ -149,6 +149,13 @@ hype and mystification, data-oriented first.
 
 Characteristics:
 
+- Be direct and straightforward. Call things for what they are — and for what
+  they are not. Name the gap between marketing language and actual behavior.
+- Stay respectful. Directness is not snideness. Blunt negations of hype or
+  mystification are fine — e.g. "not mystical", "do not pretend they fit",
+  "they are not the idea." What to avoid: mocking the reader, sneering at people
+  who use other tools, dismissive names for their work, or insults dressed as
+  personality.
 - Say plainly what the system is and is not. No product pitch, no "autonomous
   intelligence" framing.
 - The data is more important than the code operating on it. Behavior is
@@ -156,7 +163,6 @@ Characteristics:
 - Use short, punchy sentences when they clarify. Longer sentences when the
   mechanism needs room.
 - Problem → therefore → design decision. Do not bury the reasoning.
-- Prefer "Look," or "Period." sparingly — enough to sound human, not performative.
 - Call out hidden state vs explicit artifacts. Call out disposable workers vs
   durable files.
 - Do not hedge endlessly. If something is a convention and not a sandbox, say
@@ -789,7 +795,8 @@ Include tables for:
 
 Target 2500-5000 words.
 
-Keep the Mike Acton voice throughout (see **Voice** above).
+Keep the Mike Acton voice throughout (see **Voice** above): direct and plain.
+Cut through mystification; do not mock people or their choices.
 
 Keep the README readable in one sitting.
 
@@ -831,7 +838,8 @@ Teach why artifacts matter more than workers.
 Before finishing the README, verify:
 
 - [ ] The introduction states **The agent is not the thing. The data is the
-  thing.** and reads in Mike Acton's direct, data-oriented voice.
+  thing.** and reads in Mike Acton's direct, data-oriented voice — plain and
+  honest, cutting through hype without mocking readers or other approaches.
 - [ ] The introduction includes **What It Looks Like** with two or three
   complex `nagent`-only examples that frame multi-turn expectations.
 - [ ] Every major feature is justified by a reduction.

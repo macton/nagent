@@ -2,7 +2,10 @@
 
 **nagent** means **not-an-agent**.
 
-If you call something an "agent," people start imagining continuity, intent, and memory that mostly does not exist. nagent is a small reference implementation. It shows what terminal "agent-like" workflows actually are when you stop mystifying them.
+The word "agent" suggests continuity, intent, and memory that a typical LLM loop
+does not actually provide. nagent is a small reference implementation. It shows
+what terminal "agent-like" workflows are when you describe the mechanics instead
+of the metaphor.
 
 The claim is simple:
 
@@ -11,8 +14,8 @@ The claim is simple:
 The LLM is temporary. The process is temporary. Sub-agents are temporary. Context
 windows are temporary. What survives is explicit data: conversations, per-file
 conversations, root context files, repository history summaries, historical
-coupling tables, file summaries, split indexes, patch files, and the rest of
-the junk you can open in an editor.
+coupling tables, file summaries, split indexes, patch files, and other artifacts
+you can open in an editor.
 
 A text file, an LLM, structured tags, and a loop are how this repo implements
 that idea. They are not the idea.
@@ -37,8 +40,8 @@ user request
      updated artifacts
 ```
 
-This README is for programmers who want to understand the architecture and build
-their own version. Not marketing. Mechanics.
+This README is a teaching document for programmers who want to understand the
+architecture and build their own version.
 
 ## What It Looks Like
 
@@ -55,9 +58,9 @@ nagent "Investigate why this Linux service fails to start. Read the unit file an
 nagent "Review this repository: identify the main entry points, run the test suite, fix the smallest failing test you find, and summarize what changed and why."
 ```
 
-These are coordination jobs, not magic one-liners. nagent may read a pile of
-files, run commands, spawn sub-agents for scoped work, and iterate. It does not
-bypass permissions. It does what your user and filesystem allow. Period.
+These are coordination tasks, not one-shot answers. nagent may read many files,
+run commands, spawn sub-agents for scoped work, and iterate. It does not bypass
+permissions; it runs with the same access your user and filesystem allow.
 
 ---
 
@@ -252,7 +255,8 @@ If you cannot read the protocol, you cannot debug the system.
 
 **Idea** — "Agent behavior" is mostly: append, call, parse, act, append, repeat.
 
-That is the whole trick. People wrap this in frameworks and charge money.
+That pattern is the core loop. Heavier systems add infrastructure around the
+same steps.
 
 **Implementation** — Read this path:
 
@@ -441,8 +445,8 @@ them unless the request or evidence requires it.
 The table says "changed with this file." It does not say "must change now."
 
 **Build your own:** compute neighborhoods from history. Present as inspection
-guidance. Ground edits in the current request and current code, not git guilt
-by association.
+guidance. Ground edits in the current request and current code, not historical
+association alone.
 
 ---
 
@@ -611,7 +615,7 @@ not maintain a hidden registry that drifts.
 **Idea** — Different architectural style. Not "frameworks bad."
 
 nagent uses plain files, Python, subprocesses, structured text. The interesting
-part is artifact management and explicit data flow. Not tool calling cosplay.
+part is artifact management and explicit data flow, not tool calling by itself.
 
 **Implementation** — Read `bin/nagent`, `bin/helpers/`, thin wrappers in
 `bin/`, tests in `tests/`. That is the system.
