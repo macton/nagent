@@ -7,6 +7,13 @@ from pathlib import Path
 HELPERS_DIR = Path(__file__).resolve().parent / "helpers"
 sys.path.insert(0, str(HELPERS_DIR))
 from nagent_llm import add_llm_arguments, generate_with_upload, resolve_from_args
+from nagent_cli import exit_on_description
+
+NAGENT_LLM_UPLOAD_DESCRIPTION = """\
+Upload a file with a prompt to the configured LLM and print the response.
+Use when the task needs vision or document understanding (images, PDFs, office
+files, code artifacts) that plain conversation text cannot represent well. Not
+for archives (.zip); extract files first."""
 
 MAX_FILE_BYTES = 50 * 1024 * 1024
 
@@ -92,6 +99,8 @@ def classify_file(path: Path) -> str:
 
 
 def main() -> None:
+    exit_on_description(NAGENT_LLM_UPLOAD_DESCRIPTION)
+
     parser = argparse.ArgumentParser(
         description=(
             "Upload a file and prompt an LLM via the configured provider. "

@@ -1,0 +1,90 @@
+#!/usr/bin/python3
+
+import argparse
+import json
+import sys
+from pathlib import Path
+
+HELPERS_DIR = Path(__file__).resolve().parent / "helpers"
+sys.path.insert(0, str(HELPERS_DIR))
+from nagent_file_patch_lib import apply_segment_patches
+from nagent_cli import exit_on_description
+
+NAGENT_FILE_PATCH_DESCRIPTION = """\
+Merge edits from split segment files back into the original source file.
+Use after modifying segments produced by nagent-file-split; writes a unified
+diff patch, applies the merged content, validates source hash, and refreshes
+index.json line numbers. Run this once all segment edits are complete."""
+
+
+def main() -> None:
+    exit_on_description(NAGENT_FILE_PATCH_DESCRIPTION)
+
+    parser = argparse.ArgumentParser(
+        description=(
+            "Merge edits from split segment files back into the source file, "
+            "write a unified diff patch, and refresh index.json line numbers."
+        ),
+    )
+    parser.add_argument(
+        "--index",
+        required=True,
+        type=Path,
+        help="Path to index.json from nagent-file-split.",
+    )
+    parser.add_argument(
+        "--patch",
+        type=Path,
+        help="Patch output path (default: {index-dir}/{source-stem}.patch).",
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Write the patch file only; do not apply changes or update index.json.",
+    )
+    parser.add_argument(
+        "--no-apply",
+        action="store_true",
+        help="Write the patch and refresh index.json without modifying the source file.",
+    )
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Apply even when source file hash does not match index.json.",
+    )
+    parser.add_argument(
+        "--json",
+        action="store_true",
+        help="Print full result as JSON instead of only the patch path.",
+    )
+    args = parser.parse_args()
+
+    try:
+        result = apply_segment_patches(
+            args.index.expanduser(),
+            args.patch.expanduser() if args.patch else None,
+            dry_run=args.dry_run,
+            apply=not args.no_apply,
+            force=args.force,
+        )
+    except (FileNotFoundError, ValueError) as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        sys.exit(1)
+
+    if args.json:
+        payload = {
+            "changed": result.changed,
+            "source_path": str(result.source_path.resolve()),
+            "index_path": str(result.index_path.resolve()),
+            "patch_path": str(result.patch_path.resolve()) if result.patch_path else None,
+            "source_sha256": result.source_sha256,
+        }
+        print(json.dumps(payload, indent=2))
+    elif result.patch_path is not None:
+        print(str(result.patch_path.resolve()))
+    elif not result.changed:
+        print("no changes", file=sys.stderr)
+
+
+if __name__ == "__main__":
+    main()

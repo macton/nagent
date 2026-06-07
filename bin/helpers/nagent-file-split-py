@@ -1,0 +1,11 @@
+#!/usr/bin/python3
+
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from nagent_file_split_lib import helper_main, py_score
+
+
+if __name__ == "__main__":
+    helper_main(py_score)

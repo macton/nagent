@@ -14,6 +14,14 @@ from typing import Literal
 HELPERS_DIR = Path(__file__).resolve().parent / "helpers"
 sys.path.insert(0, str(HELPERS_DIR))
 from nagent_llm import PROVIDERS, list_models, require_credentials, resolve_provider, resolve_settings
+from nagent_cli import collect_bin_tool_descriptions, exit_on_description
+
+NAGENT_DESCRIPTION = """\
+Autonomous agent orchestrator for structured terminal workflows.
+Use as the main entry point when coordinating multi-step tasks: it maintains a
+conversation, calls the configured LLM, parses structured tags, and can read
+and write files, run shell commands, continue reasoning, and delegate work to
+sub-agents. Prefer nagent for human-driven requests and scoped sub-agent tasks."""
 
 Invocation = Literal["user", "delegated"]
 TagType = Literal["response", "read", "write", "shell", "next", "agent"]
@@ -111,6 +119,8 @@ def build_initial_context(
 
     git_context = git_repo_context()
     git_section = f"\n{git_context}" if git_context else ""
+    tools_section = collect_bin_tool_descriptions(process_path.parent)
+    tools_block = f"\n\n{tools_section}" if tools_section else ""
 
     return f"""<initial_context>
 Instance:
@@ -122,7 +132,7 @@ Environment:
 - nagent root: {root}
 - nagent process: {process_path}
 - cwd: {Path.cwd()}
-- host (uname -a): {host_uname()}{git_section}
+- host (uname -a): {host_uname()}{git_section}{tools_block}
 
 Context management (every nagent instance, including sub-agents):
 - Each nagent instance has its own private conversation file; parent and child agents do not share context.
@@ -515,13 +525,15 @@ def resolve_conversation(root: Path, conversation_name: str) -> Path:
     return root / conversation_name
 
 
-def print_conversation_status(conversation_file: Path) -> None:
+def print_conversation_status(conversation_file: Path, provider: str, model: str) -> None:
     size = conversation_file.stat().st_size if conversation_file.is_file() else 0
-    print(conversation_file)
-    print(size)
+    print(f"conversation:{conversation_file} size:{size}")
+    print(f"provider:{provider} model:{model}")
 
 
 def main() -> None:
+    exit_on_description(NAGENT_DESCRIPTION)
+
     parser = argparse.ArgumentParser(description="Run the nagent conversation loop.")
     parser.add_argument(
         "--root",
@@ -579,7 +591,12 @@ def main() -> None:
     conversation_file = resolve_conversation(root, conversation_name)
 
     if args.status:
-        print_conversation_status(conversation_file)
+        try:
+            provider, model = resolve_settings(args.provider, args.model, args.config)
+        except ValueError as exc:
+            print(f"Error: {exc}", file=sys.stderr)
+            return 1
+        print_conversation_status(conversation_file, provider, model)
         return 0
 
     if args.list_models:

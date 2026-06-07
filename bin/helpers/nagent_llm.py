@@ -215,6 +215,16 @@ def list_models(provider: str) -> list[str]:
     raise ValueError(f"Unsupported provider: {provider}")
 
 
+CURSOR_FAILURE_STATUSES = frozenset({"error", "cancelled", "expired"})
+
+
+def _cursor_result_text(result) -> str:
+    status = getattr(result, "status", None)
+    if status in CURSOR_FAILURE_STATUSES:
+        raise RuntimeError(f"Cursor agent failed with status {status!r}")
+    return getattr(result, "result", None) or ""
+
+
 def generate_text(message: str, provider: str, model: str) -> str:
     if provider == "openai":
         OpenAI = require_package(provider)
@@ -248,9 +258,7 @@ def generate_text(message: str, provider: str, model: str) -> str:
             local=LocalAgentOptions(cwd=os.getcwd()),
         ),
     )
-    if getattr(result, "status", None) not in (None, "completed", "success"):
-        raise RuntimeError(f"Cursor agent failed with status {result.status!r}")
-    return getattr(result, "result", None) or ""
+    return _cursor_result_text(result)
 
 
 def generate_with_upload(path: Path, prompt: str, provider: str, model: str) -> str:

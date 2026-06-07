@@ -13,6 +13,15 @@ BIN = Path(__file__).resolve().parent.parent / "bin"
 NAGENT = BIN / "nagent"
 NAGENT_LLM_TEXT = BIN / "nagent-llm-text"
 NAGENT_LLM_UPLOAD = BIN / "nagent-llm-upload"
+NAGENT_FILE_SPLIT = BIN / "nagent-file-split"
+NAGENT_FILE_PATCH = BIN / "nagent-file-patch"
+BIN_TOOLS = (
+    NAGENT,
+    NAGENT_LLM_TEXT,
+    NAGENT_LLM_UPLOAD,
+    NAGENT_FILE_SPLIT,
+    NAGENT_FILE_PATCH,
+)
 
 
 def load_nagent_module():
@@ -251,6 +260,47 @@ class InitialTextTests(unittest.TestCase):
         self.assertIn("git remote -v:", text)
         self.assertIn(str(repo_root), text)
 
+    def test_create_initial_text_includes_bin_tool_descriptions(self):
+        text = self.mod.create_initial_text(
+            Path("/tmp/nagent-root"),
+            NAGENT.resolve(),
+            "user",
+            "conv",
+        )
+        self.assertIn("Available tools:", text)
+        self.assertIn("path:", text)
+        self.assertIn("nagent-file-split", text)
+        self.assertIn("nagent-file-patch", text)
+
+
+class ToolDescriptionTests(unittest.TestCase):
+    def test_all_bin_tools_support_description(self):
+        for tool in BIN_TOOLS:
+            with self.subTest(tool=tool.name):
+                result = subprocess.run(
+                    [str(tool), "--description"],
+                    capture_output=True,
+                    text=True,
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn("path:", result.stdout)
+                self.assertGreater(len(result.stdout.strip()), 20)
+
+    def test_nagent_description_does_not_require_prompt(self):
+        result = subprocess.run(
+            [str(NAGENT), "--description"],
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("orchestrator", result.stdout.lower())
+
+
+class RefreshInitialContextTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.mod = load_nagent_module()
+
     def test_refresh_initial_context_replaces_existing_block(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -300,6 +350,11 @@ class InitialTextTests(unittest.TestCase):
 
 
 class CliTests(unittest.TestCase):
+    def clean_env(self):
+        env = os.environ.copy()
+        env.pop("NAGENT_CONFIG", None)
+        return env
+
     def test_llm_text_missing_file(self):
         result = subprocess.run(
             [str(NAGENT_LLM_TEXT), "--file", "/nonexistent/nagent-test.txt"],
@@ -309,7 +364,7 @@ class CliTests(unittest.TestCase):
         self.assertEqual(result.returncode, 1)
         self.assertIn("file not found", result.stderr)
 
-    def test_status_prints_path_and_size(self):
+    def test_status_prints_path_size_provider_and_model(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             conv = "status-test"
@@ -317,14 +372,52 @@ class CliTests(unittest.TestCase):
             conversation_file.write_text("hello", encoding="utf-8")
 
             result = subprocess.run(
-                [str(NAGENT), "--root", str(root), "--conversation", conv, "--status"],
+                [
+                    str(NAGENT),
+                    "--root",
+                    str(root),
+                    "--conversation",
+                    conv,
+                    "--config",
+                    str(root / "missing-config.json"),
+                    "--status",
+                ],
                 capture_output=True,
                 text=True,
+                env=self.clean_env(),
             )
             self.assertEqual(result.returncode, 0, result.stderr)
             lines = result.stdout.strip().splitlines()
-            self.assertEqual(lines[0], str(conversation_file))
-            self.assertEqual(int(lines[1]), conversation_file.stat().st_size)
+            self.assertEqual(lines[0], f"conversation:{conversation_file} size:{conversation_file.stat().st_size}")
+            self.assertEqual(lines[1], "provider:openai model:gpt-5.5")
+
+    def test_status_honors_provider_and_model(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            conv = "status-test"
+            conversation_file = root / conv
+
+            result = subprocess.run(
+                [
+                    str(NAGENT),
+                    "--root",
+                    str(root),
+                    "--conversation",
+                    conv,
+                    "--provider",
+                    "anthropic",
+                    "--model",
+                    "claude-test",
+                    "--status",
+                ],
+                capture_output=True,
+                text=True,
+                env=self.clean_env(),
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            lines = result.stdout.strip().splitlines()
+            self.assertEqual(lines[0], f"conversation:{conversation_file} size:0")
+            self.assertEqual(lines[1], "provider:anthropic model:claude-test")
 
     def test_status_missing_conversation_reports_zero(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -333,14 +426,24 @@ class CliTests(unittest.TestCase):
             conversation_file = root / conv
 
             result = subprocess.run(
-                [str(NAGENT), "--root", str(root), "--conversation", conv, "--status"],
+                [
+                    str(NAGENT),
+                    "--root",
+                    str(root),
+                    "--conversation",
+                    conv,
+                    "--config",
+                    str(root / "missing-config.json"),
+                    "--status",
+                ],
                 capture_output=True,
                 text=True,
+                env=self.clean_env(),
             )
             self.assertEqual(result.returncode, 0, result.stderr)
             lines = result.stdout.strip().splitlines()
-            self.assertEqual(lines[0], str(conversation_file))
-            self.assertEqual(lines[1], "0")
+            self.assertEqual(lines[0], f"conversation:{conversation_file} size:0")
+            self.assertEqual(lines[1], "provider:openai model:gpt-5.5")
 
     def test_nagent_seeds_conversation(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -505,6 +608,15 @@ class NagentLlmConfigTests(unittest.TestCase):
         with unittest.mock.patch.object(self.mod, "require_package", return_value=mock_openai):
             models = self.mod.list_models("openai")
         self.assertEqual(models, ["gpt-4o", "gpt-5.5"])
+
+    def test_cursor_finished_status_is_success(self):
+        result = unittest.mock.Mock(status="finished", result="done")
+        self.assertEqual(self.mod._cursor_result_text(result), "done")
+
+    def test_cursor_error_status_raises(self):
+        result = unittest.mock.Mock(status="error", result="")
+        with self.assertRaises(RuntimeError):
+            self.mod._cursor_result_text(result)
 
     def test_utilities_autodetect_config_without_flags(self):
         import argparse

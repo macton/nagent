@@ -1,0 +1,172 @@
+#!/usr/bin/python3
+
+import argparse
+import json
+import subprocess
+import sys
+from pathlib import Path
+
+HELPERS_DIR = Path(__file__).resolve().parent / "helpers"
+sys.path.insert(0, str(HELPERS_DIR))
+from nagent_file_split_lib import (
+    SPLIT_TYPES,
+    TARGET_BYTES_DEFAULT,
+    build_index,
+    default_output_dir,
+    detect_split_type,
+    load_index,
+    refresh_split,
+    score_for_type,
+    write_index_file,
+)
+from nagent_cli import exit_on_description
+
+NAGENT_FILE_SPLIT_DESCRIPTION = """\
+Split a large file into structure-aware segments (~32KB by default) with index.json.
+Use when a file is too large for context or when you want to read and edit one
+segment at a time. Workflow: split, edit segment files, then merge with
+nagent-file-patch. Supports --natural for type-specific boundaries and --refresh
+to re-split after the source changes."""
+
+HELPER_COMMANDS = {
+    split_type: HELPERS_DIR / f"nagent-file-split-{split_type}"
+    for split_type in SPLIT_TYPES
+    if (HELPERS_DIR / f"nagent-file-split-{split_type}").is_file()
+}
+
+
+def resolve_output_dir(source: Path, output: Path | None) -> Path:
+    if output is not None:
+        return output.expanduser()
+    return default_output_dir(source)
+
+
+def run_splitter(
+    source: Path,
+    output_dir: Path,
+    split_type: str,
+    target_bytes: int,
+    natural: bool,
+) -> list[dict]:
+    helper = HELPER_COMMANDS.get(split_type)
+    if helper is None:
+        raise RuntimeError(f"no helper for split type: {split_type}")
+
+    command = [
+        str(helper),
+        "--file",
+        str(source),
+        "--output-dir",
+        str(output_dir),
+        "--target-bytes",
+        str(target_bytes),
+    ]
+    if natural:
+        command.append("--natural")
+
+    result = subprocess.run(
+        command,
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        error = result.stderr.strip() or result.stdout.strip() or f"{helper.name} failed"
+        raise RuntimeError(error)
+    return json.loads(result.stdout)
+
+
+def split_file(
+    source: Path,
+    output_dir: Path,
+    split_type: str,
+    target_bytes: int,
+    natural: bool,
+) -> dict:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    segments = run_splitter(source, output_dir, split_type, target_bytes, natural)
+    index = build_index(source, segments, split_type, target_bytes, natural=natural)
+    index_path = output_dir / "index.json"
+    write_index_file(index_path, index)
+    return index
+
+
+def refresh_index(index_path: Path) -> dict:
+    index = load_index(index_path)
+    split_type = index.get("split_type", detect_split_type(Path(index["source_path"])))
+    return refresh_split(index_path, score_for_type(split_type))
+
+
+def emit_result(index_path: Path, index: dict, as_json: bool) -> None:
+    if as_json:
+        payload = {"index_path": str(index_path.resolve()), **index}
+        print(json.dumps(payload, indent=2))
+    else:
+        print(str(index_path.resolve()))
+
+
+def main() -> None:
+    exit_on_description(NAGENT_FILE_SPLIT_DESCRIPTION)
+
+    parser = argparse.ArgumentParser(description="Split a large file into structure-aware segments.")
+    parser.add_argument("--file", type=Path, help="Path to the source file.")
+    parser.add_argument(
+        "--output",
+        type=Path,
+        help="Output directory (default: /tmp/{file-name-slug}-{guid}).",
+    )
+    parser.add_argument(
+        "--split",
+        choices=SPLIT_TYPES,
+        help="Splitter type to use (default: autodetect from extension).",
+    )
+    parser.add_argument(
+        "--target-bytes",
+        type=int,
+        default=TARGET_BYTES_DEFAULT,
+        help=f"Approximate target size per segment in bytes (default: {TARGET_BYTES_DEFAULT}).",
+    )
+    parser.add_argument(
+        "--natural",
+        action="store_true",
+        help="Split at every natural boundary for the type (still respects --target-bytes max).",
+    )
+    parser.add_argument(
+        "--refresh",
+        type=Path,
+        metavar="INDEX",
+        help="Re-split from source using settings in an existing index.json.",
+    )
+    parser.add_argument(
+        "--json",
+        action="store_true",
+        help="Print full result as JSON instead of only the index path.",
+    )
+    args = parser.parse_args()
+
+    try:
+        if args.refresh is not None:
+            index_path = args.refresh.expanduser()
+            index = refresh_index(index_path)
+            emit_result(index_path, index, args.json)
+            return
+
+        if args.file is None:
+            print("Error: --file is required unless --refresh is used.", file=sys.stderr)
+            sys.exit(1)
+
+        source = args.file
+        if not source.is_file():
+            print(f"Error: file not found: {source}", file=sys.stderr)
+            sys.exit(1)
+
+        split_type = args.split or detect_split_type(source)
+        output_dir = resolve_output_dir(source, args.output)
+        index = split_file(source, output_dir, split_type, args.target_bytes, args.natural)
+        emit_result(output_dir / "index.json", index, args.json)
+    except (RuntimeError, FileNotFoundError, ValueError, json.JSONDecodeError) as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()
