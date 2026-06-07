@@ -2,529 +2,676 @@
 
 **nagent** means **not-an-agent**.
 
-nagent is a small, readable reference implementation of agent-like terminal
-workflows: **a text file, an LLM, structured tags, and a loop**.
+nagent is a small reference implementation of agent-like terminal workflows. Its
+central claim is not that the agent is smart or durable. The claim is:
 
-Those are mechanisms, not the idea. The idea is that the persistent object is
-not the agent. The persistent object is the work.
+**The persistent object is not the agent. The persistent object is the work.**
 
-LLMs are temporary. Processes are temporary. Context windows are temporary. The
-durable part of nagent is explicit data: conversations, per-file conversations,
-root context files, split indexes, summaries, and patch artifacts. The loop
-exists to transform those artifacts.
+LLMs are temporary. Processes are temporary. Sub-agents are temporary. Context
+windows are temporary. The durable part of the system is explicit data:
+conversations, per-file conversations, root context files, repository history
+summaries, historical coupling data, artifact neighborhoods, file summaries,
+split indexes, and patch artifacts.
 
-This README is a teaching document for programmers who want to understand the
-architecture and build their own version. It is not marketing material.
+A text file, an LLM, structured tags, and a loop are the implementation of this
+idea, not the idea itself.
 
-## What It Looks Like
-
-```bash
-nagent "Inspect this repository and explain how it works."
-nagent "Update README.md after reading the source and tests."
-nagent --status
-nagent --clear
-nagent --save-conversation before-readme
-nagent --load-conversation before-readme
-nagent --summarize
-nagent --edit-conversation "remove stale tool output and keep the useful decisions"
-nagent --file-edit README.md "tighten the architecture section"
-nagent --list-file-edits
+```text
+repository history
+        +
+root context
+        +
+conversation
+        +
+artifact-local memory
+        +
+artifact summary
+        +
+historical coupling
+        +
+user request
+            ->
+     LLM transformation
+            ->
+     updated artifacts
 ```
 
-The command may perform several LLM calls, read files, run shell commands,
-delegate to child processes, and print a final response. The work is still
-anchored in ordinary files.
+This README is a teaching document for programmers who want to understand the
+architecture and build their own version.
 
 ---
 
 ## 1. Durable Work, Disposable Workers
 
-The central reduction is simple:
+**Idea** - The system preserves work, not processes.
 
 ```text
 temporary worker
-      |
-      v
-durable artifact -> LLM transformation -> durable artifact
+        |
+        v
+durable artifacts
+        |
+        v
+next temporary worker
 ```
 
-nagent does not try to make the process durable. It makes the work durable.
+nagent is data-oriented. The data is more important than the code operating on
+it. Behavior is a transformation over explicit state. Important state should be
+inspectable, editable, and durable; it should not hide inside process memory.
 
-The main process can exit. A child process can fail. The model can forget what it
-said five turns ago. The useful state remains in files that can be opened,
-diffed, edited, copied, summarized, or loaded into another run.
-
-In data-oriented terms:
-
-| Principle | In nagent |
+| Hidden state | Explicit artifact |
 | --- | --- |
-| State should be explicit. | Conversation files, file indexes, split indexes, summaries, and patches are visible on disk. |
-| State should be inspectable. | Tool requests and tool results are appended as text. |
-| State should be editable. | Conversation history can be saved, loaded, summarized, edited, or rewritten directly. |
-| Behavior transforms data. | The loop reads an artifact, asks an LLM for a transformation, applies actions, and appends results. |
-| Temporary execution is separate from durable state. | LLM calls and subprocesses are interchangeable workers over durable artifacts. |
+| Prompt state in a running process | Conversation files under the nagent root |
+| Private tool traces | Request tags and result wrappers appended as text |
+| In-memory scratch state | Temp files, split segments, indexes, and patches |
+| Framework-managed memory | User-editable files |
 
-This is why "agent" is the wrong persistent noun. The persistent object is the
-work artifact.
+**Implementation** - `bin/nagent` stores conversations under
+`~/.nagent/conversations/`. It appends user prompts, model responses, tool
+results, parser corrections, interrupts, and child-agent results to the
+conversation file. File-edit sessions create their own per-file conversations.
+Large-file operations create split directories, `index.json` files, segment
+files, summaries, and patch files.
 
-**Build your own:** decide which files are the durable source of truth before
-you design any agent behavior. Treat processes and models as temporary
-transform functions.
+**Example**
+
+```text
+artifact
+    +
+artifact-local memory
+    +
+historical artifacts
+    +
+user request
+        ->
+LLM transformation
+        ->
+updated artifacts
+```
+
+The running Python process is just a worker over these artifacts.
+
+**Build your own:** decide which files are the source of truth before designing
+agent behavior. Make workers disposable and artifacts durable.
 
 ---
 
 ## 2. Text In, Text Out
 
-The smallest primitive is not an agent loop. It is a function:
+**Idea** - The smallest useful primitive is text generation from a file.
 
-```text
-generate_text(file) -> text
-```
+LLMs forget. Therefore: put the prompt in a file and treat the model as a
+temporary transformation function.
 
-In this repository, that primitive is `bin/nagent-llm-text`. It reads a text
-file, resolves a provider and model, sends the file contents to the LLM, and
-prints the response. With `--json`, it also returns usage data:
+**Implementation** - `bin/nagent-llm-text` reads a text file, resolves provider
+and model settings, calls `generate_text_with_usage()` from
+`bin/helpers/nagent_llm.py`, and prints either plain text or JSON with token
+usage. Provider support lives behind a small abstraction for `openai`,
+`anthropic`, `google`, and `cursor`. Defaults come from `NAGENT_CONFIG` or
+`~/.nagent/config.json`, with CLI flags overriding config.
+
+`bin/nagent-llm-upload` is the adjacent primitive for artifacts that are better
+handled through provider upload APIs, such as images, PDFs, office files, and
+code documents. It rejects `.zip` archives, checks a 50 MB limit, and returns
+text or JSON.
+
+**Example**
 
 ```bash
+echo "What is 2+2?" > question.txt
 nagent-llm-text --file question.txt
-nagent-llm-text --file question.txt --json
 ```
 
-Provider-specific code lives in `bin/helpers/nagent_llm.py`. It supports
-`openai`, `anthropic`, `google`, and `cursor`; resolves defaults from
-`NAGENT_CONFIG` or `~/.nagent/config.json`; checks credentials; lists models;
-and normalizes usage counts when providers expose them.
+Everything else in nagent is orchestration around this primitive.
 
-There is also `bin/nagent-llm-upload` for files that are better handled as
-provider uploads, such as images, PDFs, office documents, CSV/JSON/text/code
-files, and related formats. It rejects archives such as `.zip`, enforces a 50 MB
-limit, and returns text or JSON.
-
-Everything else is orchestration around text generation.
-
-**Build your own:** start with one boring command that sends a file to a model
-and returns text. Add orchestration only after that primitive is easy to test.
+**Build your own:** implement `generate_text(file) -> str` first. Keep it boring
+enough that provider changes do not affect the rest of the architecture.
 
 ---
 
 ## 3. Conversations Are Editable State
 
-Observation: LLMs forget.
+**Idea** - The conversation file is not chat history. It is working state.
 
-Therefore: put memory in files.
+It is a tool transcript, correction channel, continuation point, and editable
+artifact. Memory becomes stale. Therefore: allow conversations to be saved,
+loaded, summarized, edited, branched, trimmed, copied, diffed, versioned, and
+rewritten.
 
-nagent stores conversations under the root directory, normally:
+**The agent does not own its memory. The user does.**
 
-```text
-~/.nagent/conversations/latest-{hostname}-{pid}
-```
-
-The conversation file is not merely chat history. It is:
-
-| Role | Meaning |
+| Session memory | Artifact memory |
 | --- | --- |
-| Working state | The current prompt, prior model output, and accumulated tool results. |
-| Tool transcript | Reads, writes, shell commands, child results, and errors are visible. |
-| Correction channel | Invalid model output and retry instructions are appended for the next turn. |
-| Continuation point | A later invocation can keep working from the same file. |
-| Editable artifact | The user can save, load, trim, branch, rewrite, or summarize it. |
+| Belongs to a running session | Belongs to a file on disk |
+| Often opaque | Openable and diffable |
+| Expires with the process or service | Survives worker replacement |
+| Optimized for conversation | Optimized for preserved work |
 
-Explicit editing commands:
+**Implementation** - `bin/nagent` creates conversation names with
+`default_conversation_name()`, based on hostname and a shell identity from
+`default_pid()`. It migrates older root-level conversation files into
+`conversations/`. It exposes explicit maintenance commands:
+`--save-conversation`, `--load-conversation`, `--summarize`, and
+`--edit-conversation`.
+
+Direct conversation-file editing is also part of the design. Because a
+conversation is an ordinary file, you can open it in an editor and remove stale
+tool output, rewrite a misleading assumption, or replace a long exchange with a
+short note. `--edit-conversation` automates one version of that by archiving the
+current conversation, running a file-edit session on the archived file, and then
+loading the edited result.
+
+Root context is explicit state too. `load_root_context()` reads
+`~/.nagent/context.yaml` or `~/.nagent/context.md`. YAML context can be a list or
+contain `paths:`, and nested `context.yaml` files are expanded recursively.
+
+**Example**
 
 ```bash
-nagent --save-conversation saved-copy
-nagent --load-conversation saved-copy
+nagent --status
+nagent --save-conversation before-refactor
+nagent --load-conversation before-refactor
 nagent --summarize
 nagent --edit-conversation "keep the decisions and remove obsolete logs"
 ```
 
-Implicit editing is just as important. Because the conversation is an ordinary
-file, it can be opened, edited, trimmed, rewritten, diffed, copied, versioned,
-or scripted. The agent does not own its memory. The user does.
-
-Startup context is explicit too. `load_root_context()` reads
-`~/.nagent/context.yaml` or `~/.nagent/context.md`. A YAML file can be a list or
-contain `paths:`; nested `context.yaml` files are expanded recursively. That
-root context is inserted into the generated initial context before the role
-instructions.
-
-Default conversation naming is intentionally mundane. `default_pid()` prefers a
-GNU screen `STY`/`WINDOW` pair, then `BASHPID`, then the parent process id.
-`default_conversation_name()` combines that id with the hostname.
-
-**Build your own:** make memory a mutable data structure on disk. Let users
-rewrite history when the history has become less useful than a clean summary.
+**Build your own:** make memory a mutable data structure on disk. Treat editing
+history as maintenance, not corruption.
 
 ---
 
 ## 4. Teach The Model An Output Format
 
-Observation: free-form model output is hard to execute safely.
+**Idea** - Free-form model output is hard to execute. Use a visible protocol.
 
-Therefore: teach the model a small output language.
+The startup prompt teaches the model the only tags it may emit. The parser is
+strict: a valid response contains only recognized tags and whitespace.
 
-`create_initial_text()` and `build_initial_context()` generate the runtime
-prompt. It includes environment facts, git context, root context, tool
-descriptions, write rules, large-file guidance, role instructions, and the
-allowed tags.
+**Implementation** - `build_initial_context()` and `create_initial_text()` in
+`bin/nagent` generate runtime context: instance facts, environment, git remote
+information, discovered tool descriptions, context-management rules, write
+rules, large-file guidance, optional file-edit history, root context, and role
+instructions. `parse_response()` parses the protocol with regular expressions.
+`process_tags()` dispatches each tag to a handler.
 
-The parser contract in `parse_response()` is strict: a response must contain
-only nagent tags and whitespace. Unexpected text is a parse error.
-
-Allowed request tags:
+Available tags:
 
 | Tag | Meaning |
 | --- | --- |
-| `<nagent-response>...</nagent-response>` | Print a response to the human, or return a result to the parent. |
+| `<nagent-response>...</nagent-response>` | Print a human response or return a child result. |
 | `<nagent-read path="..."/>` | Read a small file inline. |
-| `<nagent-file-read path="..."/>` | Read a file, splitting it first if it exceeds the inline limit. |
-| `<nagent-file-patch index="..."/>` | Merge edited split segments back into their source file. |
+| `<nagent-file-read path="..."/>` | Read a file, splitting it first if needed. |
+| `<nagent-file-patch index="..."/>` | Merge edited split segments through an index. |
 | `<nagent-write path="...">...</nagent-write>` | Write content to an allowed path. |
-| `<nagent-shell>...</nagent-shell>` | Run shell commands and append stdout, stderr, and exit code. |
-| `<nagent-next>...</nagent-next>` | Append a continuation prompt to the same conversation. |
-| `<nagent-agent>...</nagent-agent>` | Start a delegated child nagent process. |
+| `<nagent-shell>...</nagent-shell>` | Run shell commands and append output. |
+| `<nagent-next>...</nagent-next>` | Append a continuation prompt. |
+| `<nagent-agent>...</nagent-agent>` | Delegate to a child nagent process. |
 
-The action handlers append result wrappers:
+Handlers append result wrappers such as `<nagent-read-result>`,
+`<nagent-file-read-result>`, `<nagent-file-patch-result>`,
+`<nagent-write-result>`, `<nagent-shell-result>`, and
+`<nagent-agent-result>`. These are not hidden return values; they become
+conversation data.
+
+**Example**
 
 ```xml
-<nagent-read-result path="...">...</nagent-read-result>
-<nagent-file-read-result path="..." mode="split" ...>...</nagent-file-read-result>
-<nagent-file-patch-result index="..." status="ok" ... />
-<nagent-write-result path="..." status="ok" />
-<nagent-shell-result>
-exit_code: 0
-stdout:
-...
-</nagent-shell-result>
-<nagent-agent-result conversation="..." tokens_in="..." tokens_out="...">...</nagent-agent-result>
+<nagent-read path="README.md" />
+<nagent-shell>python3 -m unittest discover -s tests -v</nagent-shell>
+<nagent-response>Done.</nagent-response>
 ```
 
-`clean_user_output()` strips accidental whole-response wrappers or a single
-surrounding markdown fence before printing human-visible output. The protocol is
-text, but it still has a contract.
-
-**Build your own:** use structured text before reaching for a framework schema.
-Keep the grammar small enough that the parser is easy to inspect.
+**Build your own:** make the protocol plain enough to inspect. Put the contract
+in the prompt and enforce it in a small parser.
 
 ---
 
 ## 5. The Loop
 
-Observation: "agent behavior" is mostly repetition.
+**Idea** - "Agent behavior" is mostly append, call, parse, act, append, repeat.
 
-Therefore: make the repetition visible.
-
-The main path is:
+**Implementation** - The important reading path is:
 
 ```text
 main()
   run_agent_loop()
-    append <user-prompt>
     call_llm()
     parse_response()
     process_tags()
 ```
 
-The algorithm is:
+`run_agent_loop()` appends the user prompt, sends the whole conversation file to
+`nagent-llm-text --json`, appends valid model output, processes tags, appends
+results, and loops whenever an action or `<nagent-next>` added new state.
+
+Parser retries are visible state. If `parse_response()` rejects the output,
+`run_agent_loop()` appends the invalid response inside `<agent-response>`, then
+appends a `<system>` correction telling the model to respond only with valid
+nagent tags. It retries up to `MAX_FORMAT_RETRIES`, currently 3. Provider
+errors are appended similarly. Failures become data, not invisible control flow.
+
+`TokenStats` tracks turn count, current conversation input tokens, recursive
+input tokens, and recursive output tokens. If provider usage is unavailable,
+nagent estimates by character count. Child-agent JSON output contributes to the
+recursive totals.
+
+**Example**
 
 ```text
-append the user prompt to the conversation
-
+append user prompt to conversation file
 loop:
-    send the conversation file to the LLM
-    parse the LLM response as nagent tags
-
-    if parsing fails:
-        append the bad response
-        append a format correction
-        retry
-
-    append the valid model response
-    execute requested actions
-    append action results
-
-    if actions or next prompts were appended:
-        continue
-
-    print responses
-    stop
+    response = send conversation file to LLM
+    append response to conversation file
+    if response contains action tags:
+        run those actions
+        append results to conversation file
+        continue loop
+    if response contains <nagent-response>:
+        print it and stop
 ```
 
-Malformed output retries are data, not hidden control flow. On parser failure,
-`run_agent_loop()` appends the invalid response and a `<system>` correction,
-then tries again up to `MAX_FORMAT_RETRIES`, currently 3. LLM provider errors
-are appended in the same way. If retries are exhausted, the loop returns an
-error response.
-
-Failures become visible state. They are part of the work artifact.
-
-Token accounting is deliberately simple. `TokenStats` tracks turn count,
-conversation input tokens, recursive input tokens, and recursive output tokens.
-`nagent-llm-text --json` supplies usage when available; otherwise nagent falls
-back to a rough character estimate. Child agent JSON output contributes to the
-recursive totals. Direct user runs print a final status line; `NAGENT_NO_SPINNER`
-only disables the spinner while the loop is waiting.
-
 **Build your own:** after every action, append the result to durable state and
-call the model again. Do not keep important loop state only in memory.
+loop. Do not hide important errors or retry corrections in memory.
 
 ---
 
 ## 6. Persistent Per-File Memory
 
-Observation: one conversation grows too large.
+**Idea** - One conversation grows too large. Attach memory to artifacts.
 
-Therefore: attach memory to artifacts.
+Repeated work accumulates around individual files. Therefore: give each file
+persistent local memory.
 
-Observation: repeated work accumulates around individual files.
+```text
+main conversation
+        |
+        +-- file A memory
+        |
+        +-- file B memory
+        |
+        +-- file C memory
+```
 
-Therefore: give each file persistent local memory.
+**Implementation** - `bin/nagent-file-edit` resolves a file-specific
+conversation, then delegates to `bin/nagent --file-edit`. The index lives at
+`~/.nagent/conversations/file-index-{pid}.json`. It uses stable file ids from
+device and inode via `file_id_for_path()`, not just paths. If a file is renamed
+but has the same inode, file-edit mode can still recognize it. Legacy path-only
+indexes are normalized into the current `by_file_id` shape.
 
-Most coding agents remember sessions. nagent remembers artifacts.
+Per-file conversations preserve previous investigations, failed attempts, local
+assumptions, file-specific context, editing history, historical context, and
+large-file split/patch state. This keeps the main conversation smaller because
+noisy local work stays near the artifact.
 
-`nagent-file-edit` runs nagent against a single file with a dedicated
-conversation. The lower-level implementation is `nagent --file-edit PATH`; the
-wrapper resolves the per-file conversation and delegates to the main command.
+**Example**
 
 ```bash
-nagent-file-edit --file src/foo.py "add validation"
+nagent-file-edit --file src/foo.py "add error handling"
 nagent-file-edit --file src/foo.py --clear
 nagent --list-file-edits
 ```
 
-Per-file conversations preserve:
-
-| Artifact-local memory | Why it matters |
-| --- | --- |
-| Previous attempts | Avoid repeating a failed fix. |
-| Failed commands | Keep local debugging history out of the parent conversation. |
-| Local assumptions | Record file-specific decisions near the artifact. |
-| Editing history | Continue work on the same file later. |
-| Split/patch context | Allow large-file segment edits inside the file-edit write boundary. |
-
-Stable file ids come from device and inode in `file_id_for_path()`. The index is
-stored as JSON under:
-
-```text
-~/.nagent/conversations/file-index-{pid}.json
+```json
+{
+  "by_file_id": {
+    "2050:123456": {
+      "file_id": "2050:123456",
+      "path": "/repo/src/foo.py",
+      "conversation": "foo-0c2f..."
+    }
+  }
+}
 ```
 
-That index maps `file_id` to the resolved path and conversation name. Legacy
-path-only indexes are normalized when loaded. If a file is renamed but has the
-same inode, the edit session can still recognize it.
-
-Artifact-local memory keeps the main conversation small. The parent can say
-"edit this file"; the file conversation stores the noisy local work.
-
-**Build your own:** when work repeatedly targets the same artifact, move memory
-to that artifact. Preserve useful work, not chat for its own sake.
+**Build your own:** when work keeps returning to the same artifact, store memory
+beside that artifact's identity. Session memory answers "what happened today";
+artifact memory answers "what have we learned about this file?"
 
 ---
 
-## 7. Disposable Sub-Agents
+## 7. Repository History As Data
 
-Observation: exploration creates noise.
+**Idea** - A repository is not only the current file tree. Its history is also a
+durable artifact.
 
-Therefore: use disposable sub-agents.
+Repository history can be transformed into editing context. This is not generic
+retrieval. It is explicit transformation of historical artifacts into working
+context for a target file.
 
-A sub-agent is just another nagent process with a private conversation:
+```text
+git history
+    ->
+commit/file summaries
+    ->
+file-edit initial context
+    ->
+better artifact-local edit decisions
+```
+
+**Implementation** - When a file-edit conversation starts and provider/model
+settings are available, `file_edit_history_and_summary_block()` gathers git
+history for the target file. `git_file_history()` reads recent commits.
+`summarize_new_file_commits()` asks the LLM for one-sentence summaries of new
+commits and reuses previous summaries found in the existing initial context.
+`format_file_history()` records people who edited the file, step-by-step commit
+history, files edited in the same commits, and summarized commits.
+
+`run_file_summary()` calls `nagent-file-summarize` and stores a current file
+summary in a `{file-summary}` block. The result is injected into the file-edit
+initial context along with `{file-history}`. Historical context is a hint, not a
+command.
+
+**Example**
+
+```text
+{file-history}
+File: src/foo.py
+
+Individuals who edited this file:
+- Alice <alice@example.com>: 3 commits
+
+Step-by-step history:
+- 2026-05-01 abc123 Alice: Adds validation.
+
+Summarized commits:
+- <full-hash> (abc123): Adds validation to foo parsing.
+{/file-history}
+
+{file-summary}
+File: /repo/src/foo.py
+Source: nagent-file-summarize
+
+Implements foo parsing and validation.
+{/file-summary}
+```
+
+**Build your own:** turn history into explicit context blocks. Cache summaries
+inside the durable conversation so unchanged history is not repeatedly
+re-summarized.
+
+---
+
+## 8. Historical Coupling And Artifact Neighborhoods
+
+**Idea** - A file exists within a neighborhood of related artifacts.
+
+Historical coupling can identify likely companion files, related tests, related
+headers, related configuration, and frequently co-edited implementation files.
+High co-edit files are candidates for inspection, not automatic edit targets.
+
+```text
+target file
+        |
+        +-- historical summary
+        +-- co-edited files
+        +-- local conversation
+        +-- split indexes
+```
+
+**Implementation** - `coedited_file_rows()` counts files changed in the same
+commits as the target file, then computes a high/medium/low historical co-edit
+rate. `format_file_history()` places the table in the file-edit context and
+adds guidance: inspect high-likelihood co-edited files when the requested change
+may affect interfaces, tests, config, or paired code, but do not edit them
+without evidence.
+
+**Example**
+
+| file | commits together | historical co-edit rate |
+| --- | ---: | --- |
+| `src/foo_test.py` | 7 | high (70%) |
+| `src/foo.h` | 5 | medium (50%) |
+
+The table says "changed with this file"; it does not say "must be changed now."
+
+**Build your own:** compute artifact neighborhoods from historical artifacts,
+then present them as inspection guidance. Keep the edit decision grounded in the
+current request and current code.
+
+---
+
+## 9. Disposable Sub-Agents
+
+**Idea** - Exploration creates noise. Use disposable workers.
+
+Sub-agents are temporary nagent processes with isolated conversations. Their
+lifetime is not important; the useful artifact they return is important.
+
+| Long-lived agents | Disposable workers |
+| --- | --- |
+| Identity is central | Output artifact is central |
+| Shared context can become noisy | Child context is isolated |
+| Parent absorbs all exploration | Parent receives a concise result |
+| Delegation implies personality | Delegation is context management |
+
+**Implementation** - `<nagent-agent>` is handled by `execute_agent()`. The
+parent starts `bin/nagent` with the same root, provider, model, config, and pid,
+sets `--invocation delegated`, records the parent conversation, gives the child
+a UUID-based conversation name, and requests `--json`. The parent appends a
+`<nagent-agent-result>` containing the child conversation name, exit code,
+returned output, stderr, and token totals.
+
+The child has its own private conversation file. Parent and child do not share
+context except through explicit prompt and result text.
+
+**Example**
 
 ```xml
 <nagent-agent>
-Inspect the file split tests. Return only the behaviors the README should mention.
+Inspect the split and patch tests. Return only the behaviors the README should explain.
 </nagent-agent>
 ```
 
-`execute_agent()` starts the child with the same root, provider, model, config,
-and pid. It sets `--invocation delegated`, records the parent conversation name,
-uses a UUID-based child conversation name, and requests `--json` output. The
-parent appends only the useful returned response and token totals in a
-`<nagent-agent-result>`.
-
-The child's lifetime is not important. Its transcript may contain exploratory
-commands, dead ends, and local context. The parent keeps coordination and
-decisions.
-
-Delegation is primarily context management. It prevents the parent conversation
-from filling with logs that are useful only while investigating one question.
-
-**Build your own:** spawn child loops for bounded research or execution. Return
-a summary artifact to the parent, not the whole noisy transcript.
+**Build your own:** use child loops for bounded investigation, noisy diagnostics,
+or parallel work. Return a distilled artifact to the parent, not every scratch
+step.
 
 ---
 
-## 8. Controlled Writes
+## 10. Controlled Writes
 
-Observation: a loop that can write files needs boundaries.
+**Idea** - A loop that can write files needs explicit boundaries.
 
-Therefore: make write boundaries explicit.
-
-nagent has two structured write modes:
-
-| Mode | Structured write rule |
-| --- | --- |
-| Main conversation mode | `<nagent-write>` may write only under `/tmp`, `/var/tmp`, or `$TMPDIR`. |
-| Per-file edit mode | `<nagent-write>` may write the target file, the same file by stable file id after rename, or split segments associated with that target. |
-
-The rules are generated into the initial context by `file_edit_rules()` and
-enforced by `validate_write_path()` and `execute_write()`.
-
-This is a convention-based reference implementation, not a hardened sandbox.
-Shell commands still run as subprocesses with normal OS permissions. The prompt
-tells the model not to use shell commands to write project files, and structured
+nagent is a convention-based reference implementation, not a hardened sandbox.
+Shell commands are powerful and run with normal OS permissions. Structured
 writes are checked, but this is not a security boundary.
 
-The reason the rule exists is architectural: writes should be visible,
-restricted by mode, and represented as data. A failed write appends a
-`<nagent-write-result status="error">` wrapper to the conversation.
+**Implementation** - `file_edit_rules()` writes the policy into the initial
+context. `validate_write_path()` and `execute_write()` enforce it for
+`<nagent-write>`.
 
-**Build your own:** put write policy in both the prompt contract and the action
-handler. Be honest about what the policy does and does not protect.
+| Mode | Structured write boundary |
+| --- | --- |
+| Main conversation | May write only under `/tmp`, `/var/tmp`, or `$TMPDIR`. |
+| Per-file edit | May write the target file, the same file by stable file id, or split segments for that source. |
+
+The large-file rule is integrated with file-edit mode: split segment files from
+the target source may be edited, then merged through `nagent-file-patch`.
+Rejected writes append `<nagent-write-result status="error">` to the
+conversation.
+
+**Example**
+
+```xml
+<nagent-write path="/tmp/nagent-note.txt">scratch note</nagent-write>
+```
+
+In normal mode, the same tag targeting `src/foo.py` is rejected with a visible
+write-result error. Use `nagent-file-edit --file src/foo.py` for project edits.
+
+**Build your own:** put write boundaries in both the prompt and the action
+handler. Say plainly where the boundary ends.
 
 ---
 
-## 9. Large Files As Explicit Artifacts
+## 11. Large Files As Explicit Artifacts
 
-Observation: large files exceed context windows.
-
-Therefore: create explicit split, index, summary, and patch artifacts.
-
-Inline reads are capped at 64 KB by `READ_SPLIT_THRESHOLD_BYTES`. If a model asks
-for `<nagent-read>` on a larger file, `execute_read()` returns an error telling
-it to use `<nagent-file-read>`.
-
-`<nagent-file-read>` either returns small files inline or calls
-`nagent-file-split` and returns an index path plus segment paths. Split output
-lives under the nagent root, in `splits/{slug}-{uuid}/`, when invoked by the
-main loop.
-
-The split/edit/patch workflow is:
+**Idea** - Large files exceed context windows. Create split/index/patch
+artifacts instead of pretending the file is small.
 
 ```text
-source file
-  -> segment files + index.json
-  -> edit selected segments
-  -> unified diff patch
-  -> refreshed source file + refreshed index.json
+large source file
+    ->
+split index + segment files
+    ->
+bounded edits
+    ->
+patch artifact
+    ->
+updated source file
 ```
 
-`nagent-file-split` uses `bin/helpers/nagent_file_split_lib.py` plus per-type
-helper executables. It stores durable metadata in `index.json`: source path,
-source hash, source size, line count, split type, target bytes, natural-mode
-flag, creation time, segment count, and segment paths/line ranges.
+**Implementation** - Inline reads are capped at 64 KB in `bin/nagent`.
+`<nagent-file-read>` calls `nagent-file-split` when a file is larger. The split
+tool uses `bin/helpers/nagent_file_split_lib.py` and type-specific helper
+executables for `txt`, `md`, `cpp`, `py`, `xml`, `js`, `ts`, `json`, `yaml`,
+`go`, `rs`, and `java`. It writes segment files and an `index.json` containing
+source path, source hash, source size, line count, split type, target bytes,
+natural-mode flag, creation time, segment count, and line ranges.
 
-Supported split types are `txt`, `md`, `cpp`, `py`, `xml`, `js`, `ts`, `json`,
-`yaml`, `go`, `rs`, and `java`, with extension aliases such as `.tsx`, `.jsonc`,
-`.yml`, `.html`, `.pyi`, and `.mdx`. Natural split mode prefers type-specific
-boundaries such as paragraphs, headings, top-level Python definitions, braces,
-JSON/YAML depth, XML tags, and language declarations.
+Natural splitters prefer structure: markdown headings, blank lines, Python
+top-level definitions, brace depth for C-like languages, JSON/YAML depth, XML
+tags, and language declarations. `--refresh` rebuilds segments from an existing
+index after the source changes.
 
-`nagent-file-patch` validates the source hash before applying edits unless
-`--force` is used. It merges segments, writes a unified diff patch artifact,
-optionally applies the merged text, and refreshes index line numbers and the
-source hash. `--dry-run` writes the patch without changing the source or index;
-`--no-apply` refreshes the index without modifying the source file.
+`nagent-file-patch` validates the source hash unless `--force` is used, merges
+segment files, writes a unified diff patch artifact, optionally applies the
+merged source, and refreshes index line numbers and hash. `--dry-run` writes the
+patch without changing source or index. `--no-apply` writes the patch and
+refreshes metadata without modifying the source.
 
-`nagent-file-summarize` summarizes small files inline. For files over 64 KB it
+`nagent-file-summarize` summarizes small files inline. For files over 64 KB, it
 delegates to `nagent-file-split --summarize`, stores per-segment summaries in
 `index.json`, and returns a combined summary.
 
-**Build your own:** when context is too large, do not hide chunking inside an
-opaque retriever. Write the split index down, edit bounded artifacts, and verify
-the source before merging.
+**Example**
+
+```bash
+nagent-file-split --file src/big.py --output /tmp/big-split --json
+# edit /tmp/big-split/big-0001.py
+nagent-file-patch --index /tmp/big-split/index.json --json
+nagent-file-summarize --file src/big.py --json
+```
+
+**Build your own:** make chunking a durable data structure. Store the index,
+hash the source, edit bounded segment files, and write a patch artifact.
 
 ---
 
-## 10. Tool Discovery
+## 12. Tool Discovery
 
-Observation: tool registries can become hidden state.
+**Idea** - Tool capability should also be explicit data.
 
-Therefore: let executables describe themselves.
+There is no central registry in nagent. Tools describe themselves.
 
-Each top-level helper supports `--description`. `exit_on_description()` prints
-the executable path and description, then exits. `collect_bin_tool_descriptions()`
-iterates over executable files in `bin/`, runs each with `--description`, and
-inserts the collected text into the generated initial context.
+**Implementation** - `exit_on_description()` in `bin/helpers/nagent_cli.py`
+prints a tool's resolved path and description when `--description` appears in
+`sys.argv`. `collect_bin_tool_descriptions()` iterates over executable files in
+`bin/`, runs each with `--description`, and inserts successful descriptions into
+the generated initial context.
 
-There is no central registry. The startup prompt is assembled from explicit
-data produced by the tools themselves.
-
-Top-level tools:
+Top-level tools currently described this way:
 
 | Tool | Role |
 | --- | --- |
-| `nagent` | Main conversation loop and orchestration entrypoint. |
+| `nagent` | Main structured conversation loop. |
 | `nagent-llm-text` | Send a text file to the configured LLM. |
-| `nagent-llm-upload` | Upload a supported artifact with a prompt. |
+| `nagent-llm-upload` | Upload a supported file with a prompt. |
 | `nagent-file-edit` | Run a per-file conversation for one source file. |
-| `nagent-file-split` | Split large files into segment files plus `index.json`. |
-| `nagent-file-patch` | Merge edited segments, write a patch, validate hashes, refresh metadata. |
-| `nagent-file-summarize` | Summarize small files inline or large files through split summaries. |
+| `nagent-file-split` | Split a large file into segment files and `index.json`. |
+| `nagent-file-patch` | Merge edited segments, write a patch, validate hashes. |
+| `nagent-file-summarize` | Summarize small files inline or large files through splits. |
 
-Shared CLI helpers in `bin/helpers/nagent_cli.py` provide JSON output,
-`--description` handling, and the optional wait spinner.
+**Example**
 
-**Build your own:** make tool discovery executable and inspectable. A registry
-can be a derived artifact, not a place where behavior hides.
+```bash
+nagent --description
+nagent-file-split --description
+```
+
+The startup prompt is assembled from executable descriptions, root context,
+environment facts, and mode-specific rules. Even tool discovery is a data
+pipeline.
+
+**Build your own:** let tools emit their own capability descriptions. Build the
+prompt from those descriptions instead of maintaining a hidden registry.
 
 ---
 
-## 11. How This Differs From Frameworks
+## 13. How This Differs From Frameworks
 
-nagent is not an argument against frameworks. It is a different architectural
-style.
+**Idea** - This is a different architectural style, not a claim that frameworks
+are bad.
 
-| Framework-oriented style | nagent data-oriented style |
+nagent uses plain files, Python, subprocesses, and structured text. The novel
+part is artifact management and explicit data flow, not tool calling.
+
+**Implementation** - The whole system is readable through `bin/nagent`, the
+helper modules in `bin/helpers/`, thin command wrappers in `bin/`, and tests in
+`tests/`.
+
+| Framework-style system | nagent |
 | --- | --- |
-| Hidden state in object graphs, services, threads, or managed stores. | Explicit files: conversations, indexes, summaries, patches. |
-| Behavior described as agents with capabilities. | Behavior described as transformations over artifacts. |
-| Tool registry owned by framework code. | Executables describe themselves with `--description`. |
-| Session memory is primary. | Artifact memory is primary. |
-| Orchestration hidden behind framework abstractions. | `run_agent_loop()` shows append, call, parse, act, append, repeat. |
-| Tool failures may be exceptions or logs. | Failures are appended to conversation state. |
-| Large-context handling may be implicit. | Split indexes and summaries are durable data structures. |
+| hidden or managed state | explicit files |
+| session memory | artifact memory |
+| object/service graph | data artifacts |
+| central tool registry | executable descriptions |
+| long-lived agent abstraction | disposable workers |
+| opaque orchestration | visible transformations |
 
-The tradeoff is visible in the code. nagent is less polished, less abstract, and
-less protected than a production framework. It is also small enough to read in
-one sitting.
+| Common term | nagent framing |
+| --- | --- |
+| memory | editable artifact |
+| retrieval | preserved work / historical context |
+| agent | temporary transformation function |
+| context | explicit input data |
 
-**Build your own:** use a framework when it buys you something real. Otherwise,
-start with explicit artifacts and visible transformations.
+| Object graphs | Data artifacts |
+| --- | --- |
+| Behavior is distributed across services and objects. | Behavior is a transformation over files. |
+| State often lives behind interfaces. | State can be opened in an editor. |
+| Runtime topology is central. | Artifact shape is central. |
 
----
+| Retrieval | Preserved work |
+| --- | --- |
+| Find matching chunks at query time. | Keep conversations, summaries, history, and indexes as durable inputs. |
+| Context appears as a service result. | Context appears as editable data. |
 
-## 12. Build Your Own
-
-The whole system can be reduced to a recipe:
-
-1. Implement `generate_text(file) -> text`.
-2. Keep a durable conversation document.
-3. Generate initial context from explicit environment and tool data.
-4. Teach the model a small structured protocol.
-5. Parse the protocol strictly.
-6. Run action handlers.
-7. Append every result to the conversation.
-8. Retry malformed output by appending the failure and correction.
-9. Add child loops for noisy or scoped work.
-10. Add artifact-local memory for repeated work on the same file.
-11. Add split/index/summary/patch artifacts for large files.
-12. Let users save, load, summarize, edit, branch, and rewrite memory.
-
-Code reading order:
+**Example**
 
 ```text
-bin/nagent
-  main()
-  run_agent_loop()
-  call_llm()
-  parse_response()
-  process_tags()
-  execute_read()
-  execute_file_read()
-  execute_write()
-  execute_shell()
-  execute_agent()
+conversation file
+    -> LLM output with tags
+    -> parser
+    -> action handlers
+    -> result wrappers appended to conversation file
+```
 
+**Build your own:** use a framework when it buys something concrete. If the goal
+is to learn the architecture, start with files and transformations.
+
+---
+
+## 14. Build Your Own
+
+**Idea** - The architecture can be copied, modified, or rejected piece by piece.
+
+The minimal system is not mystical. It is a small loop over explicit state.
+
+**Implementation** - Read the code in this order:
+
+```text
+main()
+  run_agent_loop()
+    call_llm()
+    parse_response()
+    process_tags()
+```
+
+Then read:
+
+```text
 bin/helpers/nagent_llm.py
 bin/helpers/nagent_cli.py
 bin/helpers/nagent_file_edit_lib.py
@@ -533,17 +680,32 @@ bin/helpers/nagent_file_patch_lib.py
 bin/helpers/nagent_file_summarize_lib.py
 ```
 
-Then read the thin command wrappers in `bin/` and the tests in `tests/`.
-
 The tests are useful architecture notes. They cover parser behavior,
 conversation lifecycle, root context loading, retry behavior, token accounting,
-sub-agent wrapping, write validation, per-file edit indexing, split metadata,
-natural splitting, patch merging, hash validation, summaries, upload
-classification, provider configuration, tool descriptions, and CLI JSON output.
+sub-agent isolation, result wrappers, write validation, stable file ids,
+per-file edit indexing, git history context, people who edited a file,
+co-edited files, file summaries, split metadata, natural splitting, refresh,
+patch merging, hash validation, summary storage, upload classification, provider
+configuration, tool descriptions, setup paths, and CLI JSON output.
 
-**Build your own:** keep the first version plain. A text file, an LLM,
-structured tags, and a loop are enough to learn what kind of system you actually
-need.
+**Example**
+
+1. Implement `generate_text(file) -> str`.
+2. Keep a growing conversation document.
+3. Generate initial context that states the contract.
+4. Define an output format and parser.
+5. Write action handlers that append results back into state.
+6. Loop after actions.
+7. Retry malformed output with visible corrections.
+8. Add child loops for delegated work.
+9. Add per-artifact memory.
+10. Transform repository history into artifact context.
+11. Add split/index/patch for large files.
+12. Add save/load/edit/summarize tools for memory maintenance.
+
+**Build your own:** preserve work before preserving workers. If you can inspect,
+edit, copy, summarize, and replay the important artifacts, the agent loop can
+stay small.
 
 ---
 
@@ -559,8 +721,6 @@ cp config.example.json ~/.nagent/config.json
 Configuration loads from `NAGENT_CONFIG` or `~/.nagent/config.json`. CLI flags
 override config values.
 
-Example config:
-
 ```json
 {
   "provider": "openai",
@@ -568,21 +728,12 @@ Example config:
 }
 ```
 
-Provider defaults:
-
 | Provider | Default model | Credential environment variable |
 | --- | --- | --- |
 | `openai` | `gpt-5.5` | `OPENAI_API_KEY` |
 | `anthropic` | `claude-sonnet-4-6` | `ANTHROPIC_API_KEY` |
 | `google` | `gemini-2.5-flash` | `GOOGLE_API_KEY` or `GEMINI_API_KEY` |
 | `cursor` | `composer-2.5` | `CURSOR_API_KEY` |
-
-Useful environment variables:
-
-| Variable | Meaning |
-| --- | --- |
-| `NAGENT_CONFIG` | Path to config JSON. |
-| `NAGENT_NO_SPINNER=1` | Disable the optional spinner/status line. |
 
 ## Common Commands
 
@@ -596,21 +747,20 @@ nagent --clear
 nagent --save-conversation saved-copy
 nagent --load-conversation saved-copy
 nagent --summarize
-nagent --edit-conversation "summarize the useful parts and remove noise"
+nagent --edit-conversation "summarize useful parts and remove noise"
 nagent --file-edit src/foo.py "make this change"
 nagent --list-file-edits
 
 nagent-llm-text --file question.txt --json
 nagent-llm-upload --file diagram.png --prompt "Explain the diagram." --json
-nagent-file-split --file src/big_file.py --output /tmp/big-file-split --json
-nagent-file-patch --index /tmp/big-file-split/index.json --json
-nagent-file-summarize --file src/big_file.py --json
 nagent-file-edit --file src/foo.py "add validation"
+nagent-file-split --file src/big.py --output /tmp/big-split --json
+nagent-file-patch --index /tmp/big-split/index.json --json
+nagent-file-summarize --file src/big.py --json
 ```
 
-Use `--help` on any command for its current argument list. Use `--description`
-on top-level helper tools to see the text nagent can include in its startup
-context.
+Use `--help` for current flags. Use `--description` to see the description a
+tool contributes to startup context.
 
 ## Tests
 

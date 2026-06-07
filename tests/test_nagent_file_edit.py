@@ -225,6 +225,8 @@ class FileEditNagentTests(unittest.TestCase):
             self.assertIn("Creates the tracked file.", text)
             self.assertIn("Adds beta behavior.", text)
             self.assertIn("| helper.py | 1 |", text)
+            self.assertIn("Use these files as hints.", text)
+            self.assertIn("Do not edit them unless the user request or evidence requires it.", text)
             self.assertIn("{file-summary}", text)
             self.assertIn("Current file summary.", text)
 

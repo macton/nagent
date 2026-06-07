@@ -486,9 +486,17 @@ def format_file_history(
     lines.extend(["", "Files edited in the same commits:"])
     coedited = coedited_file_rows(repo_root, rel_path, commits)
     if coedited:
-        lines.extend(["| file | commits together | likelihood of same-commit edit |", "| --- | ---: | --- |"])
+        lines.extend(["| file | commits together | P(other file changed | target file changed) |", "| --- | ---: | --- |"])
         for changed, count, likelihood in coedited:
             lines.append(f"| {changed} | {count} | {likelihood} |")
+        lines.extend(
+            [
+                "",
+                "Use these files as hints. Before editing, inspect high-likelihood co-edited files "
+                "when the requested change may affect interfaces, tests, config, or paired code. "
+                "Do not edit them unless the user request or evidence requires it.",
+            ]
+        )
     else:
         lines.append("- None found.")
 
