@@ -17,7 +17,7 @@ from typing import Literal
 
 HELPERS_DIR = Path(__file__).resolve().parent / "helpers"
 sys.path.insert(0, str(HELPERS_DIR))
-from nagent_llm import PROVIDERS, list_models, require_credentials, resolve_provider, resolve_settings
+from nagent_llm import PROVIDERS, generate_text, list_models, require_credentials, resolve_provider, resolve_settings
 from nagent_cli import collect_bin_tool_descriptions, emit_json, exit_on_description, WaitSpinner
 from nagent_file_edit_lib import (
     file_id_for_path,
@@ -52,9 +52,11 @@ TAG_PATTERNS: list[tuple[TagType, re.Pattern[str]]] = [
 
 READ_SPLIT_THRESHOLD_BYTES = 64 * 1024
 NAGENT_FILE_SPLIT = Path(__file__).resolve().parent / "nagent-file-split"
+NAGENT_FILE_SUMMARIZE = Path(__file__).resolve().parent / "nagent-file-summarize"
 MAX_FORMAT_RETRIES = 3
 NAGENT_LLM_TEXT = Path(__file__).resolve().parent / "nagent-llm-text"
 INTERRUPTED_MESSAGE = "Interrupted..."
+FILE_HISTORY_COMMIT_LIMIT = 50
 _spinner_enabled = True
 
 # Whole-output wrappers that may accidentally be nested inside
@@ -252,6 +254,321 @@ def load_root_context(root: Path) -> str:
     return ""
 
 
+def _run_git(cwd: Path, args: list[str]) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        ["git", *args],
+        cwd=cwd,
+        capture_output=True,
+        text=True,
+    )
+
+
+def git_toplevel_for_path(path: Path) -> Path | None:
+    workdir = path.parent if path.is_file() else path
+    result = _run_git(workdir, ["rev-parse", "--show-toplevel"])
+    if result.returncode != 0:
+        return None
+    return Path(result.stdout.strip())
+
+
+def git_relative_path(repo_root: Path, path: Path) -> str:
+    try:
+        return str(path.resolve().relative_to(repo_root.resolve()))
+    except ValueError:
+        result = _run_git(repo_root, ["ls-files", "--full-name", "--", str(path)])
+        if result.returncode == 0 and result.stdout.strip():
+            return result.stdout.strip().splitlines()[0]
+    return str(path.resolve())
+
+
+def parse_existing_file_history(context: str | None) -> dict[str, str]:
+    if not context:
+        return {}
+    match = re.search(r"\{file-history\}(.*?)\{/file-history\}", context, re.DOTALL)
+    if match is None:
+        return {}
+    summaries: dict[str, str] = {}
+    for line in match.group(1).splitlines():
+        commit_match = re.match(r"- ([0-9a-f]{40}) \([0-9a-f]+\):\s*(.*)", line.strip())
+        if commit_match:
+            summaries[commit_match.group(1)] = commit_match.group(2).strip()
+    return summaries
+
+
+def parse_existing_file_summary(context: str | None) -> str | None:
+    if not context:
+        return None
+    match = re.search(r"\{file-summary\}(.*?)\{/file-summary\}", context, re.DOTALL)
+    if match is None:
+        return None
+    body = match.group(1).strip()
+    if "\n\n" in body:
+        return body.split("\n\n", 1)[1].strip()
+    return body
+
+
+def git_file_history(repo_root: Path, rel_path: str) -> list[dict[str, str]]:
+    result = _run_git(
+        repo_root,
+        [
+            "log",
+            "--follow",
+            f"--max-count={FILE_HISTORY_COMMIT_LIMIT}",
+            "--date=short",
+            "--format=%H%x1f%h%x1f%ad%x1f%an%x1f%ae%x1f%s",
+            "--",
+            rel_path,
+        ],
+    )
+    if result.returncode != 0 or not result.stdout.strip():
+        return []
+
+    commits: list[dict[str, str]] = []
+    for line in result.stdout.splitlines():
+        parts = line.split("\x1f")
+        if len(parts) != 6:
+            continue
+        full_hash, short_hash, date, author, email, subject = parts
+        commits.append(
+            {
+                "hash": full_hash,
+                "short": short_hash,
+                "date": date,
+                "author": author,
+                "email": email,
+                "subject": subject,
+            }
+        )
+    return commits
+
+
+def git_commit_files(repo_root: Path, commit_hash: str) -> list[str]:
+    result = _run_git(repo_root, ["diff-tree", "--no-commit-id", "--name-only", "-r", "--root", commit_hash])
+    if result.returncode != 0:
+        return []
+    return [line.strip() for line in result.stdout.splitlines() if line.strip()]
+
+
+def git_commit_file_patch(repo_root: Path, commit_hash: str, rel_path: str) -> str:
+    result = _run_git(
+        repo_root,
+        [
+            "show",
+            "--find-renames",
+            "--format=%B",
+            "--stat",
+            "--patch",
+            commit_hash,
+            "--",
+            rel_path,
+        ],
+    )
+    if result.returncode != 0 or not result.stdout.strip():
+        fallback = _run_git(repo_root, ["show", "--format=%B", "--stat", "--patch", "--find-renames", commit_hash])
+        if fallback.returncode != 0:
+            return ""
+        return fallback.stdout[:12000]
+    return result.stdout[:12000]
+
+
+def parse_llm_summary_json(text: str) -> dict[str, str]:
+    stripped = text.strip()
+    fence = re.match(r"```(?:json)?\s*(.*?)\s*```", stripped, re.DOTALL)
+    if fence:
+        stripped = fence.group(1).strip()
+    payload = json.loads(stripped)
+    if isinstance(payload, dict) and isinstance(payload.get("summaries"), list):
+        rows = payload["summaries"]
+    elif isinstance(payload, list):
+        rows = payload
+    else:
+        rows = []
+    summaries: dict[str, str] = {}
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        commit = row.get("commit")
+        summary = row.get("summary")
+        if isinstance(commit, str) and isinstance(summary, str):
+            summaries[commit] = " ".join(summary.split())
+    return summaries
+
+
+def summarize_new_file_commits(
+    repo_root: Path,
+    rel_path: str,
+    commits: list[dict[str, str]],
+    provider: str,
+    model: str,
+) -> dict[str, str]:
+    if not commits:
+        return {}
+
+    sections: list[str] = []
+    total_size = 0
+    for commit in commits:
+        patch = git_commit_file_patch(repo_root, commit["hash"], rel_path)
+        section = (
+            f"Commit: {commit['hash']}\n"
+            f"Date: {commit['date']}\n"
+            f"Author: {commit['author']} <{commit['email']}>\n"
+            f"Subject: {commit['subject']}\n"
+            f"Relevant diff/stat:\n{patch}\n"
+        )
+        if total_size + len(section) > 60000:
+            section = section[: max(0, 60000 - total_size)]
+        sections.append(section)
+        total_size += len(section)
+        if total_size >= 60000:
+            break
+
+    prompt = (
+        "Summarize each git commit's effect on the target file in one short sentence. "
+        "Return only JSON in this form: "
+        '{"summaries":[{"commit":"<full commit hash>","summary":"<short summary>"}]}.\n'
+        f"Target file: {rel_path}\n\n"
+        + "\n---\n".join(sections)
+    )
+    try:
+        return parse_llm_summary_json(generate_text(prompt, provider, model))
+    except Exception:
+        return {}
+
+
+def coedited_file_rows(repo_root: Path, rel_path: str, commits: list[dict[str, str]]) -> list[tuple[str, int, str]]:
+    counts: dict[str, int] = {}
+    for commit in commits:
+        for changed in git_commit_files(repo_root, commit["hash"]):
+            if changed == rel_path:
+                continue
+            counts[changed] = counts.get(changed, 0) + 1
+
+    total = max(1, len(commits))
+    rows: list[tuple[str, int, str]] = []
+    for changed, count in sorted(counts.items(), key=lambda item: (-item[1], item[0]))[:20]:
+        ratio = count / total
+        if ratio >= 0.5:
+            likelihood = "high"
+        elif ratio >= 0.2:
+            likelihood = "medium"
+        else:
+            likelihood = "low"
+        rows.append((changed, count, f"{likelihood} ({round(ratio * 100)}%)"))
+    return rows
+
+
+def format_file_history(
+    repo_root: Path,
+    rel_path: str,
+    commits: list[dict[str, str]],
+    summaries: dict[str, str],
+) -> str:
+    people: dict[str, int] = {}
+    for commit in commits:
+        label = f"{commit['author']} <{commit['email']}>"
+        people[label] = people.get(label, 0) + 1
+
+    lines = [
+        "{file-history}",
+        f"File: {rel_path}",
+        f"Repository: {repo_root}",
+        "",
+        "Individuals who edited this file:",
+    ]
+    for person, count in sorted(people.items(), key=lambda item: (-item[1], item[0])):
+        lines.append(f"- {person}: {count} commit{'s' if count != 1 else ''}")
+
+    lines.extend(["", "Step-by-step history:"])
+    for commit in reversed(commits):
+        summary = summaries.get(commit["hash"]) or commit["subject"]
+        lines.append(f"- {commit['date']} {commit['short']} {commit['author']}: {summary}")
+
+    lines.extend(["", "Files edited in the same commits:"])
+    coedited = coedited_file_rows(repo_root, rel_path, commits)
+    if coedited:
+        lines.extend(["| file | commits together | likelihood of same-commit edit |", "| --- | ---: | --- |"])
+        for changed, count, likelihood in coedited:
+            lines.append(f"| {changed} | {count} | {likelihood} |")
+    else:
+        lines.append("- None found.")
+
+    lines.extend(["", "Summarized commits:"])
+    for commit in commits:
+        summary = summaries.get(commit["hash"]) or commit["subject"]
+        lines.append(f"- {commit['hash']} ({commit['short']}): {summary}")
+    lines.append("{/file-history}")
+    return "\n".join(lines)
+
+
+def run_file_summary(path: Path, provider: str, model: str, config_path: Path | None) -> str:
+    command = [
+        str(NAGENT_FILE_SUMMARIZE),
+        "--file",
+        str(path),
+        "--provider",
+        provider,
+        "--model",
+        model,
+        "--json",
+    ]
+    if config_path is not None:
+        command.extend(["--config", str(config_path.expanduser())])
+
+    result = subprocess.run(command, capture_output=True, text=True)
+    if result.returncode != 0:
+        error = result.stderr.strip() or result.stdout.strip() or "nagent-file-summarize failed"
+        return f"Unavailable: {error}"
+    try:
+        payload = json.loads(result.stdout)
+    except json.JSONDecodeError:
+        return result.stdout.strip()
+    summary = payload.get("summary")
+    return summary.strip() if isinstance(summary, str) else ""
+
+
+def file_edit_history_and_summary_block(
+    file_edit_path: Path,
+    provider: str | None,
+    model: str | None,
+    config_path: Path | None,
+    previous_initial_context: str | None,
+) -> str:
+    if provider is None or model is None:
+        return ""
+
+    repo_root = git_toplevel_for_path(file_edit_path)
+    existing_commit_summaries = parse_existing_file_history(previous_initial_context)
+    existing_summary = parse_existing_file_summary(previous_initial_context)
+    file_summary = existing_summary
+    file_history = ""
+    new_commits: list[dict[str, str]] = []
+
+    if repo_root is not None:
+        rel_path = git_relative_path(repo_root, file_edit_path)
+        commits = git_file_history(repo_root, rel_path)
+        new_commits = [commit for commit in commits if commit["hash"] not in existing_commit_summaries]
+        new_summaries = summarize_new_file_commits(repo_root, rel_path, new_commits, provider, model)
+        summaries = dict(existing_commit_summaries)
+        for commit in new_commits:
+            summaries[commit["hash"]] = new_summaries.get(commit["hash"], commit["subject"])
+        file_history = format_file_history(repo_root, rel_path, commits, summaries) if commits else ""
+
+    if file_summary is None or new_commits:
+        file_summary = run_file_summary(file_edit_path, provider, model, config_path)
+
+    summary_block = "\n".join(
+        [
+            "{file-summary}",
+            f"File: {file_edit_path}",
+            "Source: nagent-file-summarize",
+            "",
+            file_summary or "No summary available.",
+            "{/file-summary}",
+        ]
+    )
+    return "\n\n".join(part for part in (file_history, summary_block) if part)
+
+
 def build_initial_context(
     root: Path,
     process_path: Path,
@@ -260,6 +577,10 @@ def build_initial_context(
     parent_conversation: str | None = None,
     file_edit_path: Path | None = None,
     file_edit_id: str | None = None,
+    provider: str | None = None,
+    model: str | None = None,
+    config_path: Path | None = None,
+    previous_initial_context: str | None = None,
 ) -> str:
     parent = parent_conversation or "none"
     if invocation == "user":
@@ -280,9 +601,19 @@ def build_initial_context(
     root_context = load_root_context(root)
     root_context_block = f"\n{root_context}\n" if root_context else ""
     file_edit_block = ""
+    file_edit_detail_block = ""
     if file_edit_path is not None:
         file_edit_block = f"\n- file id: {file_edit_id or 'unknown'}"
         file_edit_block += f"\n- file-edit target: {file_edit_path}"
+        file_edit_details = file_edit_history_and_summary_block(
+            file_edit_path,
+            provider,
+            model,
+            config_path,
+            previous_initial_context,
+        )
+        if file_edit_details:
+            file_edit_detail_block = f"\n{file_edit_details}\n"
 
     return f"""<initial_context>
 Instance:
@@ -309,6 +640,7 @@ Context management (every nagent instance, including sub-agents):
 
 {file_edit_rules(file_edit_path)}
 
+{file_edit_detail_block}
 {root_context_block}
 {role_instructions}
 </initial_context>"""
@@ -370,7 +702,13 @@ def refresh_initial_context(
     parent_conversation: str | None = None,
     file_edit_path: Path | None = None,
     file_edit_id: str | None = None,
+    provider: str | None = None,
+    model: str | None = None,
+    config_path: Path | None = None,
 ) -> None:
+    content = conversation_file.read_text(encoding="utf-8")
+    existing_context_match = INITIAL_CONTEXT_PATTERN.search(content)
+    previous_initial_context = existing_context_match.group(0) if existing_context_match else None
     updated_context = build_initial_context(
         root,
         process_path,
@@ -379,8 +717,11 @@ def refresh_initial_context(
         parent_conversation,
         file_edit_path,
         file_edit_id,
+        provider,
+        model,
+        config_path,
+        previous_initial_context,
     )
-    content = conversation_file.read_text(encoding="utf-8")
     if INITIAL_CONTEXT_PATTERN.search(content):
         content = INITIAL_CONTEXT_PATTERN.sub(updated_context, content, count=1)
     else:
@@ -1616,6 +1957,9 @@ def main() -> None:
         args.parent_conversation,
         file_edit_path,
         file_edit_id,
+        provider,
+        model,
+        args.config,
     )
 
     token_stats = TokenStats()

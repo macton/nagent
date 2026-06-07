@@ -262,8 +262,8 @@ Token accounting is deliberately simple. `TokenStats` tracks turn count,
 conversation input tokens, recursive input tokens, and recursive output tokens.
 `nagent-llm-text --json` supplies usage when available; otherwise nagent falls
 back to a rough character estimate. Child agent JSON output contributes to the
-recursive totals. Direct user runs print a final status line unless the run is
-not user-direct or `NAGENT_NO_SPINNER=1` disables the spinner.
+recursive totals. Direct user runs print a final status line; `NAGENT_NO_SPINNER`
+only disables the spinner while the loop is waiting.
 
 **Build your own:** after every action, append the result to durable state and
 call the model again. Do not keep important loop state only in memory.

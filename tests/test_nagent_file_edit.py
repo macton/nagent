@@ -138,6 +138,187 @@ class FileEditNagentTests(unittest.TestCase):
         context = text.split("</initial_context>", 1)[0]
         self.assertNotIn("Do not use shell commands to write files outside temp directories", context)
 
+    def test_file_edit_context_includes_git_history_and_summary(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "repo"
+            repo.mkdir()
+            target = repo / "tracked.py"
+            sibling = repo / "helper.py"
+            subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True, text=True)
+            subprocess.run(["git", "config", "user.name", "Test User"], cwd=repo, check=True)
+            subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=repo, check=True)
+
+            target.write_text("alpha\n", encoding="utf-8")
+            subprocess.run(["git", "add", "tracked.py"], cwd=repo, check=True)
+            subprocess.run(
+                [
+                    "git",
+                    "-c",
+                    "user.name=Alice",
+                    "-c",
+                    "user.email=alice@example.com",
+                    "commit",
+                    "-m",
+                    "add tracked file",
+                ],
+                cwd=repo,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+
+            target.write_text("alpha\nbeta\n", encoding="utf-8")
+            sibling.write_text("helper\n", encoding="utf-8")
+            subprocess.run(["git", "add", "tracked.py", "helper.py"], cwd=repo, check=True)
+            subprocess.run(
+                [
+                    "git",
+                    "-c",
+                    "user.name=Bob",
+                    "-c",
+                    "user.email=bob@example.com",
+                    "commit",
+                    "-m",
+                    "expand tracked file",
+                ],
+                cwd=repo,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            commits = subprocess.run(
+                ["git", "log", "--format=%H", "--", "tracked.py"],
+                cwd=repo,
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.splitlines()
+            summary_payload = {
+                "summaries": [
+                    {"commit": commits[0], "summary": "Adds beta behavior."},
+                    {"commit": commits[1], "summary": "Creates the tracked file."},
+                ]
+            }
+            fake_summary = repo / "fake-summary"
+            fake_summary.write_text(
+                "#!/usr/bin/python3\nimport json\nprint(json.dumps({'summary': 'Current file summary.'}))\n",
+                encoding="utf-8",
+            )
+            fake_summary.chmod(0o755)
+
+            with unittest.mock.patch.object(self.mod, "NAGENT_FILE_SUMMARIZE", fake_summary):
+                with unittest.mock.patch.object(self.mod, "generate_text", return_value=json.dumps(summary_payload)):
+                    text = self.mod.build_initial_context(
+                        Path(tmp) / "nagent-root",
+                        NAGENT.resolve(),
+                        "user",
+                        "conv-file",
+                        file_edit_path=target,
+                        file_edit_id="1:2",
+                        provider="openai",
+                        model="gpt-test",
+                    )
+
+            self.assertIn("{file-history}", text)
+            self.assertIn("Alice <alice@example.com>", text)
+            self.assertIn("Bob <bob@example.com>", text)
+            self.assertIn("Creates the tracked file.", text)
+            self.assertIn("Adds beta behavior.", text)
+            self.assertIn("| helper.py | 1 |", text)
+            self.assertIn("{file-summary}", text)
+            self.assertIn("Current file summary.", text)
+
+    def test_file_edit_context_reuses_existing_history_until_new_commit(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "repo"
+            repo.mkdir()
+            target = repo / "tracked.py"
+            subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True, text=True)
+            subprocess.run(["git", "config", "user.name", "Test User"], cwd=repo, check=True)
+            subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=repo, check=True)
+
+            target.write_text("alpha\n", encoding="utf-8")
+            subprocess.run(["git", "add", "tracked.py"], cwd=repo, check=True)
+            subprocess.run(["git", "commit", "-m", "add tracked file"], cwd=repo, check=True, capture_output=True, text=True)
+            first_commit = subprocess.run(
+                ["git", "rev-parse", "HEAD"],
+                cwd=repo,
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+            first_payload = {"summaries": [{"commit": first_commit, "summary": "Initial summary."}]}
+            fake_summary = repo / "fake-summary"
+            fake_summary.write_text(
+                "#!/usr/bin/python3\nimport json\nprint(json.dumps({'summary': 'Summary v1.'}))\n",
+                encoding="utf-8",
+            )
+            fake_summary.chmod(0o755)
+
+            with unittest.mock.patch.object(self.mod, "NAGENT_FILE_SUMMARIZE", fake_summary):
+                with unittest.mock.patch.object(self.mod, "generate_text", return_value=json.dumps(first_payload)):
+                    previous = self.mod.build_initial_context(
+                        Path(tmp) / "nagent-root",
+                        NAGENT.resolve(),
+                        "user",
+                        "conv-file",
+                        file_edit_path=target,
+                        file_edit_id="1:2",
+                        provider="openai",
+                        model="gpt-test",
+                    )
+
+                with unittest.mock.patch.object(self.mod, "generate_text") as summarize_commits:
+                    reused = self.mod.build_initial_context(
+                        Path(tmp) / "nagent-root",
+                        NAGENT.resolve(),
+                        "user",
+                        "conv-file",
+                        file_edit_path=target,
+                        file_edit_id="1:2",
+                        provider="openai",
+                        model="gpt-test",
+                        previous_initial_context=previous,
+                    )
+
+            summarize_commits.assert_not_called()
+            self.assertIn("Initial summary.", reused)
+            self.assertIn("Summary v1.", reused)
+
+            target.write_text("alpha\nbeta\n", encoding="utf-8")
+            subprocess.run(["git", "add", "tracked.py"], cwd=repo, check=True)
+            subprocess.run(["git", "commit", "-m", "expand tracked file"], cwd=repo, check=True, capture_output=True, text=True)
+            second_commit = subprocess.run(
+                ["git", "rev-parse", "HEAD"],
+                cwd=repo,
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+            second_payload = {"summaries": [{"commit": second_commit, "summary": "Second summary."}]}
+            fake_summary.write_text(
+                "#!/usr/bin/python3\nimport json\nprint(json.dumps({'summary': 'Summary v2.'}))\n",
+                encoding="utf-8",
+            )
+
+            with unittest.mock.patch.object(self.mod, "NAGENT_FILE_SUMMARIZE", fake_summary):
+                with unittest.mock.patch.object(self.mod, "generate_text", return_value=json.dumps(second_payload)):
+                    refreshed = self.mod.build_initial_context(
+                        Path(tmp) / "nagent-root",
+                        NAGENT.resolve(),
+                        "user",
+                        "conv-file",
+                        file_edit_path=target,
+                        file_edit_id="1:2",
+                        provider="openai",
+                        model="gpt-test",
+                        previous_initial_context=previous,
+                    )
+
+            self.assertIn("Initial summary.", refreshed)
+            self.assertIn("Second summary.", refreshed)
+            self.assertIn("Summary v2.", refreshed)
+
     def test_execute_read_rejects_large_file(self):
         with tempfile.NamedTemporaryFile(mode="wb", delete=False) as handle:
             handle.write(b"x" * (self.mod.READ_SPLIT_THRESHOLD_BYTES + 1))
