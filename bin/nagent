@@ -54,6 +54,7 @@ READ_SPLIT_THRESHOLD_BYTES = 64 * 1024
 NAGENT_FILE_SPLIT = Path(__file__).resolve().parent / "nagent-file-split"
 MAX_FORMAT_RETRIES = 3
 NAGENT_LLM_TEXT = Path(__file__).resolve().parent / "nagent-llm-text"
+INTERRUPTED_MESSAGE = "Interrupted..."
 _spinner_enabled = True
 
 # Whole-output wrappers that may accidentally be nested inside
@@ -182,6 +183,75 @@ def file_edit_rules(file_edit_path: Path | None) -> str:
 {large_file_guidance()}"""
 
 
+def parse_context_yaml_paths(content: str) -> list[str]:
+    try:
+        import yaml  # type: ignore[import-not-found]
+
+        loaded = yaml.safe_load(content)
+        if isinstance(loaded, list):
+            return [str(item) for item in loaded if item is not None]
+        if isinstance(loaded, dict) and isinstance(loaded.get("paths"), list):
+            return [str(item) for item in loaded["paths"] if item is not None]
+    except ImportError:
+        pass
+    except Exception:
+        return []
+
+    paths: list[str] = []
+    for line in content.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#") or stripped in ("---", "..."):
+            continue
+        if stripped.endswith(":"):
+            continue
+        if stripped.startswith("-"):
+            stripped = stripped[1:].strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        if " #" in stripped:
+            stripped = stripped.split(" #", 1)[0].rstrip()
+        if len(stripped) >= 2 and stripped[0] == stripped[-1] and stripped[0] in ("'", '"'):
+            stripped = stripped[1:-1]
+        if stripped:
+            paths.append(stripped)
+    return paths
+
+
+def load_context_path(root: Path, path: Path, seen: set[Path]) -> str:
+    resolved = path if path.is_absolute() else root / path
+    try:
+        resolved = resolved.resolve()
+    except OSError:
+        return ""
+    if resolved in seen or not resolved.is_file():
+        return ""
+    seen.add(resolved)
+
+    try:
+        content = resolved.read_text(encoding="utf-8")
+    except OSError:
+        return ""
+
+    if resolved.name == "context.yaml":
+        parts = [
+            load_context_path(root, Path(child), seen)
+            for child in parse_context_yaml_paths(content)
+        ]
+        return "\n".join(part for part in parts if part)
+    return content
+
+
+def load_root_context(root: Path) -> str:
+    yaml_context = root / "context.yaml"
+    markdown_context = root / "context.md"
+    seen: set[Path] = set()
+    if yaml_context.is_file():
+        return load_context_path(root, yaml_context, seen).strip()
+    if markdown_context.is_file():
+        return load_context_path(root, markdown_context, seen).strip()
+    return ""
+
+
 def build_initial_context(
     root: Path,
     process_path: Path,
@@ -207,6 +277,8 @@ def build_initial_context(
     git_section = f"\n{git_context}" if git_context else ""
     tools_section = collect_bin_tool_descriptions(process_path.parent)
     tools_block = f"\n\n{tools_section}" if tools_section else ""
+    root_context = load_root_context(root)
+    root_context_block = f"\n{root_context}\n" if root_context else ""
     file_edit_block = ""
     if file_edit_path is not None:
         file_edit_block = f"\n- file id: {file_edit_id or 'unknown'}"
@@ -237,6 +309,7 @@ Context management (every nagent instance, including sub-agents):
 
 {file_edit_rules(file_edit_path)}
 
+{root_context_block}
 {role_instructions}
 </initial_context>"""
 
@@ -407,6 +480,10 @@ def append_to_conversation(conversation_file: Path, text: str) -> None:
         handle.write(text)
 
 
+def record_interrupt(conversation_file: Path) -> None:
+    append_to_conversation(conversation_file, INTERRUPTED_MESSAGE)
+
+
 def estimate_token_count(text: str) -> int:
     if not text:
         return 0
@@ -459,12 +536,15 @@ def call_llm(
         conversation_text = ""
     token_stats.conversation_input_tokens = estimate_token_count(conversation_text)
 
-    with wait_spinner(token_stats.status_line()):
-        result = subprocess.run(
-            command,
-            capture_output=True,
-            text=True,
-        )
+    try:
+        with wait_spinner(token_stats.status_line()):
+            result = subprocess.run(
+                command,
+                capture_output=True,
+                text=True,
+            )
+    except Exception as exc:
+        return None, str(exc)
     if result.returncode != 0:
         error = result.stderr.strip() or result.stdout.strip() or "nagent-llm-text failed"
         return None, error
@@ -829,8 +909,12 @@ def run_agent_loop(
         for attempt in range(MAX_FORMAT_RETRIES):
             llm_output, error = call_llm(conversation_file, llm, token_stats)
             if error is not None:
-                print(f"Error: {error}", file=sys.stderr)
-                return 1, user_responses
+                append_to_conversation(
+                    conversation_file,
+                    f"<system>LLM provider error on attempt {attempt + 1} of "
+                    f"{MAX_FORMAT_RETRIES}: {error}</system>",
+                )
+                continue
 
             tags, parse_error = parse_response(llm_output)
             if tags is not None:
@@ -843,10 +927,18 @@ def run_agent_loop(
                 f"Respond only with valid nagent tags.</system>",
             )
         else:
-            print(
-                f"Error: nagent response remained invalid after {MAX_FORMAT_RETRIES} attempts.",
-                file=sys.stderr,
-            )
+            if error is not None:
+                message = (
+                    f"Error: LLM provider failed after {MAX_FORMAT_RETRIES} attempts; "
+                    "nagent cannot continue."
+                )
+            else:
+                message = (
+                    f"Error: nagent response remained invalid after {MAX_FORMAT_RETRIES} attempts."
+                )
+            user_responses.append(message)
+            if not json_mode:
+                print(message)
             return 1, user_responses
 
         append_to_conversation(conversation_file, f"<agent-response>\n{llm_output}\n</agent-response>")
@@ -1527,17 +1619,22 @@ def main() -> None:
     )
 
     token_stats = TokenStats()
-    exit_code, responses = run_agent_loop(
-        conversation_file,
-        root,
-        llm,
-        initial_prompt,
-        pid,
-        file_edit_path,
-        file_edit_id,
-        json_mode=args.json,
-        token_stats=token_stats,
-    )
+    try:
+        exit_code, responses = run_agent_loop(
+            conversation_file,
+            root,
+            llm,
+            initial_prompt,
+            pid,
+            file_edit_path,
+            file_edit_id,
+            json_mode=args.json,
+            token_stats=token_stats,
+        )
+    except KeyboardInterrupt:
+        record_interrupt(conversation_file)
+        print(INTERRUPTED_MESSAGE)
+        return 130
     if args.json:
         payload = {
             "exit_code": exit_code,

@@ -2,6 +2,11 @@
 
 Write `README.md` for the `nagent` project.
 
+Before writing, inspect the current source code. Do not rely only on this prompt
+or on an existing README. Read the main scripts under `bin/`, the helper modules
+under `bin/helpers/`, and the tests when needed, then make sure every important
+moving part appears in the walkthrough or a later reference section.
+
 The README should explain nagent as a small, readable reference implementation
 of agent-like behavior: a text file, an LLM, structured tags, and a loop. Its
 job is not to market nagent as a framework or product. Its job is to teach the
@@ -20,6 +25,8 @@ The README should make these ideas clear:
 - nagent is a reference implementation, not a competitor to agent frameworks.
 - The reader should come away understanding the design well enough to copy,
   modify, or discard pieces of it.
+- The README should be grounded in the actual code as it exists now, not in an
+  idealized architecture.
 
 Use a direct, explanatory tone. Prefer concrete examples over abstract claims.
 Avoid hype, vague promises, and framework jargon unless contrasting nagent with
@@ -80,6 +87,17 @@ Include the following details.
 - Include the core phrase or idea: a text file, an LLM, structured tags, and a
   loop.
 - Say the README walks through the design step by step and maps it to code.
+- Include a short "What it looks like" or similar introduction subsection with a
+  couple of quick examples showing nagent doing complex, multi-step work, such
+  as:
+  - using `nagent` to inspect a project and then `nagent-file-edit` to make a
+    scoped code edit and run tests;
+  - asking nagent to investigate and update an obscure Linux configuration
+    detail, while reading files, running diagnostic commands, and explaining the
+    planned change before touching anything.
+- The examples should be concrete command snippets, but should not promise
+  sandboxed safety or pretend nagent can modify protected system files without
+  the normal OS permissions.
 
 ### LLM Primitive
 
@@ -104,6 +122,13 @@ Include the following details.
 
 - Explain that repeated invocations in the same shell append to that file.
 - Emphasize that there is no separate memory service.
+- Explain default pid selection, including GNU screen `STY`/`WINDOW`, `BASHPID`,
+  and parent-process fallback.
+- Explain conversation lifecycle commands: `--clear`, `--status`,
+  `--save-conversation`, `--load-conversation`, `--summarize`, and
+  `--edit-conversation`.
+- Explain root context loading from `~/.nagent/context.md` or
+  `~/.nagent/context.yaml`, including recursive YAML path expansion.
 
 ### Structured Tags
 
@@ -119,6 +144,13 @@ Include the following details.
   - `<nagent-next>...</nagent-next>`
   - `<nagent-agent>...</nagent-agent>`
 - Mention `parse_response()` in `bin/nagent`.
+- Mention result wrappers appended by action handlers, including
+  `<nagent-read-result>`, `<nagent-file-read-result>`,
+  `<nagent-file-patch-result>`, `<nagent-write-result>`,
+  `<nagent-shell-result>`, and `<nagent-agent-result>`.
+- Explain `clean_user_output()` briefly: final user output strips accidental
+  whole-response wrappers or a single surrounding markdown fence without
+  treating inline examples as protocol tags.
 
 ### Agent Loop
 
@@ -139,6 +171,11 @@ Include the following details.
 
 - Mention the code path `main()` -> `run_agent_loop()` -> `call_llm()` ->
   `process_tags()`.
+- Explain invalid-format retry behavior: malformed model output is appended back
+  to the conversation with a system correction, up to `MAX_FORMAT_RETRIES`.
+- Explain token/status accounting at a high level: `TokenStats`, JSON output
+  from `nagent-llm-text`, recursive sub-agent token totals, and the optional
+  spinner/status line.
 
 ### Sub-Agents
 
@@ -147,6 +184,9 @@ Include the following details.
 - Show a `<nagent-agent>` example.
 - Explain that the parent receives only the child final response, wrapped as a
   result, rather than the whole child history.
+- Mention delegated invocation context, unique child conversation names, shared
+  pid/root/provider/model/config, and recursive token accounting from child JSON
+  output.
 
 ### Write Safety
 
@@ -155,6 +195,9 @@ Include the following details.
   - Per-file edit session: project file writes through `nagent-file-edit`.
 - State that shell writes are discouraged and not fully sandboxed.
 - Frame this as safety by convention for a demo/reference implementation.
+- Explain that write validation allows temp paths in `/tmp`, `/var/tmp`, or
+  `$TMPDIR`; a per-file edit session may write only the target file or split
+  segments associated with that target.
 
 ### Large Files
 
@@ -163,6 +206,11 @@ Include the following details.
 - Mention `nagent-file-split`, `nagent-file-patch`, and
   `nagent-file-summarize`.
 - Explain that large-file summaries are stored in split metadata.
+- Explain that `nagent-file-split` can use type-specific natural splitters for
+  common source/config/document formats, and supports refresh/summarize
+  workflows.
+- Explain that `nagent-file-patch` validates the source hash before merging
+  segment edits and writes a patch artifact.
 
 ### Per-File Editing
 
@@ -177,6 +225,27 @@ Include the following details.
 
 - Explain the stable file id concept and show a small JSON example with
   `by_file_id`, `file_id`, `path`, and `conversation`.
+- Explain that `nagent --file-edit` is the lower-level mode used by
+  `nagent-file-edit`, and that `nagent --list-file-edits` reports the per-shell
+  file edit index.
+
+### LLM Providers and Uploads
+
+- Explain shared provider/config behavior from `bin/helpers/nagent_llm.py`:
+  provider selection, default models, config lookup, CLI overrides, credential
+  environment variables, and package checks.
+- Mention text generation with usage accounting through `nagent-llm-text
+  --json`.
+- Mention file upload support through `nagent-llm-upload` for supported images,
+  PDFs, office documents, CSV/JSON/text/code files, and the size/type checks.
+
+### CLI and Tool Discovery
+
+- Explain `--description` as the mechanism that lets nagent collect tool
+  descriptions for the initial context.
+- Mention shared CLI helpers in `bin/helpers/nagent_cli.py`, including JSON
+  output and the wait spinner.
+- Mention stdin prompt handling, including trailing `-` and piped stdin.
 
 ### Framework Comparison
 
@@ -204,6 +273,32 @@ Include the following details.
       parse_response()
       process_tags()
   ```
+
+### Source Coverage Checklist
+
+Before finishing the README, verify that the walkthrough or reference sections
+cover these code elements somewhere:
+
+- `bin/nagent`: initial context creation, root context loading, conversation
+  naming, prompt resolution, tag parsing, invalid-format retries, action
+  dispatch, conversation save/load/clear/status/summarize/edit commands,
+  delegated sub-agents, token accounting, JSON mode, and write validation.
+- `bin/nagent-llm-text` and `bin/helpers/nagent_llm.py`: provider config,
+  default models, credential/package checks, text generation, upload generation,
+  usage reporting, and model listing.
+- `bin/nagent-llm-upload`: supported file categories, upload size/type checks,
+  prompts, and JSON output.
+- `bin/nagent-file-edit` and `bin/helpers/nagent_file_edit_lib.py`: stable file
+  ids, per-pid file indexes, per-file conversations, and source path resolution.
+- `bin/nagent-file-split`, natural splitter helpers, and
+  `bin/helpers/nagent_file_split_lib.py`: split metadata, line ranges,
+  natural boundaries, refresh, and summarization.
+- `bin/nagent-file-patch` and `bin/helpers/nagent_file_patch_lib.py`: source
+  hash validation, patch generation, merge behavior, and refreshed line numbers.
+- `bin/nagent-file-summarize` and `bin/helpers/nagent_file_summarize_lib.py`:
+  small-file summaries, large-file split summaries, and metadata updates.
+- `bin/helpers/nagent_cli.py`: `--description`, JSON emission, and spinner
+  behavior.
 
 ### Tool Reference
 

@@ -210,6 +210,83 @@ class ActionTests(unittest.TestCase):
         self.assertEqual(stats.recursive_input_tokens, 17)
         self.assertEqual(stats.recursive_output_tokens, 5)
 
+    def test_call_llm_returns_subprocess_exceptions_as_errors(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            conversation = Path(tmp) / "conversation"
+            conversation.write_text("prompt text", encoding="utf-8")
+
+            def fake_run(*args, **kwargs):
+                raise RuntimeError("bridge failed")
+
+            stats = self.mod.TokenStats()
+            with unittest.mock.patch.object(self.mod.subprocess, "run", fake_run):
+                output, error = self.mod.call_llm(
+                    conversation,
+                    self.mod.LlmSettings(provider="openai", model="gpt-5.5"),
+                    stats,
+                )
+
+        self.assertIsNone(output)
+        self.assertEqual(error, "bridge failed")
+
+    def test_run_agent_loop_retries_llm_errors(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            conversation = root / "conversation"
+            conversation.write_text("initial", encoding="utf-8")
+            attempts = []
+
+            def fake_call_llm(*args, **kwargs):
+                attempts.append(1)
+                if len(attempts) == 1:
+                    return None, "transient bridge failure"
+                return "<nagent-response>retry ok</nagent-response>", None
+
+            with unittest.mock.patch.object(self.mod, "call_llm", fake_call_llm):
+                code, responses = self.mod.run_agent_loop(
+                    conversation,
+                    root,
+                    self.mod.LlmSettings(provider="openai", model="gpt-5.5"),
+                    "hello",
+                    "4242",
+                    json_mode=True,
+                )
+            contents = conversation.read_text(encoding="utf-8")
+
+        self.assertEqual(code, 0)
+        self.assertEqual(responses, ["retry ok"])
+        self.assertEqual(len(attempts), 2)
+        self.assertIn("LLM provider error on attempt 1", contents)
+
+    def test_run_agent_loop_reports_after_llm_retry_exhaustion(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            conversation = root / "conversation"
+            conversation.write_text("initial", encoding="utf-8")
+
+            with unittest.mock.patch.object(
+                self.mod,
+                "call_llm",
+                return_value=(None, "persistent bridge failure"),
+            ):
+                code, responses = self.mod.run_agent_loop(
+                    conversation,
+                    root,
+                    self.mod.LlmSettings(provider="openai", model="gpt-5.5"),
+                    "hello",
+                    "4242",
+                    json_mode=True,
+                )
+            contents = conversation.read_text(encoding="utf-8")
+
+        self.assertEqual(code, 1)
+        self.assertEqual(
+            responses,
+            ["Error: LLM provider failed after 3 attempts; nagent cannot continue."],
+        )
+        self.assertIn("LLM provider error on attempt 3", contents)
+        self.assertIn("persistent bridge failure", contents)
+
     def test_default_pid_prefers_screen_window(self):
         env = os.environ.copy()
         env.update({"STY": "screen-name", "WINDOW": "7", "BASHPID": "9999"})
@@ -237,6 +314,45 @@ class ActionTests(unittest.TestCase):
         name = self.mod.default_conversation_name("4242")
         self.assertTrue(name.endswith("-4242"))
         self.assertIn("latest-", name)
+
+    def test_load_root_context_reads_context_md(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "context.md").write_text("Project-specific guidance.\n", encoding="utf-8")
+
+            self.assertEqual(self.mod.load_root_context(root), "Project-specific guidance.")
+
+    def test_load_root_context_expands_context_yaml_recursively(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            nested = root / "nested"
+            nested.mkdir()
+            (root / "one.md").write_text("First context.\n", encoding="utf-8")
+            (nested / "two.md").write_text("Second context.\n", encoding="utf-8")
+            (nested / "context.yaml").write_text("- nested/two.md\n- missing.md\n", encoding="utf-8")
+            (root / "context.yaml").write_text("- one.md\n- nested/context.yaml\n", encoding="utf-8")
+
+            self.assertEqual(
+                self.mod.load_root_context(root),
+                "First context.\n\nSecond context.",
+            )
+
+    def test_build_initial_context_inserts_root_context_before_role_instructions(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "context.md").write_text("Custom root context.\n", encoding="utf-8")
+            context = self.mod.build_initial_context(
+                root,
+                NAGENT.resolve(),
+                "user",
+                "conv",
+            )
+
+        self.assertIn("Custom root context.", context)
+        self.assertLess(
+            context.index("Custom root context."),
+            context.index("User invocation:"),
+        )
 
     def test_resolve_initial_prompt_prefers_cli_prompt(self):
         with unittest.mock.patch.object(self.mod.sys, "stdin", io.StringIO("from stdin")):
@@ -420,6 +536,34 @@ class ActionTests(unittest.TestCase):
 
             self.assertEqual(code, 0)
             self.assertEqual(stdout.getvalue().strip().splitlines(), ["done"])
+
+    def test_main_records_keyboard_interrupt(self):
+        mod = load_nagent_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            argv = [
+                "nagent",
+                "--root",
+                str(root),
+                "--conversation",
+                "conv",
+                "hello",
+            ]
+
+            def fake_run_agent_loop(*args, **kwargs):
+                raise KeyboardInterrupt()
+
+            with unittest.mock.patch.object(mod.sys, "argv", argv), \
+                unittest.mock.patch.object(mod.sys, "stdout", io.StringIO()) as stdout, \
+                unittest.mock.patch.object(mod, "require_credentials"), \
+                unittest.mock.patch.object(mod, "run_agent_loop", fake_run_agent_loop):
+                code = mod.main()
+
+            conversation = root / "conversations" / "conv"
+            self.assertEqual(code, 130)
+            self.assertEqual(stdout.getvalue(), "Interrupted...\n")
+            self.assertTrue(conversation.exists())
+            self.assertIn("Interrupted...", conversation.read_text(encoding="utf-8"))
 
     def test_save_and_load_conversation_helpers(self):
         with tempfile.TemporaryDirectory() as tmp:
