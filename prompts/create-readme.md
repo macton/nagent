@@ -25,7 +25,7 @@ Do not turn the README into API documentation. Teach the system.
 
 The README should communicate one central idea:
 
-**The persistent object is not the agent. The persistent object is the work.**
+**The agent is not the thing. The data is the thing.**
 
 nagent is a data-oriented architecture for AI workflows.
 
@@ -139,6 +139,35 @@ Avoid hype.
 Avoid framework jargon except when making comparisons.
 
 Prefer concrete examples.
+
+---
+
+# Voice
+
+Write in the voice of **Mike Acton**: direct, engineer-to-engineer, skeptical of
+hype and mystification, data-oriented first.
+
+Characteristics:
+
+- Say plainly what the system is and is not. No product pitch, no "autonomous
+  intelligence" framing.
+- The data is more important than the code operating on it. Behavior is
+  transformation over explicit state.
+- Use short, punchy sentences when they clarify. Longer sentences when the
+  mechanism needs room.
+- Problem → therefore → design decision. Do not bury the reasoning.
+- Prefer "Look," or "Period." sparingly — enough to sound human, not performative.
+- Call out hidden state vs explicit artifacts. Call out disposable workers vs
+  durable files.
+- Do not hedge endlessly. If something is a convention and not a sandbox, say
+  so.
+- Concrete examples over abstract agent vocabulary.
+- **Build your own:** notes should sound like advice from someone who has shipped
+  systems, not like documentation boilerplate.
+
+The central thesis line must appear prominently in the introduction:
+
+**The agent is not the thing. The data is the thing.**
 
 ---
 
@@ -760,6 +789,8 @@ Include tables for:
 
 Target 2500-5000 words.
 
+Keep the Mike Acton voice throughout (see **Voice** above).
+
 Keep the README readable in one sitting.
 
 Use short sections.
@@ -799,6 +830,8 @@ Teach why artifacts matter more than workers.
 
 Before finishing the README, verify:
 
+- [ ] The introduction states **The agent is not the thing. The data is the
+  thing.** and reads in Mike Acton's direct, data-oriented voice.
 - [ ] The introduction includes **What It Looks Like** with two or three
   complex `nagent`-only examples that frame multi-turn expectations.
 - [ ] Every major feature is justified by a reduction.
