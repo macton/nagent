@@ -1,0 +1,135 @@
+#!/usr/bin/python3
+
+import argparse
+import json
+import os
+import subprocess
+import sys
+from pathlib import Path
+
+NAGENT = Path(__file__).resolve().parent / "nagent"
+
+HELPERS_DIR = Path(__file__).resolve().parent / "helpers"
+sys.path.insert(0, str(HELPERS_DIR))
+from nagent_cli import emit_json, exit_on_description
+from nagent_file_edit_lib import file_index_path, resolve_file_edit_conversation
+
+NAGENT_FILE_EDIT_DESCRIPTION = """\
+Run nagent against a per-file conversation for editing one source file.
+Use when a parent nagent (or you) need to edit a project file without bloating
+the main conversation. Each file gets a stable file id and conversation under
+conversations/file-index-{pid}.json for continuity across edits."""
+
+
+def default_pid() -> str:
+    return os.environ.get("BASHPID") or str(os.getppid())
+
+
+def conversations_dir(root: Path) -> Path:
+    return root / "conversations"
+
+
+def main() -> None:
+    exit_on_description(NAGENT_FILE_EDIT_DESCRIPTION)
+
+    parser = argparse.ArgumentParser(
+        description="Edit a file using a dedicated per-file nagent conversation.",
+    )
+    parser.add_argument("--file", required=True, type=Path, help="Path to the file to edit.")
+    parser.add_argument(
+        "--root",
+        default="~/.nagent",
+        help="nagent root directory (default: ~/.nagent).",
+    )
+    parser.add_argument(
+        "--pid",
+        help="Shell process ID for file-index lookup (default: BASHPID or parent shell pid).",
+    )
+    parser.add_argument(
+        "--provider",
+        help="LLM provider passed through to nagent.",
+    )
+    parser.add_argument(
+        "--model",
+        help="Model passed through to nagent.",
+    )
+    parser.add_argument(
+        "--config",
+        type=Path,
+        help="Config path passed through to nagent.",
+    )
+    parser.add_argument(
+        "--clear",
+        action="store_true",
+        help="Archive the per-file conversation and start fresh, then exit unless a prompt is given.",
+    )
+    parser.add_argument(
+        "--json",
+        action="store_true",
+        help="Print structured JSON result instead of plain stdout.",
+    )
+    parser.add_argument("prompt", nargs="?", help="Prompt text describing the edit.")
+    args = parser.parse_args()
+
+    root = Path(args.root).expanduser()
+    pid = args.pid or default_pid()
+    source = args.file.expanduser()
+
+    try:
+        conversation_name, resolved, file_id = resolve_file_edit_conversation(root, pid, source)
+    except FileNotFoundError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        raise SystemExit(1)
+
+    conversation_path = conversations_dir(root) / conversation_name
+    command = [
+        str(NAGENT),
+        "--file-edit",
+        str(source),
+        "--root",
+        str(root),
+        "--pid",
+        pid,
+    ]
+    if args.provider:
+        command.extend(["--provider", args.provider])
+    if args.model:
+        command.extend(["--model", args.model])
+    if args.config:
+        command.extend(["--config", str(args.config.expanduser())])
+    if args.clear:
+        command.append("--clear")
+    if args.json:
+        command.append("--json")
+    if args.prompt is not None:
+        command.append(args.prompt)
+
+    if args.json:
+        result = subprocess.run(command, capture_output=True, text=True)
+        exit_code = result.returncode
+        nagent_payload = {}
+        if result.stdout.strip():
+            try:
+                nagent_payload = json.loads(result.stdout)
+            except json.JSONDecodeError:
+                nagent_payload = {"stdout": result.stdout}
+        payload = {
+            "exit_code": exit_code,
+            "file_id": file_id,
+            "source_path": str(resolved),
+            "conversation_name": conversation_name,
+            "conversation_path": str(conversation_path.resolve()),
+            "file_index_path": str(file_index_path(root, pid).resolve()),
+            "cleared": args.clear,
+            "nagent": nagent_payload,
+            "stderr": result.stderr or "",
+        }
+        emit_json(payload)
+    else:
+        exit_code = subprocess.run(command).returncode
+
+    raise SystemExit(exit_code)
+
+
+if __name__ == "__main__":
+    main()

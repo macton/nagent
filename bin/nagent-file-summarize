@@ -1,0 +1,126 @@
+#!/usr/bin/python3
+
+import argparse
+import json
+import subprocess
+import sys
+from pathlib import Path
+
+HELPERS_DIR = Path(__file__).resolve().parent / "helpers"
+sys.path.insert(0, str(HELPERS_DIR))
+from nagent_llm import add_llm_arguments, resolve_from_args
+from nagent_cli import emit_json, exit_on_description
+from nagent_file_summarize_lib import (
+    SUMMARIZE_THRESHOLD_BYTES,
+    combined_summary_from_index,
+    summarize_file_path,
+)
+
+NAGENT_FILE_SPLIT = Path(__file__).resolve().parent / "nagent-file-split"
+
+NAGENT_FILE_SUMMARIZE_DESCRIPTION = """\
+Summarize a text file using the configured LLM. For files larger than 64KB,
+automatically splits with nagent-file-split --summarize, summarizes each segment,
+and stores per-segment summaries in index.json. Use when you need a quick overview
+of a file without loading the full contents into context."""
+
+
+def summarize_via_split(
+    source: Path,
+    output: Path | None,
+    provider: str,
+    model: str,
+    config_path: Path | None,
+) -> dict:
+    command = [
+        str(NAGENT_FILE_SPLIT),
+        "--file",
+        str(source),
+        "--summarize",
+        "--json",
+        "--provider",
+        provider,
+        "--model",
+        model,
+    ]
+    if config_path is not None:
+        command.extend(["--config", str(config_path)])
+    if output is not None:
+        command.extend(["--output", str(output)])
+
+    result = subprocess.run(command, capture_output=True, text=True)
+    if result.returncode != 0:
+        error = result.stderr.strip() or result.stdout.strip() or "nagent-file-split failed"
+        raise RuntimeError(error)
+
+    payload = json.loads(result.stdout)
+    return {
+        "mode": "split",
+        "file": str(source.resolve()),
+        "size_bytes": source.stat().st_size,
+        "index_path": payload.get("index_path"),
+        "summary": payload.get("summary") or combined_summary_from_index(payload),
+        "segment_count": payload.get("segment_count"),
+        "segments": payload.get("segments", []),
+        "provider": provider,
+        "model": model,
+    }
+
+
+def main() -> None:
+    exit_on_description(NAGENT_FILE_SUMMARIZE_DESCRIPTION)
+
+    parser = argparse.ArgumentParser(description="Summarize a text file with the configured LLM.")
+    parser.add_argument("--file", required=True, type=Path, help="Path to the file to summarize.")
+    parser.add_argument(
+        "--output",
+        type=Path,
+        help="Output directory for split+summarize when the file exceeds 64KB.",
+    )
+    parser.add_argument(
+        "--json",
+        action="store_true",
+        help="Print structured JSON output instead of plain text.",
+    )
+    add_llm_arguments(parser)
+    args = parser.parse_args()
+
+    source = args.file.expanduser()
+    if not source.is_file():
+        print(f"Error: file not found: {source}", file=sys.stderr)
+        sys.exit(1)
+
+    provider, model = resolve_from_args(args)
+    size = source.stat().st_size
+
+    try:
+        if size > SUMMARIZE_THRESHOLD_BYTES:
+            payload = summarize_via_split(
+                source,
+                args.output.expanduser() if args.output else None,
+                provider,
+                model,
+                args.config.expanduser() if args.config else None,
+            )
+        else:
+            summary = summarize_file_path(source, provider, model)
+            payload = {
+                "mode": "inline",
+                "file": str(source.resolve()),
+                "size_bytes": size,
+                "summary": summary,
+                "provider": provider,
+                "model": model,
+            }
+    except (RuntimeError, json.JSONDecodeError) as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        sys.exit(1)
+
+    if args.json:
+        emit_json(payload)
+    else:
+        print(payload["summary"])
+
+
+if __name__ == "__main__":
+    main()

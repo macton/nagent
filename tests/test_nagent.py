@@ -1,6 +1,8 @@
 #!/usr/bin/python3
 
 import importlib.util
+import io
+import json
 import os
 import subprocess
 import sys
@@ -15,12 +17,16 @@ NAGENT_LLM_TEXT = BIN / "nagent-llm-text"
 NAGENT_LLM_UPLOAD = BIN / "nagent-llm-upload"
 NAGENT_FILE_SPLIT = BIN / "nagent-file-split"
 NAGENT_FILE_PATCH = BIN / "nagent-file-patch"
+NAGENT_FILE_EDIT = BIN / "nagent-file-edit"
+NAGENT_FILE_SUMMARIZE = BIN / "nagent-file-summarize"
 BIN_TOOLS = (
     NAGENT,
     NAGENT_LLM_TEXT,
     NAGENT_LLM_UPLOAD,
     NAGENT_FILE_SPLIT,
     NAGENT_FILE_PATCH,
+    NAGENT_FILE_EDIT,
+    NAGENT_FILE_SUMMARIZE,
 )
 
 
@@ -106,14 +112,21 @@ class ParseResponseTests(unittest.TestCase):
         text = (
             '<nagent-response>Hello</nagent-response>\n'
             '<nagent-read path="/tmp/foo" />\n'
+            '<nagent-file-read path="/tmp/big.py" />\n'
+            '<nagent-file-patch index="/tmp/split/index.json" />\n'
             "<nagent-next>continue</nagent-next>"
         )
         tags, err = self.mod.parse_response(text)
         self.assertIsNone(err)
-        self.assertEqual([t.kind for t in tags], ["response", "read", "next"])
+        self.assertEqual(
+            [t.kind for t in tags],
+            ["response", "read", "file_read", "file_patch", "next"],
+        )
         self.assertEqual(tags[0].content, "Hello")
         self.assertEqual(tags[1].path, "/tmp/foo")
-        self.assertEqual(tags[2].content, "continue")
+        self.assertEqual(tags[2].path, "/tmp/big.py")
+        self.assertEqual(tags[3].path, "/tmp/split/index.json")
+        self.assertEqual(tags[4].content, "continue")
 
     def test_invalid_leading_text(self):
         tags, err = self.mod.parse_response("oops <nagent-response>Hi</nagent-response>")
@@ -167,6 +180,35 @@ class ActionTests(unittest.TestCase):
         name = self.mod.default_conversation_name("4242")
         self.assertTrue(name.endswith("-4242"))
         self.assertIn("latest-", name)
+
+    def test_resolve_initial_prompt_prefers_cli_prompt(self):
+        with unittest.mock.patch.object(self.mod.sys, "stdin", io.StringIO("from stdin")):
+            self.assertEqual(self.mod.resolve_initial_prompt("from cli"), "from cli")
+
+    def test_resolve_initial_prompt_reads_piped_stdin(self):
+        with unittest.mock.patch.object(self.mod.sys, "stdin", io.StringIO("from stdin")):
+            self.assertEqual(self.mod.resolve_initial_prompt(None), "from stdin")
+
+    def test_resolve_initial_prompt_treats_empty_stdin_as_absent(self):
+        with unittest.mock.patch.object(self.mod.sys, "stdin", io.StringIO("")):
+            self.assertIsNone(self.mod.resolve_initial_prompt(None))
+
+    def test_resolve_initial_prompt_skips_unready_pipe(self):
+        read_fd, write_fd = os.pipe()
+        stdin = os.fdopen(read_fd, "r", encoding="utf-8")
+        try:
+            with unittest.mock.patch.object(self.mod.sys, "stdin", stdin):
+                self.assertIsNone(self.mod.resolve_initial_prompt(None))
+        finally:
+            stdin.close()
+            os.close(write_fd)
+
+    def test_resolve_initial_prompt_ignores_tty_stdin(self):
+        stdin = unittest.mock.Mock()
+        stdin.isatty.return_value = True
+        with unittest.mock.patch.object(self.mod.sys, "stdin", stdin):
+            self.assertIsNone(self.mod.resolve_initial_prompt(None))
+            stdin.read.assert_not_called()
 
     def test_execute_agent_passes_pid(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -296,6 +338,14 @@ class ToolDescriptionTests(unittest.TestCase):
         self.assertIn("orchestrator", result.stdout.lower())
 
 
+class WaitSpinnerTests(unittest.TestCase):
+    def test_wait_spinner_disabled_does_not_raise(self):
+        mod = load_nagent_module()
+        mod.set_spinner_enabled(False)
+        with mod.wait_spinner("Testing"):
+            pass
+
+
 class RefreshInitialContextTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -364,11 +414,52 @@ class CliTests(unittest.TestCase):
         self.assertEqual(result.returncode, 1)
         self.assertIn("file not found", result.stderr)
 
+    def test_list_file_edits_cli(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "tracked.py"
+            source.write_text("x\n", encoding="utf-8")
+            subprocess.run(
+                [
+                    str(NAGENT),
+                    "--file-edit",
+                    str(source),
+                    "--root",
+                    str(root),
+                    "--pid",
+                    "1234",
+                    "--clear",
+                ],
+                capture_output=True,
+                text=True,
+                env={**self.clean_env(), "BASHPID": "1234"},
+            )
+            result = subprocess.run(
+                [
+                    str(NAGENT),
+                    "--root",
+                    str(root),
+                    "--pid",
+                    "1234",
+                    "--list-file-edits",
+                    "--json",
+                ],
+                capture_output=True,
+                text=True,
+                env={**self.clean_env(), "BASHPID": "1234"},
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            payload = json.loads(result.stdout)
+            self.assertEqual(payload["pid"], "1234")
+            self.assertEqual(len(payload["files"]), 1)
+            self.assertEqual(payload["files"][0]["path"], str(source.resolve()))
+
     def test_status_prints_path_size_provider_and_model(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             conv = "status-test"
-            conversation_file = root / conv
+            conversation_file = root / "conversations" / conv
+            conversation_file.parent.mkdir(parents=True)
             conversation_file.write_text("hello", encoding="utf-8")
 
             result = subprocess.run(
@@ -395,7 +486,7 @@ class CliTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             conv = "status-test"
-            conversation_file = root / conv
+            conversation_file = root / "conversations" / conv
 
             result = subprocess.run(
                 [
@@ -423,7 +514,7 @@ class CliTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             conv = "missing-conv"
-            conversation_file = root / conv
+            conversation_file = root / "conversations" / conv
 
             result = subprocess.run(
                 [
@@ -445,6 +536,85 @@ class CliTests(unittest.TestCase):
             self.assertEqual(lines[0], f"conversation:{conversation_file} size:0")
             self.assertEqual(lines[1], "provider:openai model:gpt-5.5")
 
+    def test_clear_archives_existing_conversation(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            conv = "clear-test"
+            conversation_file = root / "conversations" / conv
+            conversation_file.parent.mkdir(parents=True)
+            conversation_file.write_text("<user-prompt>\nold history\n</user-prompt>\n", encoding="utf-8")
+
+            result = subprocess.run(
+                [str(NAGENT), "--root", str(root), "--conversation", conv, "--clear"],
+                capture_output=True,
+                text=True,
+                env=self.clean_env(),
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            lines = result.stdout.strip().splitlines()
+            self.assertTrue(lines[0].startswith("archived:"))
+            self.assertEqual(lines[1], f"conversation:{conversation_file}")
+
+            archived_path = Path(lines[0].split(":", 1)[1])
+            self.assertTrue(archived_path.is_file())
+            self.assertIn("old history", archived_path.read_text(encoding="utf-8"))
+            self.assertNotEqual(archived_path, conversation_file)
+
+            fresh = conversation_file.read_text(encoding="utf-8")
+            self.assertIn("<initial_context>", fresh)
+            self.assertNotIn("old history", fresh)
+
+    def test_clear_without_existing_conversation(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            conv = "clear-new"
+            conversation_file = root / "conversations" / conv
+
+            result = subprocess.run(
+                [str(NAGENT), "--root", str(root), "--conversation", conv, "--clear"],
+                capture_output=True,
+                text=True,
+                env=self.clean_env(),
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(
+                result.stdout.strip(),
+                f"conversation:{conversation_file}",
+            )
+            self.assertTrue(conversation_file.is_file())
+            self.assertIn("<initial_context>", conversation_file.read_text(encoding="utf-8"))
+
+    def test_legacy_root_conversation_moves_to_conversations_dir(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            conv = "legacy-conv"
+            legacy_file = root / conv
+            conversation_file = root / "conversations" / conv
+            legacy_file.write_text("legacy history", encoding="utf-8")
+
+            result = subprocess.run(
+                [
+                    str(NAGENT),
+                    "--root",
+                    str(root),
+                    "--conversation",
+                    conv,
+                    "--config",
+                    str(root / "missing-config.json"),
+                    "--status",
+                ],
+                capture_output=True,
+                text=True,
+                env=self.clean_env(),
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertFalse(legacy_file.exists())
+            self.assertEqual(conversation_file.read_text(encoding="utf-8"), "legacy history")
+            self.assertEqual(
+                result.stdout.strip().splitlines()[0],
+                f"conversation:{conversation_file} size:{conversation_file.stat().st_size}",
+            )
+
     def test_nagent_seeds_conversation(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -464,7 +634,7 @@ class CliTests(unittest.TestCase):
                 encoding="utf-8",
             )
 
-            code = mod.run_agent_loop(
+            code, responses = mod.run_agent_loop(
                 conversation_file,
                 root,
                 mod.LlmSettings(provider="openai", model="gpt-5.5"),
@@ -472,6 +642,7 @@ class CliTests(unittest.TestCase):
                 "4242",
             )
             self.assertEqual(code, 0)
+            self.assertEqual(responses, ["seed ok"])
 
             self.assertTrue(conversation_file.exists())
             contents = conversation_file.read_text(encoding="utf-8")
@@ -530,7 +701,7 @@ class LiveIntegrationTests(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertIn("integration-ok", result.stdout)
 
-            conversation = Path(tmp) / "live-test"
+            conversation = Path(tmp) / "conversations" / "live-test"
             self.assertTrue(conversation.exists())
             self.assertIn("<user-prompt>", conversation.read_text(encoding="utf-8"))
 

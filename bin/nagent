@@ -1,8 +1,10 @@
 #!/usr/bin/python3
 
 import argparse
+import json
 import os
 import re
+import select
 import socket
 import subprocess
 import sys
@@ -14,7 +16,16 @@ from typing import Literal
 HELPERS_DIR = Path(__file__).resolve().parent / "helpers"
 sys.path.insert(0, str(HELPERS_DIR))
 from nagent_llm import PROVIDERS, list_models, require_credentials, resolve_provider, resolve_settings
-from nagent_cli import collect_bin_tool_descriptions, exit_on_description
+from nagent_cli import collect_bin_tool_descriptions, emit_json, exit_on_description, WaitSpinner
+from nagent_file_edit_lib import (
+    file_id_for_path,
+    is_split_segment_for_source,
+    list_file_edits,
+    resolve_file_edit_conversation,
+    same_file,
+)
+from nagent_file_patch_lib import apply_segment_patches
+from nagent_file_split_lib import slugify
 
 NAGENT_DESCRIPTION = """\
 Autonomous agent orchestrator for structured terminal workflows.
@@ -24,19 +35,25 @@ and write files, run shell commands, continue reasoning, and delegate work to
 sub-agents. Prefer nagent for human-driven requests and scoped sub-agent tasks."""
 
 Invocation = Literal["user", "delegated"]
-TagType = Literal["response", "read", "write", "shell", "next", "agent"]
+TagType = Literal["response", "read", "file_read", "file_patch", "write", "shell", "next", "agent"]
 
 TAG_PATTERNS: list[tuple[TagType, re.Pattern[str]]] = [
     ("response", re.compile(r"<nagent-response>(.*?)</nagent-response>", re.DOTALL)),
     ("read", re.compile(r'<nagent-read\s+path="([^"]*)"\s*/>')),
+    ("file_read", re.compile(r'<nagent-file-read\s+path="([^"]*)"\s*/>')),
+    ("file_patch", re.compile(r'<nagent-file-patch\s+index="([^"]*)"\s*/>')),
     ("write", re.compile(r'<nagent-write\s+path="([^"]*)">(.*?)</nagent-write>', re.DOTALL)),
     ("shell", re.compile(r"<nagent-shell>(.*?)</nagent-shell>", re.DOTALL)),
     ("next", re.compile(r"<nagent-next>(.*?)</nagent-next>", re.DOTALL)),
     ("agent", re.compile(r"<nagent-agent>(.*?)</nagent-agent>", re.DOTALL)),
 ]
 
+READ_SPLIT_THRESHOLD_BYTES = 64 * 1024
+NAGENT_FILE_SPLIT = Path(__file__).resolve().parent / "nagent-file-split"
+
 MAX_FORMAT_RETRIES = 3
 NAGENT_LLM_TEXT = Path(__file__).resolve().parent / "nagent-llm-text"
+_spinner_enabled = True
 
 # Whole-output wrappers that may accidentally be nested inside
 # <nagent-response>.  These are internal protocol details and should not be
@@ -62,6 +79,15 @@ class LlmSettings:
     provider: str
     model: str
     config_path: Path | None = None
+
+
+def set_spinner_enabled(enabled: bool) -> None:
+    global _spinner_enabled
+    _spinner_enabled = enabled
+
+
+def wait_spinner(message: str) -> WaitSpinner:
+    return WaitSpinner(message, enabled=_spinner_enabled)
 
 
 def host_uname() -> str:
@@ -98,12 +124,37 @@ def git_repo_context(cwd: Path | None = None) -> str:
     return f"- git toplevel: {toplevel.stdout.strip()}\n- git remote -v:\n{remote_block}"
 
 
+def large_file_guidance() -> str:
+    threshold_kb = READ_SPLIT_THRESHOLD_BYTES // 1024
+    return f"""Large files (>{threshold_kb}KB):
+- Use <nagent-file-read path="..."/> instead of <nagent-read>; it auto-splits large files.
+- Edit the segment files listed in the returned index.json.
+- Merge edits back with <nagent-file-patch index="{{index-path}}"/>."""
+
+
+def file_edit_rules(file_edit_path: Path | None) -> str:
+    if file_edit_path is not None:
+        return f"""File editing (this session):
+- You may use <nagent-write> on this file: {file_edit_path}
+- You may also write segment files from a split of this file (via <nagent-file-read>).
+- Merge segment edits with <nagent-file-patch index="{{index-path}}"/>.
+- Do not use shell commands to write files; use <nagent-write> for edits.
+{large_file_guidance()}"""
+
+    return f"""File editing:
+- Do not use shell commands to write files outside temp directories (/tmp, /var/tmp, or $TMPDIR).
+- To edit project files, use nagent-file-edit; <nagent-write> is allowed only under temp directories.
+{large_file_guidance()}"""
+
+
 def build_initial_context(
     root: Path,
     process_path: Path,
     invocation: Invocation,
     conversation_name: str,
     parent_conversation: str | None = None,
+    file_edit_path: Path | None = None,
+    file_edit_id: str | None = None,
 ) -> str:
     parent = parent_conversation or "none"
     if invocation == "user":
@@ -121,12 +172,16 @@ def build_initial_context(
     git_section = f"\n{git_context}" if git_context else ""
     tools_section = collect_bin_tool_descriptions(process_path.parent)
     tools_block = f"\n\n{tools_section}" if tools_section else ""
+    file_edit_block = ""
+    if file_edit_path is not None:
+        file_edit_block = f"\n- file id: {file_edit_id or 'unknown'}"
+        file_edit_block += f"\n- file-edit target: {file_edit_path}"
 
     return f"""<initial_context>
 Instance:
 - invocation: {invocation}
 - conversation: {conversation_name}
-- parent conversation: {parent}
+- parent conversation: {parent}{file_edit_block}
 
 Environment:
 - nagent root: {root}
@@ -145,6 +200,8 @@ Context management (every nagent instance, including sub-agents):
 - Keep in your own conversation only coordination, decisions, and small direct steps for your assigned task.
 - Give each sub-agent a self-contained prompt with goal, constraints, paths, and the result format you need back.
 
+{file_edit_rules(file_edit_path)}
+
 {role_instructions}
 </initial_context>"""
 
@@ -155,6 +212,8 @@ def create_initial_text(
     invocation: Invocation,
     conversation_name: str,
     parent_conversation: str | None = None,
+    file_edit_path: Path | None = None,
+    file_edit_id: str | None = None,
 ) -> str:
     if invocation == "user":
         response_hint = "Use <nagent-response> to communicate with the human user."
@@ -167,6 +226,8 @@ def create_initial_text(
         invocation,
         conversation_name,
         parent_conversation,
+        file_edit_path,
+        file_edit_id,
     )
 
     return f"""You are nagent, an autonomous agent. Respond only with one or more of these structured tags (no other text):
@@ -175,15 +236,18 @@ def create_initial_text(
 
 <nagent-response>{{text to respond to user}}</nagent-response>
 <nagent-read path="{{file-path-to-read}}" />
+<nagent-file-read path="{{file-path-to-read}}" />
+<nagent-file-patch index="{{index-json-path}}" />
 <nagent-write path="{{file-path-to-write}}">{{file content}}</nagent-write>
 <nagent-shell>{{shell commands}}</nagent-shell>
 <nagent-next>{{prompt}}</nagent-next>
 <nagent-agent>{{prompt}}</nagent-agent>
 
 {response_hint}
-Use <nagent-read> to request reading a file; results will be appended to your conversation.
-Use <nagent-write> to write a file.
-Use <nagent-shell> to run shell commands; output will be appended to your conversation.
+Use <nagent-read> for small files; use <nagent-file-read> when the file may exceed {READ_SPLIT_THRESHOLD_BYTES // 1024}KB.
+Use <nagent-write> for temp files, or in a nagent-file-edit session for the target file only.
+Do not use shell commands to write files outside temp directories.
+Use <nagent-shell> for other commands; output will be appended to your conversation.
 Use <nagent-next> to continue reasoning with an appended prompt.
 Use <nagent-agent> to delegate a sub-task to a separate nagent instance.
 """
@@ -196,6 +260,8 @@ def refresh_initial_context(
     invocation: Invocation,
     conversation_name: str,
     parent_conversation: str | None = None,
+    file_edit_path: Path | None = None,
+    file_edit_id: str | None = None,
 ) -> None:
     updated_context = build_initial_context(
         root,
@@ -203,6 +269,8 @@ def refresh_initial_context(
         invocation,
         conversation_name,
         parent_conversation,
+        file_edit_path,
+        file_edit_id,
     )
     content = conversation_file.read_text(encoding="utf-8")
     if INITIAL_CONTEXT_PATTERN.search(content):
@@ -240,7 +308,7 @@ def parse_response(text: str) -> tuple[list[NagentTag] | None, str | None]:
             if not match:
                 continue
 
-            if kind == "read":
+            if kind == "read" or kind == "file_read" or kind == "file_patch":
                 tags.append(NagentTag(kind=kind, content="", path=match.group(1)))
             elif kind in ("write",):
                 tags.append(NagentTag(kind=kind, content=match.group(2), path=match.group(1)))
@@ -313,11 +381,12 @@ def call_llm(conversation_file: Path, llm: LlmSettings) -> tuple[str | None, str
     if llm.config_path is not None:
         command.extend(["--config", str(llm.config_path)])
 
-    result = subprocess.run(
-        command,
-        capture_output=True,
-        text=True,
-    )
+    with wait_spinner("Waiting for LLM"):
+        result = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+        )
     if result.returncode != 0:
         error = result.stderr.strip() or result.stdout.strip() or "nagent-llm-text failed"
         return None, error
@@ -328,11 +397,156 @@ def execute_read(path: str) -> str:
     file_path = Path(path)
     if not file_path.is_file():
         return f'<nagent-read-result path="{path}" error="file not found" />'
+    if file_path.stat().st_size > READ_SPLIT_THRESHOLD_BYTES:
+        return (
+            f'<nagent-read-result path="{path}" error="file too large; use '
+            f'<nagent-file-read path=&quot;{path}&quot;/> instead" />'
+        )
     content = file_path.read_text(encoding="utf-8")
     return f'<nagent-read-result path="{path}">\n{content}\n</nagent-read-result>'
 
 
-def execute_write(path: str, content: str) -> str:
+def execute_file_read(path: str, root: Path) -> str:
+    file_path = Path(path)
+    if not file_path.is_file():
+        return f'<nagent-file-read-result path="{path}" error="file not found" />'
+
+    size = file_path.stat().st_size
+    if size <= READ_SPLIT_THRESHOLD_BYTES:
+        content = file_path.read_text(encoding="utf-8")
+        return (
+            f'<nagent-file-read-result path="{path}" mode="inline" size_bytes="{size}">\n'
+            f"{content}\n</nagent-file-read-result>"
+        )
+
+    output_dir = root / "splits" / f"{slugify(file_path.stem)}-{uuid.uuid4()}"
+    command = [
+        str(NAGENT_FILE_SPLIT),
+        "--file",
+        str(file_path),
+        "--output",
+        str(output_dir),
+        "--json",
+    ]
+    result = subprocess.run(command, capture_output=True, text=True)
+    if result.returncode != 0:
+        error = result.stderr.strip() or result.stdout.strip() or "nagent-file-split failed"
+        return f'<nagent-file-read-result path="{path}" error="{error}" />'
+
+    payload = json.loads(result.stdout)
+    segments = payload.get("segments", [])
+    segment_lines = "\n".join(
+        f'- segment {segment["segment_index"]}: lines {segment["start_line_num"]}-'
+        f'{segment["end_line_num"]} at {segment["path"]}'
+        for segment in segments
+    )
+    return (
+        f'<nagent-file-read-result path="{path}" mode="split" size_bytes="{size}" '
+        f'index_path="{payload["index_path"]}" segment_count="{payload["segment_count"]}">\n'
+        f"File exceeded {READ_SPLIT_THRESHOLD_BYTES} bytes and was split.\n"
+        f"index_path: {payload['index_path']}\n"
+        f"segments:\n{segment_lines}\n"
+        f"Edit segment files, then merge with: <nagent-file-patch index=\"{payload['index_path']}\"/>\n"
+        f"</nagent-file-read-result>"
+    )
+
+
+def execute_file_patch(index: str) -> str:
+    index_path = Path(index).expanduser()
+    try:
+        result = apply_segment_patches(index_path)
+    except (FileNotFoundError, ValueError) as exc:
+        return f'<nagent-file-patch-result index="{index}" status="error">{exc}</nagent-file-patch-result>'
+
+    changed = "true" if result.changed else "false"
+    patch_path = str(result.patch_path.resolve()) if result.patch_path else ""
+    return (
+        f'<nagent-file-patch-result index="{index}" status="ok" changed="{changed}" '
+        f'source_path="{result.source_path}" patch_path="{patch_path}" />'
+    )
+
+
+def tmp_roots() -> list[Path]:
+    candidates = [Path("/tmp"), Path("/var/tmp")]
+    tmpdir = os.environ.get("TMPDIR")
+    if tmpdir:
+        candidates.insert(0, Path(tmpdir))
+
+    roots: list[Path] = []
+    seen: set[str] = set()
+    for candidate in candidates:
+        try:
+            resolved = candidate.expanduser().resolve()
+        except OSError:
+            continue
+        key = str(resolved)
+        if key not in seen:
+            seen.add(key)
+            roots.append(resolved)
+    return roots
+
+
+def is_tmp_path(path: Path) -> bool:
+    try:
+        resolved = path.resolve()
+    except OSError:
+        return False
+    for root in tmp_roots():
+        if resolved == root or root in resolved.parents:
+            return True
+    return False
+
+
+def validate_write_path(
+    path: str,
+    file_edit_path: Path | None,
+    root: Path | None = None,
+    file_edit_id: str | None = None,
+) -> str | None:
+    file_path = Path(path)
+    if file_edit_path is not None:
+        try:
+            resolved = file_path.expanduser().resolve()
+        except OSError as exc:
+            return f"write not allowed: {exc}"
+        try:
+            if same_file(resolved, file_edit_path):
+                return None
+        except OSError:
+            pass
+        if file_edit_id is not None:
+            try:
+                if file_id_for_path(resolved) == file_edit_id:
+                    return None
+            except OSError:
+                pass
+        if root is not None and is_split_segment_for_source(
+            resolved, file_edit_path, root, file_edit_id
+        ):
+            return None
+        return (
+            f"write not allowed: only {file_edit_path} or its split segments "
+            "may be edited in this session"
+        )
+    try:
+        if is_tmp_path(file_path):
+            return None
+    except OSError:
+        pass
+    return "write not allowed: use nagent-file-edit to edit files outside temp directories"
+
+
+def execute_write(
+    path: str,
+    content: str,
+    file_edit_path: Path | None = None,
+    root: Path | None = None,
+    file_edit_id: str | None = None,
+) -> str:
+    error = validate_write_path(path, file_edit_path, root, file_edit_id)
+    if error is not None:
+        return f'<nagent-write-result path="{path}" status="error">{error}</nagent-write-result>'
+
     file_path = Path(path)
     try:
         file_path.parent.mkdir(parents=True, exist_ok=True)
@@ -343,12 +557,13 @@ def execute_write(path: str, content: str) -> str:
 
 
 def execute_shell(commands: str) -> str:
-    result = subprocess.run(
-        commands,
-        shell=True,
-        capture_output=True,
-        text=True,
-    )
+    with wait_spinner("Running command"):
+        result = subprocess.run(
+            commands,
+            shell=True,
+            capture_output=True,
+            text=True,
+        )
     stdout = result.stdout.rstrip("\n")
     stderr = result.stderr.rstrip("\n")
     parts = [
@@ -397,11 +612,12 @@ def execute_agent(
         ]
     )
 
-    result = subprocess.run(
-        command,
-        capture_output=True,
-        text=True,
-    )
+    with wait_spinner("Sub-agent working"):
+        result = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+        )
     output = result.stdout.rstrip("\n")
     stderr = result.stderr.rstrip("\n")
     parts = [
@@ -423,6 +639,8 @@ def process_tags(
     llm: LlmSettings,
     nagent_path: Path,
     pid: str,
+    file_edit_path: Path | None = None,
+    file_edit_id: str | None = None,
 ) -> tuple[list[str], list[str], bool]:
     responses: list[str] = []
     next_prompts: list[str] = []
@@ -434,8 +652,17 @@ def process_tags(
         elif tag.kind == "read":
             append_to_conversation(conversation_file, execute_read(tag.path or ""))
             should_continue = True
+        elif tag.kind == "file_read":
+            append_to_conversation(conversation_file, execute_file_read(tag.path or "", root))
+            should_continue = True
+        elif tag.kind == "file_patch":
+            append_to_conversation(conversation_file, execute_file_patch(tag.path or ""))
+            should_continue = True
         elif tag.kind == "write":
-            append_to_conversation(conversation_file, execute_write(tag.path or "", tag.content))
+            append_to_conversation(
+                conversation_file,
+                execute_write(tag.path or "", tag.content, file_edit_path, root, file_edit_id),
+            )
             should_continue = True
         elif tag.kind == "shell":
             append_to_conversation(conversation_file, execute_shell(tag.content))
@@ -465,8 +692,13 @@ def run_agent_loop(
     llm: LlmSettings,
     initial_prompt: str | None,
     pid: str,
-) -> int:
+    file_edit_path: Path | None = None,
+    file_edit_id: str | None = None,
+    *,
+    json_mode: bool = False,
+) -> tuple[int, list[str]]:
     nagent_path = Path(__file__).resolve()
+    user_responses: list[str] = []
 
     if initial_prompt is not None:
         append_to_conversation(conversation_file, f"<user-prompt>\n{initial_prompt}\n</user-prompt>")
@@ -477,7 +709,7 @@ def run_agent_loop(
             llm_output, error = call_llm(conversation_file, llm)
             if error is not None:
                 print(f"Error: {error}", file=sys.stderr)
-                return 1
+                return 1, user_responses
 
             tags, parse_error = parse_response(llm_output)
             if tags is not None:
@@ -494,7 +726,7 @@ def run_agent_loop(
                 f"Error: nagent response remained invalid after {MAX_FORMAT_RETRIES} attempts.",
                 file=sys.stderr,
             )
-            return 1
+            return 1, user_responses
 
         append_to_conversation(conversation_file, f"<agent-response>\n{llm_output}\n</agent-response>")
 
@@ -505,10 +737,15 @@ def run_agent_loop(
             llm,
             nagent_path,
             pid,
+            file_edit_path,
+            file_edit_id,
         )
 
         for response in responses:
-            print(clean_user_output(response))
+            cleaned = clean_user_output(response)
+            user_responses.append(cleaned)
+            if not json_mode:
+                print(cleaned)
 
         if next_prompts:
             for prompt in next_prompts:
@@ -518,17 +755,107 @@ def run_agent_loop(
         if should_continue:
             continue
 
-        return 0
+        return 0, user_responses
+
+
+def conversations_dir(root: Path) -> Path:
+    return root / "conversations"
 
 
 def resolve_conversation(root: Path, conversation_name: str) -> Path:
-    return root / conversation_name
+    return conversations_dir(root) / conversation_name
 
 
-def print_conversation_status(conversation_file: Path, provider: str, model: str) -> None:
+def migrate_legacy_conversation(root: Path, conversation_name: str, conversation_file: Path) -> Path | None:
+    legacy_file = root / conversation_name
+    if legacy_file == conversation_file or not legacy_file.is_file() or conversation_file.exists():
+        return None
+
+    conversation_file.parent.mkdir(parents=True, exist_ok=True)
+    legacy_file.rename(conversation_file)
+    return conversation_file
+
+
+def archive_conversation(conversation_file: Path) -> Path | None:
+    if not conversation_file.is_file():
+        return None
+    archive_path = conversation_file.with_name(f"{conversation_file.name}-{uuid.uuid4()}")
+    conversation_file.rename(archive_path)
+    return archive_path
+
+
+def clear_conversation(
+    conversation_file: Path,
+    root: Path,
+    process_path: Path,
+    invocation: Invocation,
+    conversation_name: str,
+    parent_conversation: str | None = None,
+    file_edit_path: Path | None = None,
+    file_edit_id: str | None = None,
+) -> Path | None:
+    archived = archive_conversation(conversation_file)
+    conversation_file.parent.mkdir(parents=True, exist_ok=True)
+    conversation_file.write_text(
+        create_initial_text(
+            root,
+            process_path,
+            invocation,
+            conversation_name,
+            parent_conversation,
+            file_edit_path,
+            file_edit_id,
+        ),
+        encoding="utf-8",
+    )
+    return archived
+
+
+def print_conversation_status(
+    conversation_file: Path,
+    provider: str,
+    model: str,
+    *,
+    json_mode: bool = False,
+) -> None:
     size = conversation_file.stat().st_size if conversation_file.is_file() else 0
+    if json_mode:
+        emit_json(
+            {
+                "conversation_path": str(conversation_file.resolve()),
+                "size": size,
+                "provider": provider,
+                "model": model,
+            }
+        )
+        return
     print(f"conversation:{conversation_file} size:{size}")
     print(f"provider:{provider} model:{model}")
+
+
+def print_file_edits(root: Path, pid: str, *, json_mode: bool = False) -> None:
+    payload = list_file_edits(root, pid)
+    if json_mode:
+        emit_json(payload)
+        return
+    print(f"file_index:{payload['file_index_path']}")
+    for entry in payload["files"]:
+        print(f"{entry['file_id']}\t{entry.get('path', '')}\t{entry.get('conversation', '')}")
+
+
+def resolve_initial_prompt(prompt_arg: str | None) -> str | None:
+    if prompt_arg is not None:
+        return prompt_arg
+    if sys.stdin.isatty():
+        return None
+    try:
+        readable, _, _ = select.select([sys.stdin], [], [], 0)
+    except (OSError, ValueError):
+        readable = [sys.stdin]
+    if not readable:
+        return None
+    prompt = sys.stdin.read()
+    return prompt if prompt else None
 
 
 def main() -> None:
@@ -538,7 +865,7 @@ def main() -> None:
     parser.add_argument(
         "--root",
         default="~/.nagent",
-        help="Root directory for conversation files (default: ~/.nagent).",
+        help="Root directory for config and conversations (default: ~/.nagent).",
     )
     parser.add_argument(
         "--conversation",
@@ -582,13 +909,53 @@ def main() -> None:
         action="store_true",
         help="List models available for the configured provider, then exit.",
     )
+    parser.add_argument(
+        "--list-file-edits",
+        action="store_true",
+        help="List per-file edit conversations for the current shell pid, then exit.",
+    )
+    parser.add_argument(
+        "--json",
+        action="store_true",
+        help="Print structured JSON output instead of plain text.",
+    )
+    parser.add_argument(
+        "--clear",
+        action="store_true",
+        help="Archive the current conversation file and start a fresh one at the same path.",
+    )
+    parser.add_argument(
+        "--file-edit",
+        type=Path,
+        metavar="PATH",
+        help="Edit a specific file using its per-file conversation (see nagent-file-edit).",
+    )
     parser.add_argument("prompt", nargs="?", help="Prompt text.")
     args = parser.parse_args()
 
     root = Path(args.root).expanduser()
     pid = args.pid or default_pid()
-    conversation_name = args.conversation or default_conversation_name(pid)
+    file_edit_path: Path | None = None
+    file_edit_id: str | None = None
+
+    if args.file_edit is not None:
+        try:
+            conversation_name, file_edit_path, file_edit_id = resolve_file_edit_conversation(
+                root, pid, args.file_edit
+            )
+        except FileNotFoundError as exc:
+            print(f"Error: {exc}", file=sys.stderr)
+            return 1
+    else:
+        conversation_name = args.conversation or default_conversation_name(pid)
     conversation_file = resolve_conversation(root, conversation_name)
+    migrate_legacy_conversation(root, conversation_name, conversation_file)
+
+    set_spinner_enabled(
+        args.invocation == "user"
+        and sys.stderr.isatty()
+        and not os.environ.get("NAGENT_NO_SPINNER")
+    )
 
     if args.status:
         try:
@@ -596,7 +963,11 @@ def main() -> None:
         except ValueError as exc:
             print(f"Error: {exc}", file=sys.stderr)
             return 1
-        print_conversation_status(conversation_file, provider, model)
+        print_conversation_status(conversation_file, provider, model, json_mode=args.json)
+        return 0
+
+    if args.list_file_edits:
+        print_file_edits(root, pid, json_mode=args.json)
         return 0
 
     if args.list_models:
@@ -607,15 +978,56 @@ def main() -> None:
             return 1
         require_credentials(provider)
         try:
-            for model_name in list_models(provider):
-                print(model_name)
+            models = list(list_models(provider))
         except Exception as exc:
             print(f"Error: {exc}", file=sys.stderr)
             return 1
+        if args.json:
+            emit_json({"provider": provider, "models": models})
+        else:
+            for model_name in models:
+                print(model_name)
         return 0
 
-    if args.prompt is None:
-        parser.error("prompt is required unless --status or --list-models is given")
+    initial_prompt = resolve_initial_prompt(args.prompt)
+
+    cleared = False
+    if args.clear:
+        process_path = Path(__file__).resolve()
+        archived = clear_conversation(
+            conversation_file,
+            root,
+            process_path,
+            args.invocation,
+            conversation_name,
+            args.parent_conversation,
+            file_edit_path,
+            file_edit_id,
+        )
+        if archived is not None:
+            if args.json:
+                emit_json(
+                    {
+                        "archived_path": str(archived.resolve()),
+                        "conversation_path": str(conversation_file.resolve()),
+                    }
+                )
+            else:
+                print(f"archived:{archived}")
+                print(f"conversation:{conversation_file}")
+        elif args.json:
+            emit_json({"conversation_path": str(conversation_file.resolve())})
+        else:
+            print(f"conversation:{conversation_file}")
+        cleared = True
+        if initial_prompt is None:
+            return 0
+
+    if initial_prompt is None:
+        parser.error(
+            "prompt is required unless --status, --list-models, --list-file-edits, "
+            "--clear, or stdin prompt text is given"
+        )
 
     try:
         provider, model = resolve_settings(args.provider, args.model, args.config)
@@ -625,10 +1037,10 @@ def main() -> None:
     require_credentials(provider)
     llm = LlmSettings(provider=provider, model=model, config_path=args.config)
 
-    root.mkdir(parents=True, exist_ok=True)
+    conversation_file.parent.mkdir(parents=True, exist_ok=True)
 
     process_path = Path(__file__).resolve()
-    if not conversation_file.exists():
+    if not cleared and not conversation_file.exists():
         conversation_file.write_text(
             create_initial_text(
                 root,
@@ -636,6 +1048,8 @@ def main() -> None:
                 args.invocation,
                 conversation_name,
                 args.parent_conversation,
+                file_edit_path,
+                file_edit_id,
             ),
             encoding="utf-8",
         )
@@ -647,9 +1061,29 @@ def main() -> None:
         args.invocation,
         conversation_name,
         args.parent_conversation,
+        file_edit_path,
+        file_edit_id,
     )
 
-    return run_agent_loop(conversation_file, root, llm, args.prompt, pid)
+    exit_code, responses = run_agent_loop(
+        conversation_file,
+        root,
+        llm,
+        initial_prompt,
+        pid,
+        file_edit_path,
+        file_edit_id,
+        json_mode=args.json,
+    )
+    if args.json:
+        emit_json(
+            {
+                "exit_code": exit_code,
+                "conversation_path": str(conversation_file.resolve()),
+                "responses": responses,
+            }
+        )
+    return exit_code
 
 
 if __name__ == "__main__":

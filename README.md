@@ -2,88 +2,65 @@
 
 **nagent** means **not-an-agent**.
 
-It is a very small, but usable, example of how to build “agent-like” systems. The goal is not to ship a product-grade agent platform. The goal is to show that the idea is simpler than it sounds — so you can read the code, understand it, and build your own.
+nagent is a small, readable example of agent-like behavior: a text file, an LLM, structured tags, and a loop. It is intentionally plain: files on disk, Python, subprocesses, and structured text.
 
-Many “agent” products wrap the same few steps in heavy abstractions. That makes it hard to see what is actually happening. nagent keeps the steps visible.
+The project is not trying to be an agent framework or a product. It is a reference implementation you can read, copy, modify, or discard. The point is to show that much of "agent behavior" is just this: append to a conversation file, call the LLM, parse the reply, run requested actions, append results, and repeat.
 
-## The whole idea
+This README walks through the design step by step and maps the pieces back to the code.
 
-At the bottom, everything is this:
+---
 
-1. You have a **text file** (the conversation).
-2. You **send that text** to an LLM.
-3. You **get text back**.
-4. You **append** the response (and any results from actions it requested) to the file.
-5. You **repeat** until the model gives a final answer to the user.
+## 1. Text in, text out
 
-That is the entire loop. “Agent behavior” is just rules for what to do with the response before you call the LLM again.
-
-There is no hidden runtime, no magic memory, no special agent object. There is a file on disk and a loop that edits it.
-
-In the same shell, you can run nagent more than once. Each prompt continues the same conversation:
-
-```
-$ nagent "What files are in this directory?"
-There are 12 files, including README.md, bin/, and tests/.
-
-$ nagent "Which one is the main entry point?"
-The main script is bin/nagent.
-```
-
-The second answer works because the conversation file still contains the first exchange. You are not starting over each time.
-
-## Step 1: Send text, get text
-
-The smallest piece is `nagent-llm-text`:
+Start with one primitive: send text to an LLM and get text back.
 
 ```bash
 echo "What is 2+2?" > question.txt
 nagent-llm-text --file question.txt
 ```
 
-This reads a file, sends its contents to the configured LLM, and prints the reply. One file in, one string out.
+That command reads a file, sends its contents to the configured provider, and prints the model response. The rest of nagent is orchestration around this primitive.
 
-Everything else in nagent is built on top of this.
+In the source, the command lives in `bin/nagent-llm-text`. Provider setup, config loading, model defaults, credential checks, and `generate_text()` live in `bin/helpers/nagent_llm.py`.
 
-## Step 2: Keep the conversation in a file
+**Build your own:** write one boring function first: `generate_text(file) -> str`. Keep provider-specific code outside the agent loop so the loop stays easy to reason about.
 
-`nagent` does not send just your one-line prompt. It keeps a **conversation file** — a growing text document — and sends the whole thing to the LLM each turn.
+---
 
-On first run, nagent creates something like:
+## 2. Put state in a file
 
-```
-~/.nagent/latest-{hostname}-{pid}
-```
+Memory is a plain conversation file. A user-level nagent conversation uses this path shape:
 
-That file starts with instructions (what tags the model may use, what tools exist, where it is running) and your prompt:
-
-```
-<initial_context>
-...environment info...
-</initial_context>
-
-<nagent-response>...</nagent-response>
-<nagent-read path="..." />
-...
-
-<user-prompt>
-What files are in this directory?
-</user-prompt>
+```text
+~/.nagent/conversations/latest-{hostname}-{pid}
 ```
 
-Each time the LLM replies, nagent **appends** that reply to the conversation file. If the model asked to run a command or read a file, nagent runs that, **appends the output**, and calls the LLM again with the updated file.
+Repeated invocations in the same shell append to that file. That means this:
 
-So “memory” is just: *what is currently in the text file*.
+```bash
+nagent "What files are in this directory?"
+nagent "Which one is the main entry point?"
+```
 
-## Step 3: Teach the LLM a simple output format
+is not two unrelated chats. The second command sends the same growing conversation file, so the model can see the first turn and its result.
 
-The LLM is asked to reply using plain XML-like **tags**, not free-form chat. For example:
+There is no separate memory service. No database is required. You can open the file and inspect the exact prompt history being sent to the model.
+
+**Build your own:** start with a single durable document. Append user prompts, model replies, tool results, and follow-up instructions to it. Make the state visible before making it clever.
+
+---
+
+## 3. Teach the model an output format
+
+Free-form prose is hard for a program to act on. nagent asks the model to reply only with structured tags.
+
+For example, the model can request a shell command:
 
 ```xml
 <nagent-shell>ls -la</nagent-shell>
 ```
 
-nagent parses the response, runs `ls -la`, and appends something like:
+nagent parses that tag, runs the command, appends the result to the conversation, and calls the LLM again:
 
 ```xml
 <nagent-shell-result>
@@ -94,29 +71,33 @@ total 24
 </nagent-shell-result>
 ```
 
-Then it sends the whole conversation file to the LLM again.
-
 Available tags:
 
 | Tag | What nagent does |
 |---|---|
-| `<nagent-response>` | Print this to the user (final answer) |
-| `<nagent-read path="..."/>` | Read a file, append contents to conversation |
-| `<nagent-write path="...">...</nagent-write>` | Write a file |
-| `<nagent-shell>...</nagent-shell>` | Run shell commands, append output |
-| `<nagent-next>...</nagent-next>` | Append a follow-up prompt and continue |
-| `<nagent-agent>...</nagent-agent>` | Start a sub-agent (see below) |
+| `<nagent-response>...</nagent-response>` | Print the final human-facing response and stop. |
+| `<nagent-read path="..."/>` | Read a small file inline. |
+| `<nagent-file-read path="..."/>` | Read a file; split it first if it exceeds the inline limit. |
+| `<nagent-file-patch index="..."/>` | Merge edited split segments back into the source file. |
+| `<nagent-write path="...">...</nagent-write>` | Write file content through nagent's write handler. |
+| `<nagent-shell>...</nagent-shell>` | Run shell commands and append stdout, stderr, and exit code. |
+| `<nagent-next>...</nagent-next>` | Append a follow-up prompt and continue the loop. |
+| `<nagent-agent>...</nagent-agent>` | Spawn a child nagent process for a scoped task. |
 
-The model chooses tags. nagent executes them and updates the text file. No separate message bus or tool registry — just text in, text out, append, repeat.
+The parser is `parse_response()` in `bin/nagent`. It recognizes the tags, returns typed records, and lets the loop dispatch them.
 
-## Step 4: The loop
+**Build your own:** choose an output format the model can follow consistently: XML-like tags, JSON, or another small grammar. Write a parser before adding more tools.
 
-In code, the loop is roughly:
+---
 
-```
+## 4. The loop
+
+The agent loop is deliberately small:
+
+```text
 append user prompt to conversation file
 loop:
-    response = send conversation file to LLM   # via nagent-llm-text
+    response = send conversation file to LLM
     append response to conversation file
     if response contains action tags:
         run those actions
@@ -126,71 +107,185 @@ loop:
         print it and stop
 ```
 
-That is `bin/nagent`. You can read it start to finish; it is a few hundred lines of Python.
+In `bin/nagent`, the path through the code is:
 
-## Step 5: Sub-agents are the same pattern again
-
-When the model emits `<nagent-agent>`, nagent starts **another** `nagent` process with its **own** conversation file and a scoped prompt.
-
-The parent does not share its full history with the child. The child runs the same text-file loop, returns a result, and the parent appends that result to its own conversation.
-
-Sub-agents are not a different system. They are the same “manage a text file, call the LLM” loop, nested.
-
-## Large files: split, edit, patch
-
-For files too big to fit in context, nagent includes two partner tools:
-
-1. **`nagent-file-split`** — break a file into smaller segments plus an `index.json`.
-2. Edit the segment files (via `<nagent-read>` / `<nagent-write>` or by hand).
-3. **`nagent-file-patch`** — merge segment edits back into the original file.
-
-Same idea: files on disk, plain text, no special agent machinery.
-
-## Tools
-
-Run any tool with `--description` to see what it does and its path:
-
-```bash
-nagent --description
+```text
+main()
+  run_agent_loop()
+    call_llm()
+    parse_response()
+    process_tags()
 ```
 
-| Command | Purpose |
+`call_llm()` shells out to `nagent-llm-text`. `process_tags()` performs reads, writes, shell commands, file patches, sub-agent calls, and final responses.
+
+**Build your own:** implement the loop with one action first. For example: parse `<shell>...</shell>`, run it, append the result, and repeat. Add capabilities only after the basic read/call/parse/act/append cycle is working.
+
+---
+
+## 5. Delegate with sub-agents
+
+A sub-agent is just another nagent process with its own conversation file. The parent gives it a scoped prompt:
+
+```xml
+<nagent-agent>
+Find all TODO comments in src/ and return a markdown list with file paths.
+</nagent-agent>
+```
+
+The child receives its own initial context, runs the same loop, and eventually returns a `<nagent-response>`. The parent does not import the child's whole transcript. It appends only the child result, wrapped as a result block, then continues its own loop.
+
+This keeps exploratory work, long logs, and isolated tasks out of the parent conversation.
+
+**Build your own:** when work is independent, start a fresh loop with a narrow prompt and a separate state file. Return only the summary or artifact the parent needs.
+
+---
+
+## 6. Control writes
+
+nagent separates coordination from source-file editing.
+
+| Context | Write rule |
 |---|---|
-| `bin/nagent` | Main loop: manage conversation file, parse tags, call LLM |
-| `bin/nagent-llm-text` | Send a text file to the LLM, print response |
-| `bin/nagent-llm-upload` | Send a file (image, PDF, etc.) with a prompt |
-| `bin/nagent-file-split` | Split a large file into segments |
-| `bin/nagent-file-patch` | Merge segment edits back to the source file |
+| Main conversation | `<nagent-write>` is allowed only under temp directories such as `/tmp`, `/var/tmp`, or `$TMPDIR`. |
+| Project files | Use `nagent-file-edit`, which starts a per-file edit session. |
+| Per-file edit session | `<nagent-write>` may write the target file and split segments for that same file. |
 
-Shared provider/config code lives in `bin/helpers/` (not meant to be run directly).
+Shell writes are discouraged and are not fully sandboxed. This repository is a demo and reference implementation, not a sandboxed security product. The write boundaries are safety by convention and by nagent's handlers, not a complete OS-level security model.
 
-## Installation
+**Build your own:** define write authority explicitly. Decide which paths the main loop can touch, which paths require a scoped edit session, and where human approval should sit.
+
+---
+
+## 7. Handle large files
+
+`<nagent-read path="..."/>` has a `64KB` inline read limit. Larger files need a chunking workflow:
+
+```text
+split -> edit segment files -> patch source file
+```
+
+The CLI tools are:
+
+| Tool | Role |
+|---|---|
+| `nagent-file-split` | Split a large file into structure-aware segment files and an `index.json`. |
+| `nagent-file-patch` | Validate and merge edited segments back into the original source file. |
+| `nagent-file-summarize` | Summarize a file; for large files, split first and summarize each segment. |
+
+Inside the loop, `<nagent-file-read path="..."/>` inlines small files and splits large ones. After segment edits, `<nagent-file-patch index="..."/>` applies the merge.
+
+Large-file summaries are stored in split metadata. When `nagent-file-split --summarize` or `nagent-file-summarize` handles a large file, per-segment summaries and a combined summary are recorded in `index.json`.
+
+**Build your own:** when input is too large for context, make the chunks visible on disk and give the model stable filenames. Use a separate merge step that can validate the source file before writing back.
+
+---
+
+## 8. Per-file editing
+
+`nagent-file-edit` keeps the main conversation small by giving each edited file its own conversation.
+
+```bash
+nagent-file-edit --file src/foo.py "add error handling"
+nagent-file-edit --file src/foo.py --clear
+nagent --list-file-edits
+```
+
+The file index is stored under `~/.nagent/conversations/file-index-{pid}.json`. Each entry is keyed by a stable file id, usually `{device}:{inode}`, so renames can keep the same edit conversation.
+
+Small example:
+
+```json
+{
+  "by_file_id": {
+    "2050:123456": {
+      "file_id": "2050:123456",
+      "path": "/abs/path/to/src/foo.py",
+      "conversation": "foo-a1b2c3d4-7e89-..."
+    }
+  }
+}
+```
+
+`nagent-file-edit` resolves the target file, looks up or creates the per-file conversation, then invokes `nagent --file-edit ...` with that scoped context.
+
+**Build your own:** keep coordinator state separate from file-worker state. A coordinator should know that a file was edited; it does not need every model turn used to make the edit.
+
+---
+
+## 9. How this differs from agent frameworks
+
+nagent is meant to expose the pattern, not hide it behind abstractions.
+
+| Typical framework | nagent |
+|---|---|
+| State in objects, services, stores, or threads. | State in a plain text file. |
+| Tools registered in code and invoked through a runtime schema. | Tools requested as tags in model output. |
+| Shared memory or one managed thread. | One file per instance, including child agents and per-file edits. |
+| Many layers, dependencies, plugins, and callbacks. | One loop and a few scripts. |
+
+Frameworks can be useful when you need their structure. nagent is useful when you want to see the mechanics clearly enough to build your own version.
+
+**Build your own:** add abstractions only after the file-and-loop version becomes painful in a specific way.
+
+---
+
+## 10. Build your own
+
+A compact recipe:
+
+1. `generate_text(file) -> str`
+2. A growing document that holds prompts, model replies, and action results.
+3. An output format and parser.
+4. A loop that reads, calls, parses, acts, appends, and repeats.
+5. Incremental capabilities: shell, file read, constrained write, sub-agents, large-file splitting, per-file editing.
+
+Code-reading order:
+
+```text
+main()
+  run_agent_loop()
+    call_llm()
+    parse_response()
+    process_tags()
+```
+
+After that, read `bin/helpers/nagent_llm.py` for provider handling, then the smaller tools under `bin/nagent-file-*` for the split, patch, summarize, and per-file edit flows.
+
+**Build your own:** copy the smallest useful version first. Replace the provider, rename the tags, change the write policy, or remove sub-agents entirely. The pattern survives those changes.
+
+---
+
+## Tool Reference
+
+Run a command with `--description` for a short description, or `--help` for full options.
+
+| Command | Purpose | JSON output |
+|---|---|---|
+| `nagent` | Main conversation loop. | `--json` for status, list, clear, and final response output. |
+| `nagent-llm-text` | Send a text file to the configured LLM. | `--json` |
+| `nagent-llm-upload` | Upload a file with a prompt for vision or document-style inputs. | `--json` |
+| `nagent-file-split` | Split a large file into segment files and `index.json`. | `--json` |
+| `nagent-file-patch` | Merge edited segment files back into the source file. | `--json` |
+| `nagent-file-edit` | Run nagent against one project file using a dedicated conversation. | `--json` |
+| `nagent-file-summarize` | Summarize a file, splitting first if it is larger than `64KB`. | `--json` |
+
+Shared provider and config helpers live under `bin/helpers/`. The tools accept `--json` where structured output is useful.
+
+---
+
+## Setup
 
 ```bash
 pip install -r requirements.txt
-```
-
-Add `bin/` to your `PATH`, or run commands from the repo:
-
-```bash
-./bin/nagent "hello"
-```
-
-## Configuration
-
-nagent loads settings from:
-
-1. `NAGENT_CONFIG` — path to a config JSON file, if set
-2. otherwise `~/.nagent/config.json`
-
-If no config exists, the default provider is `openai` with that provider's default model.
-
-```bash
+export PATH="$PWD/bin:$PATH"
 mkdir -p ~/.nagent
-cp config.example.json ~/.nagent/config.json
+cp config.example.json ~/.nagent/config.json   # optional
 ```
 
-Example `~/.nagent/config.json`:
+Config loads from `NAGENT_CONFIG` or `~/.nagent/config.json`. CLI flags override config values.
+
+Example config:
 
 ```json
 {
@@ -199,67 +294,45 @@ Example `~/.nagent/config.json`:
 }
 ```
 
-`model` is optional. CLI flags override the config file.
+Provider defaults:
 
-### Providers
-
-| Provider | Default model | Python package |
+| Provider | Default model | API key |
 |---|---|---|
-| `openai` | `gpt-5.5` | `openai` |
-| `anthropic` | `claude-sonnet-4-6` | `anthropic` |
-| `google` | `gemini-2.5-flash` | `google-genai` |
-| `cursor` | `composer-2.5` | `cursor-sdk` |
+| `openai` | `gpt-5.5` | `OPENAI_API_KEY` |
+| `anthropic` | `claude-sonnet-4-6` | `ANTHROPIC_API_KEY` |
+| `google` | `gemini-2.5-flash` | `GOOGLE_API_KEY` or `GEMINI_API_KEY` |
+| `cursor` | `composer-2.5` | `CURSOR_API_KEY` |
 
-### API keys
+Useful environment variables:
 
-Set the key for your configured provider:
-
-| Provider | Environment variable(s) |
+| Variable | Meaning |
 |---|---|
-| `openai` | `OPENAI_API_KEY` |
-| `anthropic` | `ANTHROPIC_API_KEY` |
-| `google` | `GOOGLE_API_KEY` or `GEMINI_API_KEY` |
-| `cursor` | `CURSOR_API_KEY` |
+| `NAGENT_CONFIG` | Path to a config JSON file. |
+| `NAGENT_NO_SPINNER=1` | Disable the wait spinner. |
 
-## Usage
+---
+
+## Common Commands
 
 ```bash
-# Run the loop with a prompt
-nagent "What files are in this directory?"
+nagent "your prompt here"
+echo "prompt from stdin" | nagent
+nagent --status --json
+nagent --list-models --json
+nagent --list-file-edits --pid "$BASHPID"
+nagent --clear
 
-# Conversation path and size
-nagent --status
-
-# List models for the configured provider
-nagent --list-models
-
-# One-shot: send a text file to the LLM
-nagent-llm-text --file prompt.txt
-
-# One-shot: upload a file with a prompt
-nagent-llm-upload --file chart.png --prompt "Describe this chart"
-
-# Split a large file for editing
-nagent-file-split --file src/big.py --output /tmp/big-split
-
-# Merge segment edits back
-nagent-file-patch --index /tmp/big-split/index.json
+nagent-llm-text --file prompt.txt --json
+nagent-llm-upload --file chart.png --prompt "Describe this" --json
+nagent-file-split --file src/big.py --json
+nagent-file-patch --index /tmp/big-split/index.json --json
+nagent-file-summarize --file src/big.py --json
+nagent-file-edit --file src/foo.py "add error handling"
 ```
 
 Run `--help` on any command for full options.
 
-## Build your own
-
-If you want to make something “agent-like”:
-
-1. Start with **text file → LLM → text response** (`nagent-llm-text` is the minimal version).
-2. Decide what **format** you want the model to reply in (tags, JSON, etc.).
-3. Write a **loop** that parses the response, runs side effects, appends results to the file, and calls the LLM again.
-4. Add only what you need: file I/O, shell, sub-processes, chunking large files.
-
-You do not need a framework. You need a file, a loop, and clear rules for the model's output.
-
-Read `bin/nagent` and follow the flow from `main()` → `run_agent_loop()` → `call_llm()` → `process_tags()`. That is the whole design.
+---
 
 ## Tests
 

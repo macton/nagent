@@ -19,14 +19,18 @@ from nagent_file_split_lib import (
     score_for_type,
     write_index_file,
 )
-from nagent_cli import exit_on_description
+from nagent_cli import emit_json, exit_on_description
+from nagent_llm import add_llm_arguments, resolve_from_args
+from nagent_file_summarize_lib import add_summaries_to_index
 
 NAGENT_FILE_SPLIT_DESCRIPTION = """\
 Split a large file into structure-aware segments (~32KB by default) with index.json.
 Use when a file is too large for context or when you want to read and edit one
 segment at a time. Workflow: split, edit segment files, then merge with
-nagent-file-patch. Supports --natural for type-specific boundaries and --refresh
-to re-split after the source changes."""
+nagent-file-patch. Supports --natural for type-specific boundaries, --refresh
+to re-split after the source changes, and --summarize to LLM-summarize each segment."""
+
+NAGENT_FILE_SUMMARIZE = Path(__file__).resolve().parent / "nagent-file-summarize"
 
 HELPER_COMMANDS = {
     split_type: HELPERS_DIR / f"nagent-file-split-{split_type}"
@@ -81,11 +85,26 @@ def split_file(
     split_type: str,
     target_bytes: int,
     natural: bool,
+    *,
+    summarize: bool = False,
+    provider: str | None = None,
+    model: str | None = None,
+    config_path: Path | None = None,
 ) -> dict:
     output_dir.mkdir(parents=True, exist_ok=True)
     segments = run_splitter(source, output_dir, split_type, target_bytes, natural)
     index = build_index(source, segments, split_type, target_bytes, natural=natural)
     index_path = output_dir / "index.json"
+    if summarize:
+        if provider is None or model is None:
+            raise RuntimeError("--summarize requires --provider and --model (or config defaults)")
+        index = add_summaries_to_index(
+            index,
+            provider,
+            model,
+            config_path,
+            NAGENT_FILE_SUMMARIZE,
+        )
     write_index_file(index_path, index)
     return index
 
@@ -99,7 +118,7 @@ def refresh_index(index_path: Path) -> dict:
 def emit_result(index_path: Path, index: dict, as_json: bool) -> None:
     if as_json:
         payload = {"index_path": str(index_path.resolve()), **index}
-        print(json.dumps(payload, indent=2))
+        emit_json(payload)
     else:
         print(str(index_path.resolve()))
 
@@ -137,14 +156,29 @@ def main() -> None:
         help="Re-split from source using settings in an existing index.json.",
     )
     parser.add_argument(
+        "--summarize",
+        action="store_true",
+        help="After splitting, run nagent-file-summarize on each segment and store summaries in index.json.",
+    )
+    parser.add_argument(
         "--json",
         action="store_true",
         help="Print full result as JSON instead of only the index path.",
     )
+    add_llm_arguments(parser)
     args = parser.parse_args()
+
+    summarize = args.summarize
+    provider = model = None
+    config_path = args.config.expanduser() if args.config else None
+    if summarize:
+        provider, model = resolve_from_args(args)
 
     try:
         if args.refresh is not None:
+            if summarize:
+                print("Error: --summarize cannot be used with --refresh.", file=sys.stderr)
+                sys.exit(1)
             index_path = args.refresh.expanduser()
             index = refresh_index(index_path)
             emit_result(index_path, index, args.json)
@@ -161,7 +195,17 @@ def main() -> None:
 
         split_type = args.split or detect_split_type(source)
         output_dir = resolve_output_dir(source, args.output)
-        index = split_file(source, output_dir, split_type, args.target_bytes, args.natural)
+        index = split_file(
+            source,
+            output_dir,
+            split_type,
+            args.target_bytes,
+            args.natural,
+            summarize=summarize,
+            provider=provider,
+            model=model,
+            config_path=config_path,
+        )
         emit_result(output_dir / "index.json", index, args.json)
     except (RuntimeError, FileNotFoundError, ValueError, json.JSONDecodeError) as exc:
         print(f"Error: {exc}", file=sys.stderr)

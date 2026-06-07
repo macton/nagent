@@ -7,7 +7,7 @@ from pathlib import Path
 HELPERS_DIR = Path(__file__).resolve().parent / "helpers"
 sys.path.insert(0, str(HELPERS_DIR))
 from nagent_llm import add_llm_arguments, generate_text, resolve_from_args
-from nagent_cli import exit_on_description
+from nagent_cli import emit_json, exit_on_description
 
 NAGENT_LLM_TEXT_DESCRIPTION = """\
 Send the contents of a text file to the configured LLM and print the response.
@@ -29,6 +29,11 @@ def main() -> None:
         required=True,
         help="Path to a text file whose contents are sent as the message.",
     )
+    parser.add_argument(
+        "--json",
+        action="store_true",
+        help="Print structured JSON output instead of plain text.",
+    )
     add_llm_arguments(parser)
     args = parser.parse_args()
 
@@ -41,10 +46,22 @@ def main() -> None:
     message = path.read_text(encoding="utf-8")
 
     try:
-        print(generate_text(message, provider, model))
+        response = generate_text(message, provider, model)
     except Exception as exc:
         print(f"Error: {exc}", file=sys.stderr)
         sys.exit(1)
+
+    if args.json:
+        emit_json(
+            {
+                "file": str(path.resolve()),
+                "provider": provider,
+                "model": model,
+                "response": response,
+            }
+        )
+    else:
+        print(response)
 
 
 if __name__ == "__main__":
