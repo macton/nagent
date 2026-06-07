@@ -142,6 +142,29 @@ Prefer concrete examples.
 
 ---
 
+# Introduction Examples
+
+After the core thesis and before the numbered sections, include a short
+**What It Looks Like** block with two or three examples of non-trivial tasks.
+
+Requirements:
+
+- Use only the `nagent` command in these introduction examples. Do not name
+  helper CLIs such as `nagent-file-edit`, `nagent-file-split`,
+  `nagent-file-summarize`, `nagent-llm-text`, or `nagent-llm-upload`.
+- Choose tasks that imply multiple turns: reading files, running shell commands,
+  delegating sub-tasks, iterating until done, or pausing to explain a plan before
+  editing.
+- Frame expectations clearly: one terminal prompt can trigger a long internal
+  loop while the conversation file accumulates the work.
+- Do not oversell autonomy. nagent follows the loop and obeys normal OS and
+  filesystem permissions.
+
+The goal is to show readers what using nagent feels like before the numbered
+architecture walkthrough begins.
+
+---
+
 # Audience
 
 Write for programmers who:
@@ -776,6 +799,8 @@ Teach why artifacts matter more than workers.
 
 Before finishing the README, verify:
 
+- [ ] The introduction includes **What It Looks Like** with two or three
+  complex `nagent`-only examples that frame multi-turn expectations.
 - [ ] Every major feature is justified by a reduction.
 - [ ] Every major numbered section ends with **Build your own:**.
 - [ ] Every architectural claim is grounded in implementation.

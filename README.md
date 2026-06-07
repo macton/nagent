@@ -39,6 +39,26 @@ user request
 This README is a teaching document for programmers who want to understand the
 architecture and build their own version.
 
+## What It Looks Like
+
+One `nagent` prompt can drive many turns: reads, shell commands, sub-agents,
+and follow-up reasoning, with everything appended to the conversation file.
+From the terminal it looks like a single command; under the hood the loop runs
+until the model emits a final response.
+
+```bash
+nagent "Investigate why this Linux service fails to start. Read the unit file and related config, run diagnostic commands, explain the root cause, and propose a fix before changing anything."
+```
+
+```bash
+nagent "Review this repository: identify the main entry points, run the test suite, fix the smallest failing test you find, and summarize what changed and why."
+```
+
+These are coordination tasks, not one-shot answers. nagent may read many files,
+run shell commands, spawn sub-agents for scoped work, and iterate until it can
+respond. It does not bypass normal permissions; it only does what the process
+and filesystem allow.
+
 ---
 
 ## 1. Durable Work, Disposable Workers
