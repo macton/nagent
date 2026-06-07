@@ -15,6 +15,7 @@ from nagent_file_split_lib import (
     default_output_dir,
     detect_split_type,
     load_index,
+    normalize_split_type,
     refresh_split,
     score_for_type,
     write_index_file,
@@ -52,6 +53,7 @@ def run_splitter(
     target_bytes: int,
     natural: bool,
 ) -> list[dict]:
+    split_type = normalize_split_type(split_type)
     helper = HELPER_COMMANDS.get(split_type)
     if helper is None:
         raise RuntimeError(f"no helper for split type: {split_type}")
@@ -91,6 +93,7 @@ def split_file(
     model: str | None = None,
     config_path: Path | None = None,
 ) -> dict:
+    split_type = normalize_split_type(split_type)
     output_dir.mkdir(parents=True, exist_ok=True)
     segments = run_splitter(source, output_dir, split_type, target_bytes, natural)
     index = build_index(source, segments, split_type, target_bytes, natural=natural)
@@ -135,8 +138,8 @@ def main() -> None:
     )
     parser.add_argument(
         "--split",
-        choices=SPLIT_TYPES,
-        help="Splitter type to use (default: autodetect from extension).",
+        metavar="TYPE",
+        help="Splitter type or extension alias to use (default: autodetect from extension).",
     )
     parser.add_argument(
         "--target-bytes",
@@ -193,7 +196,7 @@ def main() -> None:
             print(f"Error: file not found: {source}", file=sys.stderr)
             sys.exit(1)
 
-        split_type = args.split or detect_split_type(source)
+        split_type = normalize_split_type(args.split) if args.split else detect_split_type(source)
         output_dir = resolve_output_dir(source, args.output)
         index = split_file(
             source,

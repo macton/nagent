@@ -107,6 +107,36 @@ class FileSplitLibTests(unittest.TestCase):
             self.assertIn("int foo()", content)
             self.assertIn("int bar()", content)
 
+    def test_detects_common_extension_variants(self):
+        cases = {
+            "sample.c": "cpp",
+            "sample.h": "cpp",
+            "sample.hpp": "cpp",
+            "sample.hxx": "cpp",
+            "sample.yml": "yaml",
+            "sample.html": "xml",
+            "sample.xhtml": "xml",
+            "sample.json5": "json",
+            "sample.pyi": "py",
+            "sample.mdx": "md",
+        }
+        for filename, expected in cases.items():
+            with self.subTest(filename=filename):
+                self.assertEqual(self.mod.detect_split_type(Path(filename)), expected)
+
+    def test_normalizes_extension_aliases_to_helper_types(self):
+        cases = {
+            "hpp": "cpp",
+            ".h": "cpp",
+            "yml": "yaml",
+            ".html": "xml",
+            "tsx": "ts",
+            "jsonc": "json",
+        }
+        for split_type, expected in cases.items():
+            with self.subTest(split_type=split_type):
+                self.assertEqual(self.mod.normalize_split_type(split_type), expected)
+
 
 class FileSplitCliTests(unittest.TestCase):
     def test_end_to_end_writes_index(self):
@@ -228,6 +258,30 @@ class FileSplitCliTests(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stderr)
             payload = json.loads(result.stdout)
             self.assertEqual(payload["split_type"], "js")
+
+    def test_split_flag_accepts_extension_alias(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            source = Path(tmp) / "sample.txt"
+            source.write_text("int one() {\n  return 1;\n}\n", encoding="utf-8")
+            output_dir = Path(tmp) / "split-out"
+
+            result = subprocess.run(
+                [
+                    str(NAGENT_FILE_SPLIT),
+                    "--file",
+                    str(source),
+                    "--output",
+                    str(output_dir),
+                    "--split",
+                    "hpp",
+                    "--json",
+                ],
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            payload = json.loads(result.stdout)
+            self.assertEqual(payload["split_type"], "cpp")
 
     def test_missing_file_errors(self):
         result = subprocess.run(

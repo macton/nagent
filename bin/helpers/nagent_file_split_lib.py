@@ -15,40 +15,30 @@ ScoreFn = Callable[[int, list[Line], int], int]
 
 SPLIT_TYPES = ("txt", "md", "cpp", "py", "xml", "js", "ts", "json", "yaml", "go", "rs", "java")
 
+EXTENSIONS_BY_TYPE = {
+    "txt": (".txt", ".text", ".log", ".csv", ".tsv"),
+    "md": (".md", ".markdown", ".mdown", ".mkd", ".mdx"),
+    "cpp": (".c", ".cc", ".cpp", ".cxx", ".c++", ".h", ".hh", ".hpp", ".hxx", ".h++", ".ipp", ".inl"),
+    "py": (".py", ".pyw", ".pyi"),
+    "xml": (".xml", ".html", ".htm", ".xhtml", ".svg", ".rss", ".atom"),
+    "js": (".js", ".mjs", ".cjs", ".jsx"),
+    "ts": (".ts", ".tsx", ".mts", ".cts"),
+    "json": (".json", ".jsonc", ".json5"),
+    "yaml": (".yaml", ".yml"),
+    "go": (".go",),
+    "rs": (".rs",),
+    "java": (".java",),
+}
+
 EXTENSION_MAP = {
-    ".txt": "txt",
-    ".log": "txt",
-    ".csv": "txt",
-    ".tsv": "txt",
-    ".md": "md",
-    ".markdown": "md",
-    ".cpp": "cpp",
-    ".cc": "cpp",
-    ".cxx": "cpp",
-    ".c": "cpp",
-    ".h": "cpp",
-    ".hpp": "cpp",
-    ".hh": "cpp",
-    ".py": "py",
-    ".pyw": "py",
-    ".xml": "xml",
-    ".html": "xml",
-    ".htm": "xml",
-    ".js": "js",
-    ".mjs": "js",
-    ".cjs": "js",
-    ".jsx": "js",
-    ".ts": "ts",
-    ".tsx": "ts",
-    ".mts": "ts",
-    ".cts": "ts",
-    ".json": "json",
-    ".jsonc": "json",
-    ".yaml": "yaml",
-    ".yml": "yaml",
-    ".go": "go",
-    ".rs": "rs",
-    ".java": "java",
+    extension: split_type
+    for split_type, extensions in EXTENSIONS_BY_TYPE.items()
+    for extension in extensions
+}
+
+SPLIT_TYPE_ALIASES = {
+    **{split_type: split_type for split_type in SPLIT_TYPES},
+    **{extension.lstrip("."): split_type for extension, split_type in EXTENSION_MAP.items()},
 }
 
 
@@ -205,6 +195,14 @@ def write_index_file(index_path: Path, index: dict) -> Path:
     return index_path
 
 
+def normalize_split_type(split_type: str) -> str:
+    normalized = split_type.lower().lstrip(".")
+    if normalized not in SPLIT_TYPE_ALIASES:
+        supported = ", ".join(sorted(SPLIT_TYPE_ALIASES))
+        raise ValueError(f"unknown split type: {split_type} (supported: {supported})")
+    return SPLIT_TYPE_ALIASES[normalized]
+
+
 def detect_split_type(path: Path) -> str:
     return EXTENSION_MAP.get(path.suffix.lower(), "txt")
 
@@ -227,7 +225,7 @@ def refresh_split(
     output_dir = index_path.parent
     target_bytes = int(index.get("target_bytes", TARGET_BYTES_DEFAULT))
     natural = bool(index.get("natural", False))
-    split_type = index.get("split_type", detect_split_type(source))
+    split_type = normalize_split_type(index.get("split_type", detect_split_type(source)))
 
     segments = split_to_segments(
         source,
@@ -492,4 +490,4 @@ SCORE_BY_TYPE: dict[str, ScoreFn] = {
 
 
 def score_for_type(split_type: str) -> ScoreFn:
-    return SCORE_BY_TYPE.get(split_type, blank_line_score)
+    return SCORE_BY_TYPE.get(normalize_split_type(split_type), blank_line_score)
