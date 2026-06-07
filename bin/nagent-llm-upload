@@ -6,7 +6,7 @@ from pathlib import Path
 
 HELPERS_DIR = Path(__file__).resolve().parent / "helpers"
 sys.path.insert(0, str(HELPERS_DIR))
-from nagent_llm import add_llm_arguments, generate_with_upload, resolve_from_args
+from nagent_llm import add_llm_arguments, generate_with_upload_usage, resolve_from_args
 from nagent_cli import emit_json, exit_on_description
 
 NAGENT_LLM_UPLOAD_DESCRIPTION = """\
@@ -144,7 +144,7 @@ def main() -> None:
     provider, model = resolve_from_args(args)
 
     try:
-        response = generate_with_upload(path, args.prompt, provider, model)
+        result = generate_with_upload_usage(path, args.prompt, provider, model)
     except Exception as exc:
         print(f"Error: {exc}", file=sys.stderr)
         sys.exit(1)
@@ -156,11 +156,13 @@ def main() -> None:
                 "prompt": args.prompt,
                 "provider": provider,
                 "model": model,
-                "response": response,
+                "response": result.text,
+                "input_tokens": result.input_tokens,
+                "output_tokens": result.output_tokens,
             }
         )
     else:
-        print(response)
+        print(result.text)
 
 
 if __name__ == "__main__":

@@ -5,6 +5,7 @@ import mimetypes
 import os
 import sys
 import time
+from dataclasses import dataclass
 from pathlib import Path
 
 PROVIDERS = ("openai", "anthropic", "google", "cursor")
@@ -29,6 +30,13 @@ PACKAGE_HINTS = {
     "google": "google-genai",
     "cursor": "cursor-sdk",
 }
+
+
+@dataclass
+class LlmResult:
+    text: str
+    input_tokens: int = 0
+    output_tokens: int = 0
 
 
 def default_config_path() -> Path:
@@ -225,12 +233,42 @@ def _cursor_result_text(result) -> str:
     return getattr(result, "result", None) or ""
 
 
-def generate_text(message: str, provider: str, model: str) -> str:
+def _usage_value(usage, *names: str) -> int:
+    if usage is None:
+        return 0
+    for name in names:
+        if isinstance(usage, dict):
+            value = usage.get(name)
+        else:
+            value = getattr(usage, name, None)
+        if value is not None:
+            try:
+                return int(value)
+            except (TypeError, ValueError):
+                return 0
+    return 0
+
+
+def _result_with_usage(text: str, usage) -> LlmResult:
+    return LlmResult(
+        text=text,
+        input_tokens=_usage_value(usage, "input_tokens", "prompt_tokens", "prompt_token_count"),
+        output_tokens=_usage_value(
+            usage,
+            "output_tokens",
+            "completion_tokens",
+            "candidates_token_count",
+            "output_token_count",
+        ),
+    )
+
+
+def generate_text_with_usage(message: str, provider: str, model: str) -> LlmResult:
     if provider == "openai":
         OpenAI = require_package(provider)
         client = OpenAI()
         response = client.responses.create(model=model, input=message)
-        return response.output_text
+        return _result_with_usage(response.output_text, getattr(response, "usage", None))
 
     if provider == "anthropic":
         anthropic = require_package(provider)
@@ -240,14 +278,14 @@ def generate_text(message: str, provider: str, model: str) -> str:
             max_tokens=8192,
             messages=[{"role": "user", "content": message}],
         )
-        return _anthropic_text(response)
+        return _result_with_usage(_anthropic_text(response), getattr(response, "usage", None))
 
     if provider == "google":
         genai = require_package(provider)
         api_key = os.environ.get("GOOGLE_API_KEY") or os.environ["GEMINI_API_KEY"]
         client = genai.Client(api_key=api_key)
         response = client.models.generate_content(model=model, contents=message)
-        return response.text or ""
+        return _result_with_usage(response.text or "", getattr(response, "usage_metadata", None))
 
     Agent, AgentOptions, LocalAgentOptions = require_package(provider)
     result = Agent.prompt(
@@ -258,10 +296,14 @@ def generate_text(message: str, provider: str, model: str) -> str:
             local=LocalAgentOptions(cwd=os.getcwd()),
         ),
     )
-    return _cursor_result_text(result)
+    return LlmResult(text=_cursor_result_text(result))
 
 
-def generate_with_upload(path: Path, prompt: str, provider: str, model: str) -> str:
+def generate_text(message: str, provider: str, model: str) -> str:
+    return generate_text_with_usage(message, provider, model).text
+
+
+def generate_with_upload_usage(path: Path, prompt: str, provider: str, model: str) -> LlmResult:
     if provider == "openai":
         return _openai_upload(path, prompt, model)
     if provider == "anthropic":
@@ -269,8 +311,12 @@ def generate_with_upload(path: Path, prompt: str, provider: str, model: str) -> 
     if provider == "google":
         return _google_upload(path, prompt, model)
     if provider == "cursor":
-        return _cursor_upload(path, prompt, model)
+        return LlmResult(text=_cursor_upload(path, prompt, model))
     raise ValueError(f"Unsupported provider: {provider}")
+
+
+def generate_with_upload(path: Path, prompt: str, provider: str, model: str) -> str:
+    return generate_with_upload_usage(path, prompt, provider, model).text
 
 
 def _anthropic_text(response) -> str:
@@ -290,7 +336,7 @@ def _is_image_mime(mime_type: str) -> bool:
     return mime_type.startswith("image/")
 
 
-def _openai_upload(path: Path, prompt: str, model: str) -> str:
+def _openai_upload(path: Path, prompt: str, model: str) -> LlmResult:
     OpenAI = require_package("openai")
     client = OpenAI()
     mime_type = _mime_type(path)
@@ -308,10 +354,10 @@ def _openai_upload(path: Path, prompt: str, model: str) -> str:
         model=model,
         input=[{"role": "user", "content": content}],
     )
-    return response.output_text
+    return _result_with_usage(response.output_text, getattr(response, "usage", None))
 
 
-def _anthropic_upload(path: Path, prompt: str, model: str) -> str:
+def _anthropic_upload(path: Path, prompt: str, model: str) -> LlmResult:
     anthropic = require_package("anthropic")
     client = anthropic.Anthropic()
     mime_type = _mime_type(path)
@@ -345,7 +391,7 @@ def _anthropic_upload(path: Path, prompt: str, model: str) -> str:
             }
         ],
     )
-    return _anthropic_text(response)
+    return _result_with_usage(_anthropic_text(response), getattr(response, "usage", None))
 
 
 def _google_wait_for_file(client, uploaded):
@@ -365,7 +411,7 @@ def _google_wait_for_file(client, uploaded):
     raise RuntimeError(f"Timed out waiting for Google file processing: {name}")
 
 
-def _google_upload(path: Path, prompt: str, model: str) -> str:
+def _google_upload(path: Path, prompt: str, model: str) -> LlmResult:
     genai = require_package("google")
     api_key = os.environ.get("GOOGLE_API_KEY") or os.environ["GEMINI_API_KEY"]
     client = genai.Client(api_key=api_key)
@@ -375,7 +421,7 @@ def _google_upload(path: Path, prompt: str, model: str) -> str:
         model=model,
         contents=[prompt, uploaded],
     )
-    return response.text or ""
+    return _result_with_usage(response.text or "", getattr(response, "usage_metadata", None))
 
 
 def _cursor_upload(path: Path, prompt: str, model: str) -> str:

@@ -5,9 +5,11 @@ import json
 import os
 import re
 import select
+import shutil
 import socket
 import subprocess
 import sys
+import tempfile
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
@@ -50,7 +52,6 @@ TAG_PATTERNS: list[tuple[TagType, re.Pattern[str]]] = [
 
 READ_SPLIT_THRESHOLD_BYTES = 64 * 1024
 NAGENT_FILE_SPLIT = Path(__file__).resolve().parent / "nagent-file-split"
-
 MAX_FORMAT_RETRIES = 3
 NAGENT_LLM_TEXT = Path(__file__).resolve().parent / "nagent-llm-text"
 _spinner_enabled = True
@@ -81,13 +82,47 @@ class LlmSettings:
     config_path: Path | None = None
 
 
+@dataclass
+class TokenStats:
+    turn_count: int = 0
+    conversation_input_tokens: int = 0
+    recursive_input_tokens: int = 0
+    recursive_output_tokens: int = 0
+
+    def status_line(self) -> str:
+        return (
+            f"[Turns:{self.turn_count} "
+            f"Conversation-Tokens:{self.conversation_input_tokens} "
+            f"Tokens-In:{self.recursive_input_tokens} "
+            f"Tokens-Out:{self.recursive_output_tokens}]"
+        )
+
+    def add_llm_turn(self, input_tokens: int, output_tokens: int) -> None:
+        self.turn_count += 1
+        self.conversation_input_tokens = input_tokens
+        self.recursive_input_tokens += input_tokens
+        self.recursive_output_tokens += output_tokens
+
+    def add_recursive(self, input_tokens: int, output_tokens: int) -> None:
+        self.recursive_input_tokens += input_tokens
+        self.recursive_output_tokens += output_tokens
+
+    def as_dict(self) -> dict[str, int]:
+        return {
+            "turn_count": self.turn_count,
+            "conversation_input_tokens": self.conversation_input_tokens,
+            "recursive_input_tokens": self.recursive_input_tokens,
+            "recursive_output_tokens": self.recursive_output_tokens,
+        }
+
+
 def set_spinner_enabled(enabled: bool) -> None:
     global _spinner_enabled
     _spinner_enabled = enabled
 
 
 def wait_spinner(message: str) -> WaitSpinner:
-    return WaitSpinner(message, enabled=_spinner_enabled)
+    return WaitSpinner("Waiting...", enabled=_spinner_enabled)
 
 
 def host_uname() -> str:
@@ -281,8 +316,12 @@ def refresh_initial_context(
 
 
 def default_pid() -> str:
-    # BASHPID is not exported by bash by default; fall back to the parent shell
-    # process id so repeated terminal invocations share one conversation.
+    # In screen, STY and WINDOW identify the current virtual terminal more
+    # stably than the shell process. BASHPID is not exported by bash by default;
+    # fall back to the parent shell process id so repeated terminal invocations
+    # share one conversation.
+    if os.environ.get("STY"):
+        return f"{os.environ['STY']}-{os.environ.get('WINDOW', '')}"
     return os.environ.get("BASHPID") or str(os.getppid())
 
 
@@ -368,11 +407,44 @@ def append_to_conversation(conversation_file: Path, text: str) -> None:
         handle.write(text)
 
 
-def call_llm(conversation_file: Path, llm: LlmSettings) -> tuple[str | None, str | None]:
+def estimate_token_count(text: str) -> int:
+    if not text:
+        return 0
+    return max(1, (len(text) + 3) // 4)
+
+
+def coerce_token_count(value) -> int:
+    try:
+        return int(value or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def parse_llm_json_output(stdout: str) -> tuple[str, int, int] | None:
+    try:
+        payload = json.loads(stdout)
+    except json.JSONDecodeError:
+        return None
+    response = payload.get("response")
+    if not isinstance(response, str):
+        return None
+    return (
+        response,
+        coerce_token_count(payload.get("input_tokens")),
+        coerce_token_count(payload.get("output_tokens")),
+    )
+
+
+def call_llm(
+    conversation_file: Path,
+    llm: LlmSettings,
+    token_stats: TokenStats,
+) -> tuple[str | None, str | None]:
     command = [
         str(NAGENT_LLM_TEXT),
         "--file",
         str(conversation_file),
+        "--json",
         "--provider",
         llm.provider,
         "--model",
@@ -381,7 +453,13 @@ def call_llm(conversation_file: Path, llm: LlmSettings) -> tuple[str | None, str
     if llm.config_path is not None:
         command.extend(["--config", str(llm.config_path)])
 
-    with wait_spinner("Waiting for LLM"):
+    try:
+        conversation_text = conversation_file.read_text(encoding="utf-8")
+    except OSError:
+        conversation_text = ""
+    token_stats.conversation_input_tokens = estimate_token_count(conversation_text)
+
+    with wait_spinner(token_stats.status_line()):
         result = subprocess.run(
             command,
             capture_output=True,
@@ -390,7 +468,21 @@ def call_llm(conversation_file: Path, llm: LlmSettings) -> tuple[str | None, str
     if result.returncode != 0:
         error = result.stderr.strip() or result.stdout.strip() or "nagent-llm-text failed"
         return None, error
-    return result.stdout, None
+
+    parsed = parse_llm_json_output(result.stdout)
+    if parsed is None:
+        llm_output = result.stdout
+        input_tokens = token_stats.conversation_input_tokens
+        output_tokens = estimate_token_count(llm_output)
+    else:
+        llm_output, input_tokens, output_tokens = parsed
+        if input_tokens == 0:
+            input_tokens = token_stats.conversation_input_tokens
+        if output_tokens == 0:
+            output_tokens = estimate_token_count(llm_output)
+
+    token_stats.add_llm_turn(input_tokens, output_tokens)
+    return llm_output, None
 
 
 def execute_read(path: str) -> str:
@@ -556,8 +648,9 @@ def execute_write(
         return f'<nagent-write-result path="{path}" status="error">{exc}</nagent-write-result>'
 
 
-def execute_shell(commands: str) -> str:
-    with wait_spinner("Running command"):
+def execute_shell(commands: str, token_stats: TokenStats | None = None) -> str:
+    message = token_stats.status_line() if token_stats is not None else "Running command"
+    with wait_spinner(message):
         result = subprocess.run(
             commands,
             shell=True,
@@ -585,6 +678,7 @@ def execute_agent(
     nagent_path: Path,
     parent_conversation: str,
     pid: str,
+    token_stats: TokenStats | None = None,
 ) -> str:
     conversation_name = f"{uuid.uuid4()}-{pid}"
     command = [
@@ -600,6 +694,7 @@ def execute_agent(
     ]
     if llm.config_path is not None:
         command.extend(["--config", str(llm.config_path)])
+    command.append("--json")
     command.extend(
         [
             "--invocation",
@@ -612,16 +707,38 @@ def execute_agent(
         ]
     )
 
-    with wait_spinner("Sub-agent working"):
+    message = token_stats.status_line() if token_stats is not None else "Sub-agent working"
+    with wait_spinner(message):
         result = subprocess.run(
             command,
             capture_output=True,
             text=True,
         )
     output = result.stdout.rstrip("\n")
+    child_input_tokens = 0
+    child_output_tokens = 0
+    try:
+        payload = json.loads(result.stdout)
+    except json.JSONDecodeError:
+        payload = None
+    if isinstance(payload, dict):
+        responses = payload.get("responses")
+        if isinstance(responses, list):
+            output = "\n".join(str(response) for response in responses)
+        child_input_tokens = coerce_token_count(
+            payload.get("recursive_input_tokens") or payload.get("tokens_in")
+        )
+        child_output_tokens = coerce_token_count(
+            payload.get("recursive_output_tokens") or payload.get("tokens_out")
+        )
+        if token_stats is not None:
+            token_stats.add_recursive(child_input_tokens, child_output_tokens)
     stderr = result.stderr.rstrip("\n")
     parts = [
-        f'<nagent-agent-result conversation="{conversation_name}">',
+        (
+            f'<nagent-agent-result conversation="{conversation_name}" '
+            f'tokens_in="{child_input_tokens}" tokens_out="{child_output_tokens}">'
+        ),
         f"exit_code: {result.returncode}",
     ]
     if output:
@@ -639,6 +756,7 @@ def process_tags(
     llm: LlmSettings,
     nagent_path: Path,
     pid: str,
+    token_stats: TokenStats,
     file_edit_path: Path | None = None,
     file_edit_id: str | None = None,
 ) -> tuple[list[str], list[str], bool]:
@@ -665,7 +783,7 @@ def process_tags(
             )
             should_continue = True
         elif tag.kind == "shell":
-            append_to_conversation(conversation_file, execute_shell(tag.content))
+            append_to_conversation(conversation_file, execute_shell(tag.content, token_stats))
             should_continue = True
         elif tag.kind == "agent":
             append_to_conversation(
@@ -677,6 +795,7 @@ def process_tags(
                     nagent_path,
                     conversation_file.name,
                     pid,
+                    token_stats,
                 ),
             )
             should_continue = True
@@ -696,9 +815,11 @@ def run_agent_loop(
     file_edit_id: str | None = None,
     *,
     json_mode: bool = False,
+    token_stats: TokenStats | None = None,
 ) -> tuple[int, list[str]]:
     nagent_path = Path(__file__).resolve()
     user_responses: list[str] = []
+    token_stats = token_stats or TokenStats()
 
     if initial_prompt is not None:
         append_to_conversation(conversation_file, f"<user-prompt>\n{initial_prompt}\n</user-prompt>")
@@ -706,7 +827,7 @@ def run_agent_loop(
     while True:
         llm_output, error = None, None
         for attempt in range(MAX_FORMAT_RETRIES):
-            llm_output, error = call_llm(conversation_file, llm)
+            llm_output, error = call_llm(conversation_file, llm, token_stats)
             if error is not None:
                 print(f"Error: {error}", file=sys.stderr)
                 return 1, user_responses
@@ -737,6 +858,7 @@ def run_agent_loop(
             llm,
             nagent_path,
             pid,
+            token_stats,
             file_edit_path,
             file_edit_id,
         )
@@ -766,6 +888,13 @@ def resolve_conversation(root: Path, conversation_name: str) -> Path:
     return conversations_dir(root) / conversation_name
 
 
+def resolve_conversation_reference(root: Path, name: str) -> Path:
+    reference = Path(name).expanduser()
+    if reference.is_absolute() or reference.parent != Path("."):
+        return reference
+    return resolve_conversation(root, name)
+
+
 def migrate_legacy_conversation(root: Path, conversation_name: str, conversation_file: Path) -> Path | None:
     legacy_file = root / conversation_name
     if legacy_file == conversation_file or not legacy_file.is_file() or conversation_file.exists():
@@ -782,6 +911,23 @@ def archive_conversation(conversation_file: Path) -> Path | None:
     archive_path = conversation_file.with_name(f"{conversation_file.name}-{uuid.uuid4()}")
     conversation_file.rename(archive_path)
     return archive_path
+
+
+def save_conversation(conversation_file: Path, target: Path) -> Path:
+    if not conversation_file.is_file():
+        raise FileNotFoundError(f"conversation not found: {conversation_file}")
+    target.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(conversation_file, target)
+    return target
+
+
+def load_conversation(conversation_file: Path, source: Path) -> Path | None:
+    if not source.is_file():
+        raise FileNotFoundError(f"conversation not found: {source}")
+    archived = archive_conversation(conversation_file)
+    conversation_file.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(source, conversation_file)
+    return archived
 
 
 def clear_conversation(
@@ -833,6 +979,220 @@ def print_conversation_status(
     print(f"provider:{provider} model:{model}")
 
 
+def print_save_conversation_result(
+    conversation_file: Path,
+    saved_path: Path,
+    *,
+    json_mode: bool = False,
+) -> None:
+    if json_mode:
+        emit_json(
+            {
+                "conversation_path": str(conversation_file.resolve()),
+                "saved_path": str(saved_path.resolve()),
+            }
+        )
+        return
+    print(f"saved:{saved_path}")
+    print(f"conversation:{conversation_file}")
+
+
+def print_load_conversation_result(
+    conversation_file: Path,
+    source_path: Path,
+    archived_path: Path | None,
+    *,
+    json_mode: bool = False,
+) -> None:
+    if json_mode:
+        payload = {
+            "conversation_path": str(conversation_file.resolve()),
+            "loaded_path": str(source_path.resolve()),
+        }
+        if archived_path is not None:
+            payload["archived_path"] = str(archived_path.resolve())
+        emit_json(payload)
+        return
+    if archived_path is not None:
+        print(f"archived:{archived_path}")
+    print(f"loaded:{source_path}")
+    print(f"conversation:{conversation_file}")
+
+
+def summarize_conversation(
+    conversation_file: Path,
+    provider: str | None,
+    model: str | None,
+    config_path: Path | None,
+    *,
+    json_mode: bool = False,
+    print_status: bool = False,
+) -> int:
+    if not conversation_file.is_file():
+        print(f"Error: conversation not found: {conversation_file}", file=sys.stderr)
+        return 1
+
+    try:
+        resolved_provider, resolved_model = resolve_settings(provider, model, config_path)
+    except ValueError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
+    require_credentials(resolved_provider)
+
+    try:
+        conversation_text = conversation_file.read_text(encoding="utf-8")
+    except OSError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
+
+    token_stats = TokenStats(conversation_input_tokens=estimate_token_count(conversation_text))
+    summary_prompt = (
+        "Summarize the following nagent conversation for future context. "
+        "Focus on the user's goals, decisions made, implementation changes, "
+        "commands or tests run, unresolved issues, and any important file paths. "
+        "Do not summarize nagent as a tool; summarize only this conversation.\n\n"
+        "<conversation>\n"
+        f"{conversation_text}\n"
+        "</conversation>\n"
+    )
+
+    with tempfile.NamedTemporaryFile("w", encoding="utf-8", suffix=".txt", delete=False) as handle:
+        prompt_path = Path(handle.name)
+        handle.write(summary_prompt)
+
+    command = [
+        str(NAGENT_LLM_TEXT),
+        "--file",
+        str(prompt_path),
+        "--json",
+        "--provider",
+        resolved_provider,
+        "--model",
+        resolved_model,
+    ]
+    if config_path is not None:
+        command.extend(["--config", str(config_path.expanduser())])
+
+    try:
+        with wait_spinner(token_stats.status_line()):
+            result = subprocess.run(command, capture_output=True, text=True)
+    finally:
+        try:
+            prompt_path.unlink()
+        except OSError:
+            pass
+
+    if result.returncode != 0:
+        error = result.stderr.strip() or result.stdout.strip() or "nagent-llm-text failed"
+        print(f"Error: {error}", file=sys.stderr)
+        return result.returncode
+
+    parsed = parse_llm_json_output(result.stdout)
+    if parsed is None:
+        summary = result.stdout
+        input_tokens = estimate_token_count(summary_prompt)
+        output_tokens = estimate_token_count(summary)
+    else:
+        summary, input_tokens, output_tokens = parsed
+        if input_tokens == 0:
+            input_tokens = estimate_token_count(summary_prompt)
+        if output_tokens == 0:
+            output_tokens = estimate_token_count(summary)
+
+    token_stats.turn_count += 1
+    token_stats.recursive_input_tokens += input_tokens
+    token_stats.recursive_output_tokens += output_tokens
+
+    if json_mode:
+        payload = {
+            "conversation_path": str(conversation_file.resolve()),
+            "summary": summary,
+            **token_stats.as_dict(),
+        }
+        payload["tokens_in"] = token_stats.recursive_input_tokens
+        payload["tokens_out"] = token_stats.recursive_output_tokens
+        emit_json(payload)
+    else:
+        print(summary)
+        if print_status:
+            print(token_stats.status_line())
+    return 0
+
+
+def edit_conversation(
+    conversation_file: Path,
+    root: Path,
+    process_path: Path,
+    invocation: Invocation,
+    conversation_name: str,
+    pid: str,
+    parent_conversation: str | None,
+    prompt: str,
+    provider: str | None,
+    model: str | None,
+    config_path: Path | None,
+    file_edit_path: Path | None = None,
+    file_edit_id: str | None = None,
+    *,
+    json_mode: bool = False,
+) -> int:
+    archived = clear_conversation(
+        conversation_file,
+        root,
+        process_path,
+        invocation,
+        conversation_name,
+        parent_conversation,
+        file_edit_path,
+        file_edit_id,
+    )
+    if archived is None:
+        print(f"Error: conversation not found: {conversation_file}", file=sys.stderr)
+        return 1
+
+    command = [
+        str(process_path),
+        "--file-edit",
+        str(archived),
+        "--root",
+        str(root),
+        "--pid",
+        pid,
+        "--clear",
+    ]
+    if provider:
+        command.extend(["--provider", provider])
+    if model:
+        command.extend(["--model", model])
+    if config_path is not None:
+        command.extend(["--config", str(config_path.expanduser())])
+    if json_mode:
+        command.append("--json")
+    command.append(prompt)
+
+    result = subprocess.run(command, capture_output=True, text=True)
+    if result.returncode != 0:
+        if result.stdout:
+            print(result.stdout, end="")
+        if result.stderr:
+            print(result.stderr, end="", file=sys.stderr)
+        return result.returncode
+
+    loaded_archive = load_conversation(conversation_file, archived)
+    if json_mode:
+        payload = {
+            "conversation_path": str(conversation_file.resolve()),
+            "edited_path": str(archived.resolve()),
+        }
+        if loaded_archive is not None:
+            payload["archived_path"] = str(loaded_archive.resolve())
+        emit_json(payload)
+    else:
+        print(f"edited:{archived}")
+        print(f"conversation:{conversation_file}")
+    return 0
+
+
 def print_file_edits(root: Path, pid: str, *, json_mode: bool = False) -> None:
     payload = list_file_edits(root, pid)
     if json_mode:
@@ -843,9 +1203,24 @@ def print_file_edits(root: Path, pid: str, *, json_mode: bool = False) -> None:
         print(f"{entry['file_id']}\t{entry.get('path', '')}\t{entry.get('conversation', '')}")
 
 
-def resolve_initial_prompt(prompt_arg: str | None) -> str | None:
-    if prompt_arg is not None:
-        return prompt_arg
+def resolve_initial_prompt(prompt_arg: str | list[str] | None) -> str | None:
+    if isinstance(prompt_arg, list):
+        prompt_parts = prompt_arg
+    elif prompt_arg is None:
+        prompt_parts = []
+    else:
+        prompt_parts = [prompt_arg]
+
+    if prompt_parts and prompt_parts[-1] == "-":
+        stdin_prompt = sys.stdin.read()
+        leading_prompt = " ".join(prompt_parts[:-1])
+        if leading_prompt and stdin_prompt:
+            return f"{leading_prompt}\n{stdin_prompt}"
+        return leading_prompt or stdin_prompt or None
+
+    if prompt_parts:
+        return " ".join(prompt_parts)
+
     if sys.stdin.isatty():
         return None
     try:
@@ -869,7 +1244,7 @@ def main() -> None:
     )
     parser.add_argument(
         "--conversation",
-        help='Conversation name (default: latest-{hostname}-{bashpid}).',
+        help='Conversation name (default: latest-{hostname}-{pid}).',
     )
     parser.add_argument(
         "--model",
@@ -897,7 +1272,10 @@ def main() -> None:
     )
     parser.add_argument(
         "--pid",
-        help="Shell process ID shared across sub-agents (default: BASHPID or parent shell pid).",
+        help=(
+            "Shell process ID shared across sub-agents "
+            "(default: STY-WINDOW, BASHPID, or parent shell pid)."
+        ),
     )
     parser.add_argument(
         "--status",
@@ -925,15 +1303,43 @@ def main() -> None:
         help="Archive the current conversation file and start a fresh one at the same path.",
     )
     parser.add_argument(
+        "--save-conversation",
+        metavar="NAME",
+        help="Copy the current conversation to NAME without changing the loaded conversation.",
+    )
+    parser.add_argument(
+        "--load-conversation",
+        metavar="NAME",
+        help="Archive the current conversation, then copy NAME into the current conversation path.",
+    )
+    parser.add_argument(
+        "--summarize",
+        action="store_true",
+        help="Print an LLM-generated summary of the loaded conversation, then exit.",
+    )
+    parser.add_argument(
+        "--edit-conversation",
+        action="store_true",
+        help=(
+            "Archive the current conversation, edit that backup using the prompt, "
+            "then load the edited backup."
+        ),
+    )
+    parser.add_argument(
         "--file-edit",
         type=Path,
         metavar="PATH",
         help="Edit a specific file using its per-file conversation (see nagent-file-edit).",
     )
-    parser.add_argument("prompt", nargs="?", help="Prompt text.")
+    parser.add_argument(
+        "prompt",
+        nargs="*",
+        help="Prompt text. Use trailing '-' to read stdin until EOF.",
+    )
     args = parser.parse_args()
 
     root = Path(args.root).expanduser()
+    user_direct_mode = args.invocation == "user" and args.pid is None
     pid = args.pid or default_pid()
     file_edit_path: Path | None = None
     file_edit_id: str | None = None
@@ -989,11 +1395,42 @@ def main() -> None:
                 print(model_name)
         return 0
 
+    if args.summarize:
+        return summarize_conversation(
+            conversation_file,
+            args.provider,
+            args.model,
+            args.config,
+            json_mode=args.json,
+            print_status=user_direct_mode,
+        )
+
     initial_prompt = resolve_initial_prompt(args.prompt)
+
+    process_path = Path(__file__).resolve()
+
+    if args.edit_conversation:
+        if initial_prompt is None:
+            parser.error("prompt is required with --edit-conversation")
+        return edit_conversation(
+            conversation_file,
+            root,
+            process_path,
+            args.invocation,
+            conversation_name,
+            pid,
+            args.parent_conversation,
+            initial_prompt,
+            args.provider,
+            args.model,
+            args.config,
+            file_edit_path,
+            file_edit_id,
+            json_mode=args.json,
+        )
 
     cleared = False
     if args.clear:
-        process_path = Path(__file__).resolve()
         archived = clear_conversation(
             conversation_file,
             root,
@@ -1020,13 +1457,38 @@ def main() -> None:
         else:
             print(f"conversation:{conversation_file}")
         cleared = True
-        if initial_prompt is None:
+        if initial_prompt is None and args.load_conversation is None and args.save_conversation is None:
             return 0
+
+    if args.load_conversation is not None:
+        source = resolve_conversation_reference(root, args.load_conversation)
+        try:
+            archived = load_conversation(conversation_file, source)
+        except FileNotFoundError as exc:
+            print(f"Error: {exc}", file=sys.stderr)
+            return 1
+        print_load_conversation_result(conversation_file, source, archived, json_mode=args.json)
+
+    if args.save_conversation is not None:
+        target = resolve_conversation_reference(root, args.save_conversation)
+        try:
+            saved = save_conversation(conversation_file, target)
+        except FileNotFoundError as exc:
+            print(f"Error: {exc}", file=sys.stderr)
+            return 1
+        print_save_conversation_result(conversation_file, saved, json_mode=args.json)
+
+    if (
+        initial_prompt is None
+        and (args.load_conversation is not None or args.save_conversation is not None)
+    ):
+        return 0
 
     if initial_prompt is None:
         parser.error(
             "prompt is required unless --status, --list-models, --list-file-edits, "
-            "--clear, or stdin prompt text is given"
+            "--clear, --save-conversation, --load-conversation, --summarize, "
+            "or stdin prompt text is given"
         )
 
     try:
@@ -1039,7 +1501,6 @@ def main() -> None:
 
     conversation_file.parent.mkdir(parents=True, exist_ok=True)
 
-    process_path = Path(__file__).resolve()
     if not cleared and not conversation_file.exists():
         conversation_file.write_text(
             create_initial_text(
@@ -1065,6 +1526,7 @@ def main() -> None:
         file_edit_id,
     )
 
+    token_stats = TokenStats()
     exit_code, responses = run_agent_loop(
         conversation_file,
         root,
@@ -1074,15 +1536,20 @@ def main() -> None:
         file_edit_path,
         file_edit_id,
         json_mode=args.json,
+        token_stats=token_stats,
     )
     if args.json:
-        emit_json(
-            {
-                "exit_code": exit_code,
-                "conversation_path": str(conversation_file.resolve()),
-                "responses": responses,
-            }
-        )
+        payload = {
+            "exit_code": exit_code,
+            "conversation_path": str(conversation_file.resolve()),
+            "responses": responses,
+            **token_stats.as_dict(),
+        }
+        payload["tokens_in"] = token_stats.recursive_input_tokens
+        payload["tokens_out"] = token_stats.recursive_output_tokens
+        emit_json(payload)
+    elif user_direct_mode:
+        print(token_stats.status_line())
     return exit_code
 
 

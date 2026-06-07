@@ -165,12 +165,69 @@ class ActionTests(unittest.TestCase):
         self.assertIn("hello-nagent", result)
         self.assertIn("exit_code: 0", result)
 
-    def test_default_pid_prefers_bashpid(self):
-        with unittest.mock.patch.dict(os.environ, {"BASHPID": "9999"}, clear=False):
+    def test_parse_llm_json_output_includes_tokens(self):
+        parsed = self.mod.parse_llm_json_output(
+            json.dumps(
+                {
+                    "response": "<nagent-response>ok</nagent-response>",
+                    "input_tokens": 12,
+                    "output_tokens": 3,
+                }
+            )
+        )
+        self.assertEqual(parsed, ("<nagent-response>ok</nagent-response>", 12, 3))
+
+    def test_call_llm_updates_token_stats_from_json(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            conversation = root / "conversation"
+            conversation.write_text("prompt text", encoding="utf-8")
+            fake_llm = root / "fake-llm"
+            fake_llm.write_text(
+                "#!/usr/bin/python3\n"
+                "import json\n"
+                "print(json.dumps({"
+                "'response': '<nagent-response>token ok</nagent-response>', "
+                "'input_tokens': 17, "
+                "'output_tokens': 5"
+                "}))\n",
+                encoding="utf-8",
+            )
+            fake_llm.chmod(0o755)
+
+            self.mod.NAGENT_LLM_TEXT = fake_llm
+            stats = self.mod.TokenStats()
+            output, error = self.mod.call_llm(
+                conversation,
+                self.mod.LlmSettings(provider="openai", model="gpt-5.5"),
+                stats,
+            )
+
+        self.assertIsNone(error)
+        self.assertEqual(output, "<nagent-response>token ok</nagent-response>")
+        self.assertEqual(stats.turn_count, 1)
+        self.assertEqual(stats.conversation_input_tokens, 17)
+        self.assertEqual(stats.recursive_input_tokens, 17)
+        self.assertEqual(stats.recursive_output_tokens, 5)
+
+    def test_default_pid_prefers_screen_window(self):
+        env = os.environ.copy()
+        env.update({"STY": "screen-name", "WINDOW": "7", "BASHPID": "9999"})
+        with unittest.mock.patch.dict(os.environ, env, clear=True):
+            self.assertEqual(self.mod.default_pid(), "screen-name-7")
+
+    def test_default_pid_prefers_bashpid_without_screen(self):
+        env = os.environ.copy()
+        env.pop("STY", None)
+        env.pop("WINDOW", None)
+        env["BASHPID"] = "9999"
+        with unittest.mock.patch.dict(os.environ, env, clear=True):
             self.assertEqual(self.mod.default_pid(), "9999")
 
     def test_default_pid_falls_back_to_parent_shell(self):
         env = os.environ.copy()
+        env.pop("STY", None)
+        env.pop("WINDOW", None)
         env.pop("BASHPID", None)
         with unittest.mock.patch.dict(os.environ, env, clear=True):
             with unittest.mock.patch.object(self.mod.os, "getppid", return_value=4242):
@@ -184,6 +241,20 @@ class ActionTests(unittest.TestCase):
     def test_resolve_initial_prompt_prefers_cli_prompt(self):
         with unittest.mock.patch.object(self.mod.sys, "stdin", io.StringIO("from stdin")):
             self.assertEqual(self.mod.resolve_initial_prompt("from cli"), "from cli")
+
+    def test_resolve_initial_prompt_joins_prompt_parts(self):
+        self.assertEqual(self.mod.resolve_initial_prompt(["from", "cli"]), "from cli")
+
+    def test_resolve_initial_prompt_reads_explicit_stdin_prompt(self):
+        with unittest.mock.patch.object(self.mod.sys, "stdin", io.StringIO("from stdin")):
+            self.assertEqual(self.mod.resolve_initial_prompt(["-"]), "from stdin")
+
+    def test_resolve_initial_prompt_appends_explicit_stdin_to_prompt(self):
+        with unittest.mock.patch.object(self.mod.sys, "stdin", io.StringIO("from stdin")):
+            self.assertEqual(
+                self.mod.resolve_initial_prompt(["summarize", "-"]),
+                "summarize\nfrom stdin",
+            )
 
     def test_resolve_initial_prompt_reads_piped_stdin(self):
         with unittest.mock.patch.object(self.mod.sys, "stdin", io.StringIO("from stdin")):
@@ -236,7 +307,248 @@ class ActionTests(unittest.TestCase):
             pid_index = captured["cmd"].index("--pid")
             self.assertEqual(captured["cmd"][pid_index + 1], "4242")
             self.assertEqual(captured["cmd"][captured["cmd"].index("--provider") + 1], "openai")
+            self.assertIn("--json", captured["cmd"])
             self.assertIn("4242", captured["cmd"][captured["cmd"].index("--conversation") + 1])
+
+    def test_execute_agent_adds_recursive_token_counts(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+
+            def fake_run(cmd, **kwargs):
+                return unittest.mock.Mock(
+                    returncode=0,
+                    stdout=json.dumps(
+                        {
+                            "responses": ["done"],
+                            "recursive_input_tokens": 21,
+                            "recursive_output_tokens": 8,
+                        }
+                    ),
+                    stderr="",
+                )
+
+            stats = self.mod.TokenStats()
+            with unittest.mock.patch.object(self.mod.subprocess, "run", fake_run):
+                result = self.mod.execute_agent(
+                    "do task",
+                    root,
+                    self.mod.LlmSettings(provider="openai", model="gpt-5.5"),
+                    NAGENT,
+                    "parent-conv",
+                    "4242",
+                    stats,
+                )
+
+        self.assertIn('tokens_in="21"', result)
+        self.assertIn("done", result)
+        self.assertEqual(stats.recursive_input_tokens, 21)
+        self.assertEqual(stats.recursive_output_tokens, 8)
+
+    def test_token_status_line_format(self):
+        stats = self.mod.TokenStats(
+            turn_count=2,
+            conversation_input_tokens=100,
+            recursive_input_tokens=150,
+            recursive_output_tokens=40,
+        )
+        self.assertEqual(
+            stats.status_line(),
+            "[Turns:2 Conversation-Tokens:100 Tokens-In:150 Tokens-Out:40]",
+        )
+
+    def test_main_prints_final_status_for_user_direct_mode(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+
+            def fake_run_agent_loop(*args, **kwargs):
+                token_stats = kwargs["token_stats"]
+                token_stats.turn_count = 2
+                token_stats.conversation_input_tokens = 100
+                token_stats.recursive_input_tokens = 150
+                token_stats.recursive_output_tokens = 40
+                print("done")
+                return 0, ["done"]
+
+            argv = [
+                "nagent",
+                "--root",
+                str(root),
+                "--conversation",
+                "conv",
+                "hello",
+            ]
+            with unittest.mock.patch.object(self.mod.sys, "argv", argv), \
+                unittest.mock.patch.object(self.mod.sys, "stdout", io.StringIO()) as stdout, \
+                unittest.mock.patch.object(self.mod, "require_credentials"), \
+                unittest.mock.patch.object(self.mod, "run_agent_loop", fake_run_agent_loop):
+                code = self.mod.main()
+
+            self.assertEqual(code, 0)
+            self.assertEqual(
+                stdout.getvalue().strip().splitlines(),
+                [
+                    "done",
+                    "[Turns:2 Conversation-Tokens:100 Tokens-In:150 Tokens-Out:40]",
+                ],
+            )
+
+    def test_main_omits_final_status_when_pid_is_explicit(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+
+            def fake_run_agent_loop(*args, **kwargs):
+                token_stats = kwargs["token_stats"]
+                token_stats.turn_count = 2
+                print("done")
+                return 0, ["done"]
+
+            argv = [
+                "nagent",
+                "--root",
+                str(root),
+                "--conversation",
+                "conv",
+                "--pid",
+                "4242",
+                "hello",
+            ]
+            with unittest.mock.patch.object(self.mod.sys, "argv", argv), \
+                unittest.mock.patch.object(self.mod.sys, "stdout", io.StringIO()) as stdout, \
+                unittest.mock.patch.object(self.mod, "require_credentials"), \
+                unittest.mock.patch.object(self.mod, "run_agent_loop", fake_run_agent_loop):
+                code = self.mod.main()
+
+            self.assertEqual(code, 0)
+            self.assertEqual(stdout.getvalue().strip().splitlines(), ["done"])
+
+    def test_save_and_load_conversation_helpers(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            current = root / "conversations" / "current"
+            saved = root / "conversations" / "saved"
+            current.parent.mkdir(parents=True)
+            current.write_text("current history", encoding="utf-8")
+
+            self.mod.save_conversation(current, saved)
+            self.assertEqual(saved.read_text(encoding="utf-8"), "current history")
+            self.assertEqual(current.read_text(encoding="utf-8"), "current history")
+
+            source = root / "conversations" / "source"
+            source.write_text("loaded history", encoding="utf-8")
+            archived = self.mod.load_conversation(current, source)
+
+            self.assertIsNotNone(archived)
+            self.assertEqual(current.read_text(encoding="utf-8"), "loaded history")
+            self.assertEqual(archived.read_text(encoding="utf-8"), "current history")
+
+    def test_summarize_conversation_sends_conversation_prompt_to_llm(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            conversation = root / "conversations" / "conv"
+            conversation.parent.mkdir(parents=True)
+            conversation.write_text("conversation history", encoding="utf-8")
+            captured: dict[str, str] = {}
+
+            def fake_run(cmd, **kwargs):
+                prompt_path = Path(cmd[cmd.index("--file") + 1])
+                captured["prompt"] = prompt_path.read_text(encoding="utf-8")
+                payload = {
+                    "response": "summary ok",
+                    "input_tokens": 30,
+                    "output_tokens": 4,
+                }
+                return unittest.mock.Mock(returncode=0, stdout=json.dumps(payload), stderr="")
+
+            stdout = io.StringIO()
+            with unittest.mock.patch.object(self.mod, "require_credentials"), \
+                unittest.mock.patch.object(self.mod.subprocess, "run", fake_run), \
+                unittest.mock.patch.object(sys, "stdout", stdout):
+                code = self.mod.summarize_conversation(
+                    conversation,
+                    "openai",
+                    "gpt-5.5",
+                    None,
+                )
+
+            self.assertEqual(code, 0)
+            self.assertEqual(stdout.getvalue(), "summary ok\n")
+            self.assertIn("Summarize the following nagent conversation", captured["prompt"])
+            self.assertIn("conversation history", captured["prompt"])
+            self.assertIn("Do not summarize nagent as a tool", captured["prompt"])
+
+    def test_summarize_conversation_prints_status_for_user_direct_mode(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            conversation = root / "conversations" / "conv"
+            conversation.parent.mkdir(parents=True)
+            conversation.write_text("conversation history", encoding="utf-8")
+
+            def fake_run(cmd, **kwargs):
+                payload = {
+                    "response": "summary ok",
+                    "input_tokens": 30,
+                    "output_tokens": 4,
+                }
+                return unittest.mock.Mock(returncode=0, stdout=json.dumps(payload), stderr="")
+
+            stdout = io.StringIO()
+            with unittest.mock.patch.object(self.mod, "require_credentials"), \
+                unittest.mock.patch.object(self.mod.subprocess, "run", fake_run), \
+                unittest.mock.patch.object(sys, "stdout", stdout):
+                code = self.mod.summarize_conversation(
+                    conversation,
+                    "openai",
+                    "gpt-5.5",
+                    None,
+                    print_status=True,
+                )
+
+            self.assertEqual(code, 0)
+            self.assertEqual(
+                stdout.getvalue().strip().splitlines(),
+                [
+                    "summary ok",
+                    "[Turns:1 Conversation-Tokens:5 Tokens-In:30 Tokens-Out:4]",
+                ],
+            )
+
+    def test_edit_conversation_edits_backup_then_loads_it(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            conversation = root / "conversations" / "conv"
+            conversation.parent.mkdir(parents=True)
+            conversation.write_text("old history", encoding="utf-8")
+            captured: dict[str, list[str]] = {}
+
+            def fake_run(cmd, **kwargs):
+                if "--file-edit" not in cmd:
+                    return unittest.mock.Mock(returncode=1, stdout="", stderr="")
+                captured["cmd"] = cmd
+                backup = Path(cmd[cmd.index("--file-edit") + 1])
+                backup.write_text("edited history", encoding="utf-8")
+                return unittest.mock.Mock(returncode=0, stdout="", stderr="")
+
+            stdout = io.StringIO()
+            with unittest.mock.patch.object(self.mod.subprocess, "run", fake_run):
+                with unittest.mock.patch.object(sys, "stdout", stdout):
+                    code = self.mod.edit_conversation(
+                        conversation,
+                        root,
+                        NAGENT.resolve(),
+                        "user",
+                        "conv",
+                        "4242",
+                        None,
+                        "remove noise",
+                        "openai",
+                        "gpt-5.5",
+                        None,
+                    )
+
+            self.assertEqual(code, 0)
+            self.assertEqual(conversation.read_text(encoding="utf-8"), "edited history")
+            self.assertIn("--clear", captured["cmd"])
+            self.assertEqual(captured["cmd"][-1], "remove noise")
 
 
 class InitialTextTests(unittest.TestCase):
@@ -344,6 +656,13 @@ class WaitSpinnerTests(unittest.TestCase):
         mod.set_spinner_enabled(False)
         with mod.wait_spinner("Testing"):
             pass
+
+    def test_wait_spinner_uses_waiting_message(self):
+        mod = load_nagent_module()
+        with unittest.mock.patch.object(mod, "WaitSpinner") as spinner:
+            mod.wait_spinner("[Turns:2 Conversation-Tokens:100 Tokens-In:150 Tokens-Out:40]")
+
+        spinner.assert_called_once_with("Waiting...", enabled=True)
 
 
 class RefreshInitialContextTests(unittest.TestCase):

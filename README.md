@@ -35,6 +35,8 @@ Memory is a plain conversation file. A user-level nagent conversation uses this 
 ~/.nagent/conversations/latest-{hostname}-{pid}
 ```
 
+By default, `pid` is `{STY}-{WINDOW}` inside GNU screen, otherwise `BASHPID` when available, otherwise the parent shell process id.
+
 Repeated invocations in the same shell append to that file. That means this:
 
 ```bash
@@ -43,6 +45,23 @@ nagent "Which one is the main entry point?"
 ```
 
 is not two unrelated chats. The second command sends the same growing conversation file, so the model can see the first turn and its result.
+
+Use a trailing `-` when you want to type or paste a prompt on stdin, ending it with `Ctrl+D`:
+
+```bash
+nagent "Summarize this log:" -
+```
+
+You can copy and restore conversation files without switching the active conversation name:
+
+```bash
+nagent --save-conversation before-refactor
+nagent --load-conversation before-refactor
+nagent --summarize
+nagent --edit-conversation "remove obsolete tool output and keep the useful decisions"
+```
+
+`--save-conversation` copies the loaded conversation to another conversation name. `--load-conversation` first archives the loaded conversation, then replaces it with the named copy. `--summarize` sends the loaded conversation to the LLM with summary instructions and prints the result without appending it to the conversation. `--edit-conversation` archives the current conversation, runs a scoped file-edit session on that backup using your prompt, and then loads the edited backup.
 
 There is no separate memory service. No database is required. You can open the file and inspect the exact prompt history being sent to the model.
 
@@ -118,6 +137,14 @@ main()
 ```
 
 `call_llm()` shells out to `nagent-llm-text`. `process_tags()` performs reads, writes, shell commands, file patches, sub-agent calls, and final responses.
+
+While the loop waits, the spinner shows `Waiting...`. In user-direct mode (a human-run `nagent` invocation with no explicit `--pid`), nagent prints the final token status after the final response and before exiting:
+
+```text
+[Turns:2 Conversation-Tokens:1234 Tokens-In:1800 Tokens-Out:420]
+```
+
+`Turns` counts LLM calls in the current nagent process. `Conversation-Tokens` is the current loaded conversation input size for the next or most recent model call. `Tokens-In` and `Tokens-Out` include recursive sub-agent totals returned through child `nagent --json` runs.
 
 **Build your own:** implement the loop with one action first. For example: parse `<shell>...</shell>`, run it, append the result, and repeat. Add capabilities only after the basic read/call/parse/act/append cycle is working.
 
@@ -262,9 +289,9 @@ Run a command with `--description` for a short description, or `--help` for full
 
 | Command | Purpose | JSON output |
 |---|---|---|
-| `nagent` | Main conversation loop. | `--json` for status, list, clear, and final response output. |
-| `nagent-llm-text` | Send a text file to the configured LLM. | `--json` |
-| `nagent-llm-upload` | Upload a file with a prompt for vision or document-style inputs. | `--json` |
+| `nagent` | Main conversation loop. | `--json` for status, list, clear, final response output, and recursive token totals. |
+| `nagent-llm-text` | Send a text file to the configured LLM. | `--json`, including input and output token counts. |
+| `nagent-llm-upload` | Upload a file with a prompt for vision or document-style inputs. | `--json`, including input and output token counts. |
 | `nagent-file-split` | Split a large file into segment files and `index.json`. | `--json` |
 | `nagent-file-patch` | Merge edited segment files back into the source file. | `--json` |
 | `nagent-file-edit` | Run nagent against one project file using a dedicated conversation. | `--json` |
@@ -321,6 +348,10 @@ nagent --status --json
 nagent --list-models --json
 nagent --list-file-edits --pid "$BASHPID"
 nagent --clear
+nagent --save-conversation before-refactor
+nagent --load-conversation before-refactor
+nagent --summarize
+nagent --edit-conversation "condense this conversation"
 
 nagent-llm-text --file prompt.txt --json
 nagent-llm-upload --file chart.png --prompt "Describe this" --json
