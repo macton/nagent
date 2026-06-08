@@ -54,6 +54,7 @@ TAG_PATTERNS: list[tuple[TagType, re.Pattern[str]]] = [
 READ_SPLIT_THRESHOLD_BYTES = 64 * 1024
 NAGENT_FILE_SPLIT = Path(__file__).resolve().parent / "nagent-file-split"
 NAGENT_FILE_SUMMARIZE = Path(__file__).resolve().parent / "nagent-file-summarize"
+SAVED_CONVERSATION_SUMMARY_WORD_COUNT = 50
 MAX_FORMAT_RETRIES = 3
 NAGENT_LLM_TEXT = Path(__file__).resolve().parent / "nagent-llm-text"
 INTERRUPTED_MESSAGE = "Interrupted..."
@@ -1334,6 +1335,10 @@ def conversations_dir(root: Path) -> Path:
     return root / "conversations"
 
 
+def saved_conversations_index_path(root: Path, pid: str) -> Path:
+    return conversations_dir(root) / f"index-saved-conversations-{pid}.json"
+
+
 def resolve_conversation(root: Path, conversation_name: str) -> Path:
     return conversations_dir(root) / conversation_name
 
@@ -1371,12 +1376,106 @@ def save_conversation(conversation_file: Path, target: Path) -> Path:
     return target
 
 
+def summarize_saved_conversation(
+    conversation_file: Path,
+    provider: str | None,
+    model: str | None,
+    config_path: Path | None,
+) -> str:
+    command = [
+        str(NAGENT_FILE_SUMMARIZE),
+        "--file",
+        str(conversation_file),
+        "--max-word-count",
+        str(SAVED_CONVERSATION_SUMMARY_WORD_COUNT),
+        "--json",
+    ]
+    if provider:
+        command.extend(["--provider", provider])
+    if model:
+        command.extend(["--model", model])
+    if config_path is not None:
+        command.extend(["--config", str(config_path.expanduser())])
+
+    result = subprocess.run(command, capture_output=True, text=True)
+    if result.returncode != 0:
+        error = result.stderr.strip() or result.stdout.strip() or "nagent-file-summarize failed"
+        raise RuntimeError(error)
+    try:
+        payload = json.loads(result.stdout)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"invalid nagent-file-summarize JSON output: {exc}") from exc
+    summary = payload.get("summary")
+    if not isinstance(summary, str):
+        raise RuntimeError("nagent-file-summarize output did not include a summary")
+    return summary.strip()
+
+
+def load_saved_conversations_index(root: Path, pid: str) -> dict:
+    index_path = saved_conversations_index_path(root, pid)
+    payload: dict = {
+        "pid": pid,
+        "index_path": str(index_path.resolve()),
+        "conversations": [],
+    }
+    if not index_path.is_file():
+        return payload
+    try:
+        loaded = json.loads(index_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return payload
+    if not isinstance(loaded, dict):
+        return payload
+    conversations = loaded.get("conversations", [])
+    if not isinstance(conversations, list):
+        conversations = []
+    payload["conversations"] = [
+        entry for entry in conversations
+        if isinstance(entry, dict)
+    ]
+    return payload
+
+
+def update_saved_conversations_index(
+    root: Path,
+    pid: str,
+    name: str,
+    saved_path: Path,
+    summary: str,
+) -> Path:
+    index_path = saved_conversations_index_path(root, pid)
+    payload = load_saved_conversations_index(root, pid)
+    saved_path_text = str(saved_path.resolve())
+    entry = {
+        "name": name,
+        "path": saved_path_text,
+        "summary": summary,
+    }
+    conversations = [
+        existing for existing in payload["conversations"]
+        if existing.get("path") != saved_path_text and existing.get("name") != name
+    ]
+    conversations.append(entry)
+    payload["pid"] = pid
+    payload["index_path"] = str(index_path.resolve())
+    payload["conversations"] = conversations
+    index_path.parent.mkdir(parents=True, exist_ok=True)
+    index_path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    return index_path
+
+
 def load_conversation(conversation_file: Path, source: Path) -> Path | None:
     if not source.is_file():
         raise FileNotFoundError(f"conversation not found: {source}")
+    source_is_current = False
+    try:
+        source_is_current = source.resolve() == conversation_file.resolve()
+    except OSError:
+        source_is_current = source == conversation_file
     archived = archive_conversation(conversation_file)
+    copy_source = archived if source_is_current and archived is not None else source
     conversation_file.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copy2(source, conversation_file)
+    shutil.copy2(copy_source, conversation_file)
     return archived
 
 
@@ -1433,17 +1532,24 @@ def print_save_conversation_result(
     conversation_file: Path,
     saved_path: Path,
     *,
+    summary: str | None = None,
+    index_path: Path | None = None,
     json_mode: bool = False,
 ) -> None:
     if json_mode:
-        emit_json(
-            {
-                "conversation_path": str(conversation_file.resolve()),
-                "saved_path": str(saved_path.resolve()),
-            }
-        )
+        payload = {
+            "conversation_path": str(conversation_file.resolve()),
+            "saved_path": str(saved_path.resolve()),
+        }
+        if summary is not None:
+            payload["summary"] = summary
+        if index_path is not None:
+            payload["index_path"] = str(index_path.resolve())
+        emit_json(payload)
         return
     print(f"saved:{saved_path}")
+    if index_path is not None:
+        print(f"saved_conversations_index:{index_path}")
     print(f"conversation:{conversation_file}")
 
 
@@ -1653,6 +1759,16 @@ def print_file_edits(root: Path, pid: str, *, json_mode: bool = False) -> None:
         print(f"{entry['file_id']}\t{entry.get('path', '')}\t{entry.get('conversation', '')}")
 
 
+def print_saved_conversations(root: Path, pid: str, *, json_mode: bool = False) -> None:
+    payload = load_saved_conversations_index(root, pid)
+    if json_mode:
+        emit_json(payload)
+        return
+    print(f"saved_conversations_index:{payload['index_path']}")
+    for entry in payload["conversations"]:
+        print(f"{entry.get('name', '')}\t{entry.get('path', '')}\t{entry.get('summary', '')}")
+
+
 def resolve_initial_prompt(prompt_arg: str | list[str] | None) -> str | None:
     if isinstance(prompt_arg, list):
         prompt_parts = prompt_arg
@@ -1743,6 +1859,11 @@ def main() -> None:
         help="List per-file edit conversations for the current shell pid, then exit.",
     )
     parser.add_argument(
+        "--list-conversations",
+        action="store_true",
+        help="List saved conversations for the current shell pid, then exit.",
+    )
+    parser.add_argument(
         "--json",
         action="store_true",
         help="Print structured JSON output instead of plain text.",
@@ -1761,6 +1882,14 @@ def main() -> None:
         "--load-conversation",
         metavar="NAME",
         help="Archive the current conversation, then copy NAME into the current conversation path.",
+    )
+    parser.add_argument(
+        "--branch-conversation",
+        metavar="CONVERSATION_NAME",
+        help=(
+            "Archive the current conversation, then copy CONVERSATION_NAME from "
+            "the conversations directory into the current conversation path."
+        ),
     )
     parser.add_argument(
         "--summarize",
@@ -1834,6 +1963,10 @@ def main() -> None:
 
     if args.list_file_edits:
         print_file_edits(root, pid, json_mode=args.json)
+        return 0
+
+    if args.list_conversations:
+        print_saved_conversations(root, pid, json_mode=args.json)
         return 0
 
     if args.list_models:
@@ -1921,9 +2054,19 @@ def main() -> None:
             initial_prompt is None
             and not args.read
             and args.load_conversation is None
+            and args.branch_conversation is None
             and args.save_conversation is None
         ):
             return 0
+
+    if args.branch_conversation is not None:
+        source = resolve_conversation(root, args.branch_conversation)
+        try:
+            archived = load_conversation(conversation_file, source)
+        except FileNotFoundError as exc:
+            print(f"Error: {exc}", file=sys.stderr)
+            return 1
+        print_load_conversation_result(conversation_file, source, archived, json_mode=args.json)
 
     if args.load_conversation is not None:
         source = resolve_conversation_reference(root, args.load_conversation)
@@ -1938,23 +2081,41 @@ def main() -> None:
         target = resolve_conversation_reference(root, args.save_conversation)
         try:
             saved = save_conversation(conversation_file, target)
-        except FileNotFoundError as exc:
+            summary = summarize_saved_conversation(saved, args.provider, args.model, args.config)
+            index_path = update_saved_conversations_index(
+                root,
+                pid,
+                args.save_conversation,
+                saved,
+                summary,
+            )
+        except (FileNotFoundError, RuntimeError) as exc:
             print(f"Error: {exc}", file=sys.stderr)
             return 1
-        print_save_conversation_result(conversation_file, saved, json_mode=args.json)
+        print_save_conversation_result(
+            conversation_file,
+            saved,
+            summary=summary,
+            index_path=index_path,
+            json_mode=args.json,
+        )
 
     if (
         initial_prompt is None
         and not args.read
-        and (args.load_conversation is not None or args.save_conversation is not None)
+        and (
+            args.branch_conversation is not None
+            or args.load_conversation is not None
+            or args.save_conversation is not None
+        )
     ):
         return 0
 
     if initial_prompt is None and not args.read:
         parser.error(
             "prompt is required unless --status, --list-models, --list-file-edits, "
-            "--clear, --save-conversation, --load-conversation, --summarize, "
-            "--read, or stdin prompt text is given"
+            "--list-conversations, --clear, --save-conversation, --load-conversation, "
+            "--branch-conversation, --summarize, --read, or stdin prompt text is given"
         )
 
     try:

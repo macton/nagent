@@ -105,7 +105,9 @@ def main() -> None:
     )
     parser.add_argument(
         "--limit-word-count",
+        "--max-word-count",
         type=positive_int,
+        dest="limit_word_count",
         metavar="COUNT",
         help="Ask the LLM to fit the summary into COUNT words or less, then validate and retry once.",
     )

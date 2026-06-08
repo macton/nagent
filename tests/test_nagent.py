@@ -154,6 +154,32 @@ class NagentFileSummarizeTests(unittest.TestCase):
         self.assertEqual(captured["limit_word_count"], 8)
         self.assertEqual(stdout.getvalue(), "short summary\n")
 
+    def test_main_accepts_max_word_count_alias(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            source = Path(tmp) / "source.txt"
+            source.write_text("source content", encoding="utf-8")
+            captured = {}
+
+            def fake_summarize(path, provider, model, limit_word_count=None):
+                captured["limit_word_count"] = limit_word_count
+                return "short summary"
+
+            argv = [
+                "nagent-file-summarize",
+                "--file",
+                str(source),
+                "--max-word-count",
+                "8",
+            ]
+            with unittest.mock.patch.object(self.mod.sys, "argv", argv), \
+                unittest.mock.patch.object(self.mod, "resolve_from_args", return_value=("openai", "gpt-5.5")), \
+                unittest.mock.patch.object(self.mod, "summarize_file_path", fake_summarize), \
+                unittest.mock.patch.object(self.mod.sys, "stdout", io.StringIO()) as stdout:
+                self.mod.main()
+
+        self.assertEqual(captured["limit_word_count"], 8)
+        self.assertEqual(stdout.getvalue(), "short summary\n")
+
 
 class NagentLlmUploadTests(unittest.TestCase):
     @classmethod
@@ -758,6 +784,126 @@ class ActionTests(unittest.TestCase):
             self.assertEqual(current.read_text(encoding="utf-8"), "loaded history")
             self.assertEqual(archived.read_text(encoding="utf-8"), "current history")
 
+    def test_summarize_saved_conversation_uses_file_summarize_max_word_count(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            conversation = Path(tmp) / "conversation"
+            conversation.write_text("conversation history", encoding="utf-8")
+            captured: dict[str, list[str]] = {}
+
+            def fake_run(cmd, **kwargs):
+                captured["cmd"] = cmd
+                return unittest.mock.Mock(
+                    returncode=0,
+                    stdout=json.dumps({"summary": "short summary"}),
+                    stderr="",
+                )
+
+            with unittest.mock.patch.object(self.mod.subprocess, "run", fake_run):
+                summary = self.mod.summarize_saved_conversation(
+                    conversation,
+                    "openai",
+                    "gpt-5.5",
+                    None,
+                )
+
+        self.assertEqual(summary, "short summary")
+        self.assertIn("--max-word-count", captured["cmd"])
+        self.assertEqual(
+            captured["cmd"][captured["cmd"].index("--max-word-count") + 1],
+            "50",
+        )
+        self.assertIn("--json", captured["cmd"])
+
+    def test_saved_conversations_index_records_and_replaces_entries(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            saved = root / "conversations" / "saved"
+            saved.parent.mkdir(parents=True)
+            saved.write_text("conversation history", encoding="utf-8")
+
+            index = self.mod.update_saved_conversations_index(
+                root,
+                "4242",
+                "saved",
+                saved,
+                "first summary",
+            )
+            self.mod.update_saved_conversations_index(
+                root,
+                "4242",
+                "saved",
+                saved,
+                "updated summary",
+            )
+            payload = json.loads(index.read_text(encoding="utf-8"))
+
+        self.assertEqual(payload["pid"], "4242")
+        self.assertEqual(len(payload["conversations"]), 1)
+        self.assertEqual(payload["conversations"][0]["name"], "saved")
+        self.assertEqual(payload["conversations"][0]["path"], str(saved.resolve()))
+        self.assertEqual(payload["conversations"][0]["summary"], "updated summary")
+
+    def test_main_save_conversation_summarizes_and_indexes_saved_copy(self):
+        mod = load_nagent_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            current = root / "conversations" / "current"
+            current.parent.mkdir(parents=True)
+            current.write_text("current history", encoding="utf-8")
+            captured: dict[str, Path] = {}
+
+            def fake_summarize(path, provider, model, config_path):
+                captured["summarized_path"] = path
+                return "short summary"
+
+            argv = [
+                "nagent",
+                "--root",
+                str(root),
+                "--conversation",
+                "current",
+                "--pid",
+                "4242",
+                "--save-conversation",
+                "saved",
+            ]
+            with unittest.mock.patch.object(mod.sys, "argv", argv), \
+                unittest.mock.patch.object(mod.sys, "stdout", io.StringIO()) as stdout, \
+                unittest.mock.patch.object(mod, "summarize_saved_conversation", fake_summarize):
+                code = mod.main()
+
+            saved = root / "conversations" / "saved"
+            index = root / "conversations" / "index-saved-conversations-4242.json"
+            payload = json.loads(index.read_text(encoding="utf-8"))
+
+            self.assertEqual(code, 0)
+            self.assertEqual(saved.read_text(encoding="utf-8"), "current history")
+            self.assertEqual(captured["summarized_path"], saved)
+            self.assertEqual(payload["conversations"][0]["path"], str(saved.resolve()))
+            self.assertEqual(payload["conversations"][0]["summary"], "short summary")
+            self.assertEqual(
+                stdout.getvalue().strip().splitlines(),
+                [
+                    f"saved:{saved}",
+                    f"saved_conversations_index:{index}",
+                    f"conversation:{current}",
+                ],
+            )
+
+    def test_load_conversation_from_current_path_archives_and_restores(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            current = root / "conversations" / "current"
+            current.parent.mkdir(parents=True)
+            current.write_text("current history", encoding="utf-8")
+
+            archived = self.mod.load_conversation(current, current)
+
+            self.assertIsNotNone(archived)
+            self.assertEqual(current.read_text(encoding="utf-8"), "current history")
+            self.assertEqual(archived.read_text(encoding="utf-8"), "current history")
+            self.assertNotEqual(archived, current)
+
     def test_summarize_conversation_sends_conversation_prompt_to_llm(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -1094,6 +1240,52 @@ class CliTests(unittest.TestCase):
             self.assertEqual(len(payload["files"]), 1)
             self.assertEqual(payload["files"][0]["path"], str(source.resolve()))
 
+    def test_list_conversations_cli_reads_saved_conversation_index(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            saved = root / "conversations" / "saved"
+            saved.parent.mkdir(parents=True)
+            saved.write_text("conversation history", encoding="utf-8")
+            index = root / "conversations" / "index-saved-conversations-1234.json"
+            index.write_text(
+                json.dumps(
+                    {
+                        "pid": "1234",
+                        "index_path": str(index.resolve()),
+                        "conversations": [
+                            {
+                                "name": "saved",
+                                "path": str(saved.resolve()),
+                                "summary": "short summary",
+                            }
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            result = subprocess.run(
+                [
+                    str(NAGENT),
+                    "--root",
+                    str(root),
+                    "--pid",
+                    "1234",
+                    "--list-conversations",
+                    "--json",
+                ],
+                capture_output=True,
+                text=True,
+                env={**self.clean_env(), "BASHPID": "1234"},
+            )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        payload = json.loads(result.stdout)
+        self.assertEqual(payload["pid"], "1234")
+        self.assertEqual(payload["conversations"][0]["name"], "saved")
+        self.assertEqual(payload["conversations"][0]["path"], str(saved.resolve()))
+        self.assertEqual(payload["conversations"][0]["summary"], "short summary")
+
     def test_status_prints_path_size_provider_and_model(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -1223,6 +1415,111 @@ class CliTests(unittest.TestCase):
             )
             self.assertTrue(conversation_file.is_file())
             self.assertIn("<initial_context>", conversation_file.read_text(encoding="utf-8"))
+
+    def test_branch_conversation_copies_named_conversation_and_exits_without_prompt(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            current = "current"
+            source = "source"
+            current_file = root / "conversations" / current
+            source_file = root / "conversations" / source
+            current_file.parent.mkdir(parents=True)
+            current_file.write_text("current history", encoding="utf-8")
+            source_file.write_text("source history", encoding="utf-8")
+
+            result = subprocess.run(
+                [
+                    str(NAGENT),
+                    "--root",
+                    str(root),
+                    "--conversation",
+                    current,
+                    "--branch-conversation",
+                    source,
+                ],
+                capture_output=True,
+                text=True,
+                env=self.clean_env(),
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(current_file.read_text(encoding="utf-8"), "source history")
+            lines = result.stdout.strip().splitlines()
+            self.assertTrue(lines[0].startswith("archived:"))
+            self.assertEqual(lines[1], f"loaded:{source_file}")
+            self.assertEqual(lines[2], f"conversation:{current_file}")
+            archived_path = Path(lines[0].split(":", 1)[1])
+            self.assertEqual(archived_path.read_text(encoding="utf-8"), "current history")
+
+    def test_branch_conversation_missing_name_errors_without_archiving_current(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            current = "current"
+            current_file = root / "conversations" / current
+            current_file.parent.mkdir(parents=True)
+            current_file.write_text("current history", encoding="utf-8")
+
+            result = subprocess.run(
+                [
+                    str(NAGENT),
+                    "--root",
+                    str(root),
+                    "--conversation",
+                    current,
+                    "--branch-conversation",
+                    "missing",
+                ],
+                capture_output=True,
+                text=True,
+                env=self.clean_env(),
+            )
+
+            self.assertEqual(result.returncode, 1)
+            self.assertIn("conversation not found", result.stderr)
+            self.assertEqual(current_file.read_text(encoding="utf-8"), "current history")
+            self.assertEqual(list(current_file.parent.glob("current-*")), [])
+
+    def test_branch_conversation_with_prompt_continues_from_copied_conversation(self):
+        mod = load_nagent_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            current = "current"
+            source = "source"
+            current_file = root / "conversations" / current
+            source_file = root / "conversations" / source
+            current_file.parent.mkdir(parents=True)
+            current_file.write_text("current history", encoding="utf-8")
+            source_file.write_text("source history", encoding="utf-8")
+
+            captured: dict[str, object] = {}
+
+            def fake_run_agent_loop(conversation_file, *args, **kwargs):
+                captured["conversation_text"] = conversation_file.read_text(encoding="utf-8")
+                captured["initial_prompt"] = args[2]
+                return 0, []
+
+            argv = [
+                "nagent",
+                "--root",
+                str(root),
+                "--conversation",
+                current,
+                "--pid",
+                "4242",
+                "--branch-conversation",
+                source,
+                "hello",
+            ]
+            with unittest.mock.patch.object(mod.sys, "argv", argv), \
+                unittest.mock.patch.object(mod.sys, "stdout", io.StringIO()), \
+                unittest.mock.patch.object(mod, "require_credentials"), \
+                unittest.mock.patch.object(mod, "run_agent_loop", fake_run_agent_loop):
+                code = mod.main()
+
+            self.assertEqual(code, 0)
+            self.assertIn("source history", captured["conversation_text"])
+            self.assertNotIn("current history", captured["conversation_text"])
+            self.assertEqual(captured["initial_prompt"], "hello")
 
     def test_legacy_root_conversation_moves_to_conversations_dir(self):
         with tempfile.TemporaryDirectory() as tmp:
