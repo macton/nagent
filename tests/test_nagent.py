@@ -60,6 +60,101 @@ def load_nagent_llm_upload_module():
     return module
 
 
+def load_nagent_file_summarize_module():
+    from importlib.machinery import SourceFileLoader
+
+    loader = SourceFileLoader("nagent_file_summarize_mod", str(NAGENT_FILE_SUMMARIZE))
+    spec = importlib.util.spec_from_loader("nagent_file_summarize_mod", loader)
+    module = importlib.util.module_from_spec(spec)
+    loader.exec_module(module)
+    return module
+
+
+def load_nagent_file_summarize_lib_module():
+    from importlib.machinery import SourceFileLoader
+
+    helpers = BIN / "helpers"
+    if str(helpers) not in sys.path:
+        sys.path.insert(0, str(helpers))
+    loader = SourceFileLoader(
+        "nagent_file_summarize_lib_mod",
+        str(helpers / "nagent_file_summarize_lib.py"),
+    )
+    spec = importlib.util.spec_from_loader("nagent_file_summarize_lib_mod", loader)
+    module = importlib.util.module_from_spec(spec)
+    loader.exec_module(module)
+    return module
+
+
+class NagentFileSummarizeTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.mod = load_nagent_file_summarize_module()
+        cls.lib = load_nagent_file_summarize_lib_module()
+
+    def test_limit_word_count_prompt_retries_when_too_long(self):
+        prompts = []
+        summaries = iter(["one two three four", "one two"])
+
+        def fake_generate_text(prompt, provider, model):
+            prompts.append(prompt)
+            return next(summaries)
+
+        with unittest.mock.patch.object(self.lib, "generate_text", fake_generate_text):
+            summary = self.lib.summarize_content(
+                "source content",
+                "source.txt",
+                "openai",
+                "gpt-5.5",
+                limit_word_count=3,
+            )
+
+        self.assertEqual(summary, "one two")
+        self.assertEqual(len(prompts), 2)
+        self.assertIn("Fit the summary into 3 words or less.", prompts[0])
+        self.assertIn("previous summary was 4 words", prompts[1])
+
+    def test_limit_word_count_raises_after_retry_exceeds_limit(self):
+        def fake_generate_text(prompt, provider, model):
+            return "one two three four"
+
+        with unittest.mock.patch.object(self.lib, "generate_text", fake_generate_text):
+            with self.assertRaisesRegex(RuntimeError, "exceeded --limit-word-count 3"):
+                self.lib.summarize_content(
+                    "source content",
+                    "source.txt",
+                    "openai",
+                    "gpt-5.5",
+                    limit_word_count=3,
+                )
+
+    def test_main_passes_limit_word_count_to_inline_summarize(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            source = Path(tmp) / "source.txt"
+            source.write_text("source content", encoding="utf-8")
+            captured = {}
+
+            def fake_summarize(path, provider, model, limit_word_count=None):
+                captured["limit_word_count"] = limit_word_count
+                return "short summary"
+
+            argv = [
+                "nagent-file-summarize",
+                "--file",
+                str(source),
+                "--limit-word-count",
+                "8",
+            ]
+            with unittest.mock.patch.object(self.mod.sys, "argv", argv), \
+                unittest.mock.patch.object(self.mod, "resolve_from_args", return_value=("openai", "gpt-5.5")), \
+                unittest.mock.patch.object(self.mod, "summarize_file_path", fake_summarize), \
+                unittest.mock.patch.object(self.mod.sys, "stdout", io.StringIO()) as stdout:
+                self.mod.main()
+
+        self.assertEqual(captured["limit_word_count"], 8)
+        self.assertEqual(stdout.getvalue(), "short summary\n")
+
+
 class NagentLlmUploadTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -114,19 +209,21 @@ class ParseResponseTests(unittest.TestCase):
             '<nagent-read path="/tmp/foo" />\n'
             '<nagent-file-read path="/tmp/big.py" />\n'
             '<nagent-file-patch index="/tmp/split/index.json" />\n'
-            "<nagent-next>continue</nagent-next>"
+            "<nagent-next>continue</nagent-next>\n"
+            "<nagent-conversation>delegate</nagent-conversation>"
         )
         tags, err = self.mod.parse_response(text)
         self.assertIsNone(err)
         self.assertEqual(
             [t.kind for t in tags],
-            ["response", "read", "file_read", "file_patch", "next"],
+            ["response", "read", "file_read", "file_patch", "next", "conversation"],
         )
         self.assertEqual(tags[0].content, "Hello")
         self.assertEqual(tags[1].path, "/tmp/foo")
         self.assertEqual(tags[2].path, "/tmp/big.py")
         self.assertEqual(tags[3].path, "/tmp/split/index.json")
         self.assertEqual(tags[4].content, "continue")
+        self.assertEqual(tags[5].content, "delegate")
 
     def test_invalid_leading_text(self):
         tags, err = self.mod.parse_response("oops <nagent-response>Hi</nagent-response>")
@@ -287,6 +384,38 @@ class ActionTests(unittest.TestCase):
         self.assertIn("LLM provider error on attempt 3", contents)
         self.assertIn("persistent bridge failure", contents)
 
+    def test_run_agent_loop_appends_initial_reads_before_prompt(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            conversation = root / "conversation"
+            conversation.write_text("initial", encoding="utf-8")
+            first = root / "first.txt"
+            second = root / "second.txt"
+            first.write_text("first content", encoding="utf-8")
+            second.write_text("second content", encoding="utf-8")
+
+            with unittest.mock.patch.object(
+                self.mod,
+                "call_llm",
+                return_value=("<nagent-response>ok</nagent-response>", None),
+            ):
+                code, responses = self.mod.run_agent_loop(
+                    conversation,
+                    root,
+                    self.mod.LlmSettings(provider="openai", model="gpt-5.5"),
+                    "prompt content",
+                    "4242",
+                    json_mode=True,
+                    initial_read_paths=[str(first), str(second)],
+                )
+            contents = conversation.read_text(encoding="utf-8")
+
+        self.assertEqual(code, 0)
+        self.assertEqual(responses, ["ok"])
+        self.assertLess(contents.index("first content"), contents.index("second content"))
+        self.assertLess(contents.index("second content"), contents.index("<user-prompt>"))
+        self.assertIn("prompt content", contents)
+
     def test_default_pid_prefers_screen_window(self):
         env = os.environ.copy()
         env.update({"STY": "screen-name", "WINDOW": "7", "BASHPID": "9999"})
@@ -396,6 +525,18 @@ class ActionTests(unittest.TestCase):
         with unittest.mock.patch.object(self.mod.sys, "stdin", stdin):
             self.assertIsNone(self.mod.resolve_initial_prompt(None))
             stdin.read.assert_not_called()
+
+    def test_execute_read_accepts_relative_paths_from_cwd(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            previous = Path.cwd()
+            try:
+                os.chdir(tmp)
+                Path("relative.txt").write_text("relative content", encoding="utf-8")
+                result = self.mod.execute_read("relative.txt")
+            finally:
+                os.chdir(previous)
+
+        self.assertIn("relative content", result)
 
     def test_execute_agent_passes_pid(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -536,6 +677,38 @@ class ActionTests(unittest.TestCase):
 
             self.assertEqual(code, 0)
             self.assertEqual(stdout.getvalue().strip().splitlines(), ["done"])
+
+    def test_main_allows_read_without_prompt(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "source.txt"
+            source.write_text("source content", encoding="utf-8")
+            captured: dict[str, object] = {}
+
+            def fake_run_agent_loop(*args, **kwargs):
+                captured["initial_prompt"] = args[3]
+                captured["initial_read_paths"] = kwargs["initial_read_paths"]
+                return 0, []
+
+            argv = [
+                "nagent",
+                "--root",
+                str(root),
+                "--conversation",
+                "conv",
+                "--pid",
+                "4242",
+                "--read",
+                str(source),
+            ]
+            with unittest.mock.patch.object(self.mod.sys, "argv", argv), \
+                unittest.mock.patch.object(self.mod, "require_credentials"), \
+                unittest.mock.patch.object(self.mod, "run_agent_loop", fake_run_agent_loop):
+                code = self.mod.main()
+
+        self.assertEqual(code, 0)
+        self.assertIsNone(captured["initial_prompt"])
+        self.assertEqual(captured["initial_read_paths"], [str(source)])
 
     def test_main_records_keyboard_interrupt(self):
         mod = load_nagent_module()
@@ -705,14 +878,17 @@ class InitialTextTests(unittest.TestCase):
             Path("/tmp/nagent-root"),
             NAGENT.resolve(),
             "delegated",
-            "sub-agent-1",
+            "sub-conversation-1",
             "parent-conv",
         )
         self.assertIn("invocation: delegated", text)
-        self.assertIn("conversation: sub-agent-1", text)
+        self.assertIn("conversation: sub-conversation-1", text)
         self.assertIn("parent conversation: parent-conv", text)
         self.assertIn("Delegated invocation:", text)
+        self.assertIn("parent nagent conversation spawned you", text)
         self.assertIn("Still decompose and delegate", text)
+        self.assertIn("<nagent-conversation>{prompt}</nagent-conversation>", text)
+        self.assertNotIn("<nagent-agent>", text)
         self.assertNotIn("User invocation:", text)
 
     def test_git_repo_context_outside_repo(self):
@@ -731,7 +907,7 @@ class InitialTextTests(unittest.TestCase):
                 ),
             ]
             context = self.mod.git_repo_context(Path("/home/macton/nagent"))
-        self.assertIn("git toplevel: /home/macton/nagent", context)
+        self.assertIn("- git toplevel/project-root: /home/macton/nagent", context)
         self.assertIn("git remote -v:", context)
         self.assertIn("origin\tgit@github.com:macton/nagent.git (fetch)", context)
 
@@ -754,7 +930,8 @@ class InitialTextTests(unittest.TestCase):
             "user",
             "conv",
         )
-        self.assertIn("git toplevel:", text)
+        self.assertIn("project-root:", text)
+        self.assertIn("git toplevel/project-root:", text)
         self.assertIn("git remote -v:", text)
         self.assertIn(str(repo_root), text)
 
@@ -1117,7 +1294,8 @@ class CliTests(unittest.TestCase):
             self.assertIn("nagent process:", contents)
             self.assertIn("cwd:", contents)
             self.assertIn("host (uname -a):", contents)
-            self.assertIn("Context management (every nagent instance", contents)
+            self.assertIn("Context management (every nagent conversation", contents)
+            self.assertIn("<nagent-conversation>{prompt}</nagent-conversation>", contents)
             self.assertIn("User invocation:", contents)
             self.assertIn("<user-prompt>", contents)
             self.assertIn("hello", contents)

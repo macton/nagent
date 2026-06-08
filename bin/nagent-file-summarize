@@ -13,6 +13,7 @@ from nagent_cli import emit_json, exit_on_description
 from nagent_file_summarize_lib import (
     SUMMARIZE_THRESHOLD_BYTES,
     combined_summary_from_index,
+    summarize_content,
     summarize_file_path,
 )
 
@@ -31,6 +32,7 @@ def summarize_via_split(
     provider: str,
     model: str,
     config_path: Path | None,
+    limit_word_count: int | None,
 ) -> dict:
     command = [
         str(NAGENT_FILE_SPLIT),
@@ -54,17 +56,36 @@ def summarize_via_split(
         raise RuntimeError(error)
 
     payload = json.loads(result.stdout)
+    summary = payload.get("summary") or combined_summary_from_index(payload)
+    if limit_word_count is not None:
+        summary = summarize_content(
+            summary,
+            f"split summaries for {source.resolve()}",
+            provider,
+            model,
+            limit_word_count,
+        )
     return {
         "mode": "split",
         "file": str(source.resolve()),
         "size_bytes": source.stat().st_size,
         "index_path": payload.get("index_path"),
-        "summary": payload.get("summary") or combined_summary_from_index(payload),
+        "summary": summary,
         "segment_count": payload.get("segment_count"),
         "segments": payload.get("segments", []),
         "provider": provider,
         "model": model,
     }
+
+
+def positive_int(value: str) -> int:
+    try:
+        count = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("must be an integer") from exc
+    if count < 1:
+        raise argparse.ArgumentTypeError("must be greater than 0")
+    return count
 
 
 def main() -> None:
@@ -81,6 +102,12 @@ def main() -> None:
         "--json",
         action="store_true",
         help="Print structured JSON output instead of plain text.",
+    )
+    parser.add_argument(
+        "--limit-word-count",
+        type=positive_int,
+        metavar="COUNT",
+        help="Ask the LLM to fit the summary into COUNT words or less, then validate and retry once.",
     )
     add_llm_arguments(parser)
     args = parser.parse_args()
@@ -101,9 +128,10 @@ def main() -> None:
                 provider,
                 model,
                 args.config.expanduser() if args.config else None,
+                args.limit_word_count,
             )
         else:
-            summary = summarize_file_path(source, provider, model)
+            summary = summarize_file_path(source, provider, model, args.limit_word_count)
             payload = {
                 "mode": "inline",
                 "file": str(source.resolve()),

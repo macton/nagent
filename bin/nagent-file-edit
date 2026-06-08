@@ -16,9 +16,10 @@ from nagent_file_edit_lib import file_index_path, resolve_file_edit_conversation
 
 NAGENT_FILE_EDIT_DESCRIPTION = """\
 Run nagent against a per-file conversation for editing one source file.
-Use when a parent nagent (or you) need to edit a project file without bloating
-the main conversation. Each file gets a stable file id and conversation under
-conversations/file-index-{pid}.json for continuity across edits."""
+Use when a parent nagent conversation (or you) needs to edit a project file
+without bloating the main conversation. Each file gets a stable file id and
+conversation under conversations/file-index-{pid}.json for continuity across
+edits."""
 
 
 def default_pid() -> str:

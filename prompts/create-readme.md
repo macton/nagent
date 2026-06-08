@@ -33,7 +33,7 @@ LLMs are temporary.
 
 Processes are temporary.
 
-Sub-agents are temporary.
+Sub-conversations are temporary.
 
 Context windows are temporary.
 
@@ -51,7 +51,7 @@ nagent keeps durable state in editable artifacts:
 - split indexes
 - patch artifacts
 
-The agent loop exists to transform those artifacts.
+The conversation loop exists to transform those artifacts.
 
 A text file, an LLM, structured tags, and a loop are the implementation of this
 idea, not the idea itself.
@@ -63,7 +63,19 @@ idea, not the idea itself.
 Frame nagent using data-oriented principles.
 
 Do not describe the system primarily as interacting objects, personalities, or
-autonomous agents.
+autonomous conversations.
+
+Terminology rule:
+
+- Prefer **conversation** for a running nagent loop and its durable state.
+- Prefer **sub-conversation** for delegated child work.
+- Do not loosely call nagent conversations "agents" or delegated work
+  "sub-agents."
+- Keep **nagent** unchanged; it is the system name.
+- The thesis line and industry comparisons may still use the word "agent" when
+  they are explaining the confusing term rather than naming the architecture.
+- The delegation protocol tag is `<nagent-conversation>`, not
+  `<nagent-agent>`.
 
 Describe it as a series of explicit data transformations:
 
@@ -108,7 +120,7 @@ Show that:
 - historical coupling is data
 - split indexes are data
 - patch artifacts are data
-- sub-agents are temporary workers operating on data
+- sub-conversations are temporary workers operating on data
 
 ---
 
@@ -119,7 +131,7 @@ The README should make these ideas clear:
 - **nagent** means **not-an-agent**
 - the project intentionally uses plain files, Python, subprocesses, and
   structured text
-- "agent behavior" is mostly:
+- "conversation-loop behavior" is mostly:
   - append to conversation
   - call LLM
   - parse reply
@@ -167,7 +179,8 @@ Characteristics:
   durable files.
 - Do not hedge endlessly. If something is a convention and not a sandbox, say
   so.
-- Concrete examples over abstract agent vocabulary.
+- Concrete examples over abstract agent vocabulary when discussing industry
+  language; otherwise use conversation/sub-conversation terminology.
 - **Build your own:** notes should sound like advice from someone who has shipped
   systems, not like documentation boilerplate.
 
@@ -188,7 +201,7 @@ Requirements:
   helper CLIs such as `nagent-file-edit`, `nagent-file-split`,
   `nagent-file-summarize`, `nagent-llm-text`, or `nagent-llm-upload`.
 - Choose tasks that imply multiple turns: reading files, running shell commands,
-  delegating sub-tasks, iterating until done, or pausing to explain a plan before
+  delegating to sub-conversations, iterating until done, or pausing to explain a plan before
   editing.
 - Frame expectations clearly: one terminal prompt can trigger a long internal
   loop while the conversation file accumulates the work.
@@ -206,7 +219,7 @@ Write for programmers who:
 
 - know basic Python
 - know command-line tools
-- are curious how agent loops work
+- are curious how conversation loops work
 - appreciate explicit state
 - like inspectable systems
 - may want to build a small tool without a framework
@@ -272,7 +285,7 @@ Exploration creates noise.
 
 Therefore:
 
-Use disposable sub-agents.
+Use disposable sub-conversations.
 
 ---
 
@@ -312,7 +325,7 @@ Before finishing the README, verify that it explicitly explains all of these:
 - [ ] artifact neighborhoods
 - [ ] large-file split/index/patch
 - [ ] disposable workers
-- [ ] sub-agent isolation
+- [ ] sub-conversation isolation
 - [ ] controlled writes
 - [ ] visible protocols
 - [ ] explicit transformation pipelines
@@ -403,7 +416,7 @@ Because conversations are ordinary files they can be:
 
 Use this idea:
 
-**The agent does not own its memory. The user does.**
+**The conversation does not own its memory. The user does.**
 
 Explain that conversation files are mutable data structures, not immutable logs.
 
@@ -413,7 +426,9 @@ Explain structured tags.
 
 Show examples of action tags and result tags.
 
-Explain that runtime-generated initial context is part of the protocol.
+Explain that runtime-generated initial context is part of the protocol. The
+available tag list and usage rules live inside `<initial_context>`, so context
+refreshes carry the current protocol forward.
 
 Mention the parser contract and `parse_response()`.
 
@@ -426,7 +441,7 @@ Include a table of available tags:
 - `<nagent-write path="...">...</nagent-write>`
 - `<nagent-shell>...</nagent-shell>`
 - `<nagent-next>...</nagent-next>`
-- `<nagent-agent>...</nagent-agent>`
+- `<nagent-conversation>...</nagent-conversation>`
 
 Explain result wrappers appended by handlers.
 
@@ -467,7 +482,7 @@ Explain token/status accounting at a high level.
 
 Treat this as a memory model, not merely a helper tool.
 
-Explain that most coding agents remember sessions.
+Explain that most coding tools remember sessions.
 
 nagent remembers artifacts.
 
@@ -563,9 +578,9 @@ Include an example table:
 Prefer "historical co-edit rate" or "changed with this file" over ambiguous
 phrases such as "likelihood of same-commit edit."
 
-## 9. Disposable sub-agents
+## 9. Disposable sub-conversations
 
-Frame sub-agents as temporary workers.
+Frame sub-conversations as temporary workers.
 
 Their lifetime is not important.
 
@@ -578,7 +593,8 @@ Explain that:
 - the parent receives only the useful result
 - delegation is primarily context management, not just parallelism
 
-Show a `<nagent-agent>` example.
+Show a `<nagent-conversation>` example and explain that the concept is a
+sub-conversation.
 
 ## 10. Controlled writes
 
@@ -704,7 +720,7 @@ Include:
 - loop
 - retry behavior
 - token accounting
-- sub-agents
+- sub-conversations
 - write controls
 - large-file support
 - per-file editing
@@ -785,7 +801,7 @@ Include tables for:
 - hidden state vs explicit artifacts
 - session memory vs artifact memory
 - retrieval vs preserved work
-- long-lived agents vs disposable workers
+- long-lived agent abstractions vs disposable workers
 - object graphs vs data artifacts
 - framework-style systems vs nagent
 
@@ -850,6 +866,6 @@ Before finishing the README, verify:
 - [ ] The README explains per-file conversations as artifact-local memory.
 - [ ] The README explains repository history as first-class data.
 - [ ] The README explains historical coupling as inspection guidance, not an edit mandate.
-- [ ] The README explains sub-agents as disposable workers.
+- [ ] The README explains sub-conversations as disposable workers.
 - [ ] The README explains split/index/patch as explicit artifacts.
 - [ ] The reader could build a minimal version after reading.

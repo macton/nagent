@@ -7,23 +7,67 @@ from pathlib import Path
 from nagent_llm import generate_text
 
 SUMMARIZE_THRESHOLD_BYTES = 64 * 1024
+SUMMARY_MAX_ATTEMPTS = 2
 
 
-def build_summary_prompt(source_label: str, content: str) -> str:
-    return (
+def count_words(text: str) -> int:
+    return len(text.split())
+
+
+def build_summary_prompt(
+    source_label: str,
+    content: str,
+    limit_word_count: int | None = None,
+    previous_word_count: int | None = None,
+) -> str:
+    instructions = [
         "Summarize this file concisely. Note its purpose, main components, "
-        f"and anything unusual or important.\nFile: {source_label}\n\n{content}"
+        "and anything unusual or important.",
+    ]
+    if limit_word_count is not None:
+        instructions.append(f"Fit the summary into {limit_word_count} words or less.")
+    if previous_word_count is not None:
+        instructions.append(
+            f"The previous summary was {previous_word_count} words, which exceeded the limit. "
+            "Retry with a shorter summary that meets the limit."
+        )
+    return f"{' '.join(instructions)}\nFile: {source_label}\n\n{content}"
+
+
+def summarize_content(
+    content: str,
+    source_label: str,
+    provider: str,
+    model: str,
+    limit_word_count: int | None = None,
+) -> str:
+    previous_word_count = None
+    for _ in range(SUMMARY_MAX_ATTEMPTS):
+        prompt = build_summary_prompt(
+            source_label,
+            content,
+            limit_word_count,
+            previous_word_count,
+        )
+        summary = generate_text(prompt, provider, model)
+        word_count = count_words(summary)
+        if limit_word_count is None or word_count <= limit_word_count:
+            return summary
+        previous_word_count = word_count
+    raise RuntimeError(
+        f"summary exceeded --limit-word-count {limit_word_count} "
+        f"after {SUMMARY_MAX_ATTEMPTS} attempts (last word count: {previous_word_count})"
     )
 
 
-def summarize_content(content: str, source_label: str, provider: str, model: str) -> str:
-    prompt = build_summary_prompt(source_label, content)
-    return generate_text(prompt, provider, model)
-
-
-def summarize_file_path(path: Path, provider: str, model: str) -> str:
+def summarize_file_path(
+    path: Path,
+    provider: str,
+    model: str,
+    limit_word_count: int | None = None,
+) -> str:
     content = path.read_text(encoding="utf-8")
-    return summarize_content(content, str(path.resolve()), provider, model)
+    return summarize_content(content, str(path.resolve()), provider, model, limit_word_count)
 
 
 def combined_summary_from_index(index: dict) -> str:

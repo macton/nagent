@@ -11,11 +11,13 @@ The claim is simple:
 
 **The agent is not the thing. The data is the thing.**
 
-The LLM is temporary. The process is temporary. Sub-agents are temporary. Context
-windows are temporary. What survives is explicit data: conversations, per-file
-conversations, root context files, repository history summaries, historical
-coupling tables, file summaries, split indexes, patch files, and other artifacts
-you can open in an editor.
+nagent is a data-oriented architecture for AI workflows.
+
+The LLM is temporary. The process is temporary. Sub-conversations are temporary.
+Context windows are temporary. What survives is explicit data: conversations,
+per-file conversations, root context files, repository history summaries,
+historical coupling tables, artifact neighborhoods, file summaries, split
+indexes, patch files, and other artifacts you can open in an editor.
 
 A text file, an LLM, structured tags, and a loop are how this repo implements
 that idea. They are not the idea.
@@ -45,10 +47,10 @@ architecture and build their own version.
 
 ## What It Looks Like
 
-One `nagent` prompt can run for many turns. Reads. Shell. Sub-agents. More
-reasoning. Everything gets appended to the conversation file. From the terminal
-you typed one command. Under the hood the loop keeps going until the model emits
-a final response.
+One `nagent` prompt can run for many turns. Reads. Shell. Sub-conversations.
+More reasoning. Everything gets appended to the conversation file. From the
+terminal you typed one command. Under the hood the loop keeps going until the
+model emits a final response.
 
 ```bash
 nagent "Investigate why this Linux service fails to start. Read the unit file and related config, run diagnostic commands, explain the root cause, and propose a fix before changing anything."
@@ -58,9 +60,13 @@ nagent "Investigate why this Linux service fails to start. Read the unit file an
 nagent "Review this repository: identify the main entry points, run the test suite, fix the smallest failing test you find, and summarize what changed and why."
 ```
 
+```bash
+nagent "Plan the migration of this config format. Inspect the loader, tests, and examples, explain the risks, then make the smallest implementation change if the plan is sound."
+```
+
 These are coordination tasks, not one-shot answers. nagent may read many files,
-run commands, spawn sub-agents for scoped work, and iterate. It does not bypass
-permissions; it runs with the same access your user and filesystem allow.
+run commands, spawn sub-conversations for scoped work, and iterate. It does not
+bypass permissions; it runs with the same access your user and filesystem allow.
 
 ---
 
@@ -94,7 +100,7 @@ inspect, diff, copy, and edit. Do not hide it in process memory and call that
 
 **Implementation** — `bin/nagent` stores conversations under
 `~/.nagent/conversations/`. It appends user prompts, model responses, tool
-results, parser corrections, interrupts, and child-agent results to the
+results, parser corrections, interrupts, and sub-conversation results to the
 conversation file. File-edit sessions get their own per-file conversations.
 Large-file work creates split directories, `index.json`, segment files, summaries,
 and patch artifacts.
@@ -118,7 +124,7 @@ updated artifacts
 The Python process is a worker. The files are the system.
 
 **Build your own:** decide which artifacts are source of truth before you design
-"agent behavior." Workers come and go. Data stays.
+"conversation behavior." Workers come and go. Data stays.
 
 ---
 
@@ -161,7 +167,7 @@ Tool transcript. Correction channel. Continuation point. Mutable artifact. Memor
 goes stale. Therefore let people save, load, summarize, edit, branch, trim,
 copy, diff, version, and rewrite conversations.
 
-**The agent does not own its memory. The user does.**
+**The conversation does not own its memory. The user does.**
 
 
 | Session memory               | Artifact memory              |
@@ -215,7 +221,9 @@ recognized tags and whitespace. Nothing else.
 **Implementation** — `build_initial_context()` and `create_initial_text()` in
 `bin/nagent` assemble runtime context: instance facts, environment, git remotes,
 discovered tool descriptions, context-management rules, write rules, large-file
-guidance, optional file-edit history, root context, role instructions.
+guidance, the structured tag protocol, optional file-edit history, root context,
+role instructions. The tag list and usage rules live inside `<initial_context>`,
+so refreshed context carries the current protocol with it.
 `parse_response()` parses with regex. `process_tags()` dispatches handlers.
 
 Tags:
@@ -230,12 +238,12 @@ Tags:
 | `<nagent-write path="...">...</nagent-write>` | Write to an allowed path.              |
 | `<nagent-shell>...</nagent-shell>`            | Run shell; append output.              |
 | `<nagent-next>...</nagent-next>`              | Append a continuation prompt.          |
-| `<nagent-agent>...</nagent-agent>`            | Delegate to a child nagent.            |
+| `<nagent-conversation>...</nagent-conversation>` | Start an isolated sub-conversation. |
 
 
 Handlers append `<nagent-read-result>`, `<nagent-file-read-result>`,
 `<nagent-file-patch-result>`, `<nagent-write-result>`, `<nagent-shell-result>`,
-`<nagent-agent-result>`. These are not secret return values. They are
+`<nagent-conversation-result>`. These are not secret return values. They are
 conversation data.
 
 **Example**
@@ -450,15 +458,15 @@ association alone.
 
 ---
 
-## 9. Disposable Sub-Agents
+## 9. Disposable Sub-Conversations
 
 **Idea** — Exploration creates noise. Spawn disposable workers.
 
-Sub-agents are temporary nagent processes with isolated conversations. Their
-lifetime does not matter. The artifact they return matters.
+Sub-conversations are temporary nagent processes with isolated conversations.
+Their lifetime does not matter. The artifact they return matters.
 
 
-| Long-lived agents              | Disposable workers               |
+| Long-lived agent abstractions  | Disposable workers               |
 | ------------------------------ | -------------------------------- |
 | Identity is central            | Output artifact is central       |
 | Shared context gets noisy      | Child context is isolated        |
@@ -466,20 +474,22 @@ lifetime does not matter. The artifact they return matters.
 | Delegation implies personality | Delegation is context management |
 
 
-**Implementation** — `<nagent-agent>` → `execute_agent()`. Parent starts
-`bin/nagent` with same root, provider, model, config, pid; `--invocation delegated`; parent conversation recorded; UUID child conversation; `--json`.
-Parent appends `<nagent-agent-result>` with child name, exit code, output,
+**Implementation** — `<nagent-conversation>` is the protocol tag for delegated
+sub-conversations. The parent starts `bin/nagent` with same root, provider, model,
+config, pid; `--invocation delegated`; parent conversation recorded; UUID child
+conversation; `--json`.
+Parent appends `<nagent-conversation-result>` with child name, exit code, output,
 stderr, token totals.
 
-Child has its own conversation file. No shared context except explicit prompt and
-result text.
+The child has its own conversation file. No shared context except explicit prompt
+and result text.
 
 **Example**
 
 ```xml
-<nagent-agent>
+<nagent-conversation>
 Inspect the split and patch tests. Return only the behaviors the README should explain.
-</nagent-agent>
+</nagent-conversation>
 ```
 
 **Build your own:** child loops for bounded investigation and noisy diagnostics.
@@ -698,7 +708,7 @@ bin/helpers/nagent_file_summarize_lib.py
 ```
 
 Tests are architecture notes: parser, conversation lifecycle, root context,
-retries, tokens, sub-agents, result wrappers, write validation, file ids,
+retries, tokens, sub-conversations, result wrappers, write validation, file ids,
 file-edit index, git history, co-edited files, summaries, split/patch, uploads,
 providers, tool descriptions, JSON output.
 
