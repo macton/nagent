@@ -14,8 +14,8 @@ under `bin/helpers/`, and the tests when needed. Ground the walkthrough in the
 implementation that actually exists.
 
 Do not treat the README as marketing material. Treat it as a teaching document
-for programmers who want to understand the architecture and build their own
-version.
+for programmers who want to understand the reference example, the approach, and
+build their own version.
 
 Do not turn the README into API documentation. Teach the system.
 
@@ -27,7 +27,18 @@ The README should communicate one central idea:
 
 **The agent is not the thing. The data is the thing.**
 
-nagent is a data-oriented architecture for AI workflows.
+nagent is a small reference example of a data-oriented approach to AI workflows.
+
+Do not describe nagent as an architecture or as a framework.
+
+The introduction must also call out this claim:
+
+**Don't edit the output artifacts. Edit the prompt.**
+
+Meaning: when a generator produces output you do not like, fix the generator or
+the inputs to that generator. Do not merely patch the generated output. In
+nagent, the conversation prompt is one of those inputs. To improve generation,
+that prompt must be saveable, maintainable, organizable, and editable.
 
 LLMs are temporary.
 
@@ -73,7 +84,7 @@ Terminology rule:
   "sub-agents."
 - Keep **nagent** unchanged; it is the system name.
 - The thesis line and industry comparisons may still use the word "agent" when
-  they are explaining the confusing term rather than naming the architecture.
+  they are explaining the confusing term rather than naming the approach.
 - The delegation protocol tag is `<nagent-conversation>`, not
   `<nagent-agent>`.
 
@@ -139,7 +150,7 @@ The README should make these ideas clear:
   - append results
   - repeat
 - the implementation is intentionally small
-- the architecture should be understandable in one sitting
+- the approach should be understandable in one sitting
 - the reader should understand the design well enough to copy, modify, or reject
   pieces of it
 - the novel part is artifact management and explicit data flow, not tool calling
@@ -209,7 +220,7 @@ Requirements:
   filesystem permissions.
 
 The goal is to show readers what using nagent feels like before the numbered
-architecture walkthrough begins.
+walkthrough begins.
 
 ---
 
@@ -654,7 +665,14 @@ data.
 
 Do not market against frameworks.
 
-Compare architectural styles.
+Do not frame this as "frameworks bad."
+
+Emphasize data ownership and visibility. The point is that inputs to the system
+should not be trapped inside an opaque framework that hides, rewrites, stores, or
+modifies the data being used, beyond the unavoidable transformations already
+introduced by LLM providers. nagent keeps as much control over the data as
+possible by making prompts, conversations, tool results, summaries, indexes, and
+patches transparent and editable.
 
 Include a table covering:
 
@@ -839,8 +857,6 @@ Do not describe nagent as an autonomous intelligence.
 
 Do not turn the README into full API documentation.
 
-Teach the architecture.
-
 Teach the data flow.
 
 Teach why the state is explicit.
@@ -860,7 +876,7 @@ Before finishing the README, verify:
   complex `nagent`-only examples that frame multi-turn expectations.
 - [ ] Every major feature is justified by a reduction.
 - [ ] Every major numbered section ends with **Build your own:**.
-- [ ] Every architectural claim is grounded in implementation.
+- [ ] Every design claim is grounded in implementation.
 - [ ] Novelty is attributed to data flow and artifact management, not tool calling.
 - [ ] The README explains editable conversations as mutable data structures.
 - [ ] The README explains per-file conversations as artifact-local memory.
@@ -868,4 +884,8 @@ Before finishing the README, verify:
 - [ ] The README explains historical coupling as inspection guidance, not an edit mandate.
 - [ ] The README explains sub-conversations as disposable workers.
 - [ ] The README explains split/index/patch as explicit artifacts.
+- [ ] The introduction explains: **Don't edit the output artifacts. Edit the
+  prompt.**
+- [ ] The framework comparison emphasizes transparent, editable data inputs
+  instead of arguing that frameworks are bad.
 - [ ] The reader could build a minimal version after reading.

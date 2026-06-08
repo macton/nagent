@@ -11,7 +11,16 @@ The claim is simple:
 
 **The agent is not the thing. The data is the thing.**
 
-nagent is a data-oriented architecture for AI workflows.
+nagent is a small reference example of a data-oriented approach to AI workflows.
+
+The second claim follows from the first:
+
+**Don't edit the output artifacts. Edit the prompt.**
+
+If a generator produces output you do not like, fix the generator or the inputs
+to that generator. Do not merely patch the generated output and leave the bad
+input in place. In nagent, the conversation prompt is one of those inputs. If it
+matters, it needs to be saveable, maintainable, organizable, and editable.
 
 The LLM is temporary. The process is temporary. Sub-conversations are temporary.
 Context windows are temporary. What survives is explicit data: conversations,
@@ -43,7 +52,7 @@ user request
 ```
 
 This README is a teaching document for programmers who want to understand the
-architecture and build their own version.
+reference example, the approach, and build their own version.
 
 ## What It Looks Like
 
@@ -622,10 +631,15 @@ not maintain a hidden registry that drifts.
 
 ## 13. How This Differs From Frameworks
 
-**Idea** — Different architectural style. Not "frameworks bad."
+**Idea** — Own the data inputs. Keep them visible and editable.
 
 nagent uses plain files, Python, subprocesses, structured text. The interesting
 part is artifact management and explicit data flow, not tool calling by itself.
+The point is not to argue against frameworks. The point is to keep the inputs to
+the system out of an opaque layer that hides, rewrites, stores, or modifies the
+data you are using. LLM providers already transform data enough. nagent keeps as
+much control as it can by making prompts, conversations, tool results, summaries,
+indexes, and patches transparent and editable.
 
 **Implementation** — Read `bin/nagent`, `bin/helpers/`, thin wrappers in
 `bin/`, tests in `tests/`. That is the system.
@@ -676,7 +690,7 @@ conversation file
 ```
 
 **Build your own:** use a framework when it buys something concrete. If the
-goal is to learn the architecture, start with files and transformations.
+goal is to learn the data flow, start with files and transformations.
 
 ---
 
@@ -707,7 +721,7 @@ bin/helpers/nagent_file_patch_lib.py
 bin/helpers/nagent_file_summarize_lib.py
 ```
 
-Tests are architecture notes: parser, conversation lifecycle, root context,
+Tests are executable notes: parser, conversation lifecycle, root context,
 retries, tokens, sub-conversations, result wrappers, write validation, file ids,
 file-edit index, git history, co-edited files, summaries, split/patch, uploads,
 providers, tool descriptions, JSON output.

@@ -8,7 +8,8 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
-PROVIDERS = ("openai", "anthropic", "google", "cursor")
+PROVIDERS = ("openai", "anthropic", "google", "gemini", "cursor")
+PROVIDER_ALIASES = {"gemini": "google"}
 
 DEFAULT_MODELS = {
     "openai": "gpt-5.5",
@@ -63,6 +64,12 @@ def default_model(provider: str) -> str:
     return DEFAULT_MODELS[provider]
 
 
+def estimate_token_count(text: str) -> int:
+    if not text:
+        return 0
+    return max(1, (len(text) + 3) // 4)
+
+
 def resolve_settings(
     provider: str | None = None,
     model: str | None = None,
@@ -70,7 +77,12 @@ def resolve_settings(
 ) -> tuple[str, str]:
     config = load_config(config_path)
     resolved_provider = resolve_provider(provider, config_path, config)
-    resolved_model = model or config.get("model") or default_model(resolved_provider)
+    if model is not None:
+        resolved_model = model
+    elif provider is not None:
+        resolved_model = default_model(resolved_provider)
+    else:
+        resolved_model = config.get("model") or default_model(resolved_provider)
     return resolved_provider, resolved_model
 
 
@@ -80,10 +92,11 @@ def resolve_provider(
     config: dict | None = None,
 ) -> str:
     config = config if config is not None else load_config(config_path)
-    resolved_provider = (provider or config.get("provider") or "openai").lower()
-    if resolved_provider not in PROVIDERS:
+    requested_provider = (provider or config.get("provider") or "openai").lower()
+    resolved_provider = PROVIDER_ALIASES.get(requested_provider, requested_provider)
+    if requested_provider not in PROVIDERS and resolved_provider not in PROVIDERS:
         raise ValueError(
-            f"Unsupported provider {resolved_provider!r}. "
+            f"Unsupported provider {requested_provider!r}. "
             f"Supported providers: {', '.join(PROVIDERS)}."
         )
     return resolved_provider
@@ -249,17 +262,26 @@ def _usage_value(usage, *names: str) -> int:
     return 0
 
 
-def _result_with_usage(text: str, usage) -> LlmResult:
+def _result_with_usage(text: str, usage, input_text: str | None = None) -> LlmResult:
+    input_tokens = _usage_value(usage, "input_tokens", "prompt_tokens", "prompt_token_count")
+    output_tokens = _usage_value(
+        usage,
+        "output_tokens",
+        "completion_tokens",
+        "candidates_token_count",
+        "output_token_count",
+    )
+    total_tokens = _usage_value(usage, "total_tokens", "total_token_count")
+    if output_tokens == 0 and total_tokens and input_tokens:
+        output_tokens = max(0, total_tokens - input_tokens)
+    if input_tokens == 0 and input_text is not None:
+        input_tokens = estimate_token_count(input_text)
+    if output_tokens == 0:
+        output_tokens = estimate_token_count(text)
     return LlmResult(
         text=text,
-        input_tokens=_usage_value(usage, "input_tokens", "prompt_tokens", "prompt_token_count"),
-        output_tokens=_usage_value(
-            usage,
-            "output_tokens",
-            "completion_tokens",
-            "candidates_token_count",
-            "output_token_count",
-        ),
+        input_tokens=input_tokens,
+        output_tokens=output_tokens,
     )
 
 
@@ -268,7 +290,7 @@ def generate_text_with_usage(message: str, provider: str, model: str) -> LlmResu
         OpenAI = require_package(provider)
         client = OpenAI()
         response = client.responses.create(model=model, input=message)
-        return _result_with_usage(response.output_text, getattr(response, "usage", None))
+        return _result_with_usage(response.output_text, getattr(response, "usage", None), message)
 
     if provider == "anthropic":
         anthropic = require_package(provider)
@@ -278,14 +300,14 @@ def generate_text_with_usage(message: str, provider: str, model: str) -> LlmResu
             max_tokens=8192,
             messages=[{"role": "user", "content": message}],
         )
-        return _result_with_usage(_anthropic_text(response), getattr(response, "usage", None))
+        return _result_with_usage(_anthropic_text(response), getattr(response, "usage", None), message)
 
     if provider == "google":
         genai = require_package(provider)
         api_key = os.environ.get("GOOGLE_API_KEY") or os.environ["GEMINI_API_KEY"]
         client = genai.Client(api_key=api_key)
         response = client.models.generate_content(model=model, contents=message)
-        return _result_with_usage(response.text or "", getattr(response, "usage_metadata", None))
+        return _result_with_usage(response.text or "", getattr(response, "usage_metadata", None), message)
 
     Agent, AgentOptions, LocalAgentOptions = require_package(provider)
     result = Agent.prompt(
@@ -296,7 +318,12 @@ def generate_text_with_usage(message: str, provider: str, model: str) -> LlmResu
             local=LocalAgentOptions(cwd=os.getcwd()),
         ),
     )
-    return LlmResult(text=_cursor_result_text(result))
+    text = _cursor_result_text(result)
+    return LlmResult(
+        text=text,
+        input_tokens=estimate_token_count(message),
+        output_tokens=estimate_token_count(text),
+    )
 
 
 def generate_text(message: str, provider: str, model: str) -> str:
@@ -354,7 +381,7 @@ def _openai_upload(path: Path, prompt: str, model: str) -> LlmResult:
         model=model,
         input=[{"role": "user", "content": content}],
     )
-    return _result_with_usage(response.output_text, getattr(response, "usage", None))
+    return _result_with_usage(response.output_text, getattr(response, "usage", None), prompt)
 
 
 def _anthropic_upload(path: Path, prompt: str, model: str) -> LlmResult:
@@ -391,7 +418,7 @@ def _anthropic_upload(path: Path, prompt: str, model: str) -> LlmResult:
             }
         ],
     )
-    return _result_with_usage(_anthropic_text(response), getattr(response, "usage", None))
+    return _result_with_usage(_anthropic_text(response), getattr(response, "usage", None), prompt)
 
 
 def _google_wait_for_file(client, uploaded):
@@ -421,7 +448,7 @@ def _google_upload(path: Path, prompt: str, model: str) -> LlmResult:
         model=model,
         contents=[prompt, uploaded],
     )
-    return _result_with_usage(response.text or "", getattr(response, "usage_metadata", None))
+    return _result_with_usage(response.text or "", getattr(response, "usage_metadata", None), prompt)
 
 
 def _cursor_upload(path: Path, prompt: str, model: str) -> str:

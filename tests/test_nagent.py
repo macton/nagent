@@ -236,13 +236,24 @@ class ParseResponseTests(unittest.TestCase):
             '<nagent-file-read path="/tmp/big.py" />\n'
             '<nagent-file-patch index="/tmp/split/index.json" />\n'
             "<nagent-next>continue</nagent-next>\n"
-            "<nagent-conversation>delegate</nagent-conversation>"
+            "<nagent-conversation>delegate</nagent-conversation>\n"
+            '<nagent-conversation conversation-file="existing-conv">continue file</nagent-conversation>\n'
+            '<nagent-conversation conversation-name="saved-conv">continue saved</nagent-conversation>'
         )
         tags, err = self.mod.parse_response(text)
         self.assertIsNone(err)
         self.assertEqual(
             [t.kind for t in tags],
-            ["response", "read", "file_read", "file_patch", "next", "conversation"],
+            [
+                "response",
+                "read",
+                "file_read",
+                "file_patch",
+                "next",
+                "conversation",
+                "conversation",
+                "conversation",
+            ],
         )
         self.assertEqual(tags[0].content, "Hello")
         self.assertEqual(tags[1].path, "/tmp/foo")
@@ -250,6 +261,24 @@ class ParseResponseTests(unittest.TestCase):
         self.assertEqual(tags[3].path, "/tmp/split/index.json")
         self.assertEqual(tags[4].content, "continue")
         self.assertEqual(tags[5].content, "delegate")
+        self.assertEqual(tags[6].content, "continue file")
+        self.assertEqual(tags[6].conversation_file, "existing-conv")
+        self.assertEqual(tags[7].content, "continue saved")
+        self.assertEqual(tags[7].conversation_name, "saved-conv")
+
+    def test_conversation_tag_rejects_unsupported_options(self):
+        tags, err = self.mod.parse_response(
+            '<nagent-conversation unknown="conv">delegate</nagent-conversation>'
+        )
+        self.assertIsNone(tags)
+        self.assertIn("Unsupported <nagent-conversation> attribute", err)
+
+        tags, err = self.mod.parse_response(
+            '<nagent-conversation conversation-file="conv" conversation-name="saved">'
+            "delegate</nagent-conversation>"
+        )
+        self.assertIsNone(tags)
+        self.assertIn("supports only one", err)
 
     def test_invalid_leading_text(self):
         tags, err = self.mod.parse_response("oops <nagent-response>Hi</nagent-response>")
@@ -593,6 +622,62 @@ class ActionTests(unittest.TestCase):
             self.assertIn("--json", captured["cmd"])
             self.assertIn("4242", captured["cmd"][captured["cmd"].index("--conversation") + 1])
 
+    def test_execute_agent_accepts_conversation_file_option(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            captured: dict[str, list[str]] = {}
+
+            def fake_run(cmd, **kwargs):
+                captured["cmd"] = cmd
+                return unittest.mock.Mock(returncode=0, stdout="", stderr="")
+
+            with unittest.mock.patch.object(self.mod.subprocess, "run", fake_run):
+                self.mod.execute_agent(
+                    "do task",
+                    root,
+                    self.mod.LlmSettings(provider="openai", model="gpt-5.5"),
+                    NAGENT,
+                    "parent-conv",
+                    "4242",
+                    conversation_file="existing-conv",
+                )
+
+        self.assertEqual(captured["cmd"][captured["cmd"].index("--conversation") + 1], "existing-conv")
+
+    def test_execute_agent_loads_saved_conversation_name_option(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            saved = root / "saved-outside-conversations"
+            saved.write_text("saved history", encoding="utf-8")
+            self.mod.update_saved_conversations_index(
+                root,
+                "4242",
+                "saved",
+                saved,
+                "summary",
+            )
+            captured: dict[str, list[str]] = {}
+
+            def fake_run(cmd, **kwargs):
+                captured["cmd"] = cmd
+                return unittest.mock.Mock(returncode=0, stdout="", stderr="")
+
+            with unittest.mock.patch.object(self.mod.subprocess, "run", fake_run):
+                self.mod.execute_agent(
+                    "do task",
+                    root,
+                    self.mod.LlmSettings(provider="openai", model="gpt-5.5"),
+                    NAGENT,
+                    "parent-conv",
+                    "4242",
+                    conversation_name="saved",
+                )
+
+            child_name = captured["cmd"][captured["cmd"].index("--conversation") + 1]
+            child_conversation = root / "conversations" / child_name
+            self.assertEqual(child_conversation.read_text(encoding="utf-8"), "saved history")
+            self.assertNotEqual(child_name, "saved")
+
     def test_execute_agent_adds_recursive_token_counts(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -638,6 +723,32 @@ class ActionTests(unittest.TestCase):
             stats.status_line(),
             "[Turns:2 Conversation-Tokens:100 Tokens-In:150 Tokens-Out:40]",
         )
+
+    def test_call_llm_uses_plain_wait_spinner_message(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            conversation = Path(tmp) / "conversation"
+            conversation.write_text("prompt text", encoding="utf-8")
+            result = unittest.mock.Mock(
+                returncode=0,
+                stdout=json.dumps(
+                    {
+                        "response": "<nagent-response>ok</nagent-response>",
+                        "input_tokens": 4,
+                        "output_tokens": 2,
+                    }
+                ),
+                stderr="",
+            )
+
+            with unittest.mock.patch.object(self.mod, "WaitSpinner") as spinner, \
+                unittest.mock.patch.object(self.mod.subprocess, "run", return_value=result):
+                self.mod.call_llm(
+                    conversation,
+                    self.mod.LlmSettings(provider="openai", model="gpt-5.5"),
+                    self.mod.TokenStats(),
+                )
+
+        spinner.assert_called_once_with("Waiting for LLM", enabled=True)
 
     def test_main_prints_final_status_for_user_direct_mode(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1124,12 +1235,12 @@ class WaitSpinnerTests(unittest.TestCase):
         with mod.wait_spinner("Testing"):
             pass
 
-    def test_wait_spinner_uses_waiting_message(self):
+    def test_wait_spinner_uses_activity_message(self):
         mod = load_nagent_module()
         with unittest.mock.patch.object(mod, "WaitSpinner") as spinner:
-            mod.wait_spinner("[Turns:2 Conversation-Tokens:100 Tokens-In:150 Tokens-Out:40]")
+            mod.wait_spinner("Testing")
 
-        spinner.assert_called_once_with("Waiting...", enabled=True)
+        spinner.assert_called_once_with("Testing", enabled=True)
 
 
 class RefreshInitialContextTests(unittest.TestCase):
@@ -1672,6 +1783,15 @@ class NagentLlmConfigTests(unittest.TestCase):
             self.assertEqual(provider, "google")
             self.assertEqual(model, "gemini-2.5-pro")
 
+    def test_provider_override_uses_matching_default_model(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = Path(tmp) / "config.json"
+            config_path.write_text('{"provider": "openai", "model": "gpt-5.5"}', encoding="utf-8")
+            provider, model = self.mod.resolve_settings(provider="gemini", config_path=config_path)
+
+        self.assertEqual(provider, "google")
+        self.assertEqual(model, self.mod.default_model("google"))
+
     def test_missing_credentials_exits(self):
         with tempfile.TemporaryDirectory() as tmp:
             config_path = Path(tmp) / "config.json"
@@ -1726,6 +1846,79 @@ class NagentLlmConfigTests(unittest.TestCase):
         result = unittest.mock.Mock(status="error", result="")
         with self.assertRaises(RuntimeError):
             self.mod._cursor_result_text(result)
+
+    def test_openai_usage_counts_are_preserved(self):
+        class FakeResponses:
+            def create(self, **kwargs):
+                usage = unittest.mock.Mock(input_tokens=31, output_tokens=7)
+                return unittest.mock.Mock(output_text="ok", usage=usage)
+
+        class FakeClient:
+            responses = FakeResponses()
+
+        with unittest.mock.patch.object(self.mod, "require_package", return_value=lambda: FakeClient()):
+            result = self.mod.generate_text_with_usage("hello", "openai", "gpt-5.5")
+
+        self.assertEqual(result.text, "ok")
+        self.assertEqual(result.input_tokens, 31)
+        self.assertEqual(result.output_tokens, 7)
+
+    def test_gemini_usage_counts_are_preserved(self):
+        class FakeModels:
+            def generate_content(self, **kwargs):
+                usage = type(
+                    "FakeUsage",
+                    (),
+                    {"prompt_token_count": 29, "candidates_token_count": 6},
+                )()
+                return unittest.mock.Mock(text="ok", usage_metadata=usage)
+
+        class FakeClient:
+            models = FakeModels()
+
+        fake_genai = unittest.mock.Mock(Client=lambda api_key: FakeClient())
+        with unittest.mock.patch.object(self.mod, "require_package", return_value=fake_genai), \
+            unittest.mock.patch.dict(os.environ, {"GEMINI_API_KEY": "test-key"}, clear=False):
+            result = self.mod.generate_text_with_usage("hello", "google", "gemini-2.5-flash")
+
+        self.assertEqual(result.text, "ok")
+        self.assertEqual(result.input_tokens, 29)
+        self.assertEqual(result.output_tokens, 6)
+
+    def test_cursor_usage_counts_fall_back_to_estimates(self):
+        class FakeAgent:
+            @staticmethod
+            def prompt(message, options):
+                return unittest.mock.Mock(status="finished", result="cursor ok")
+
+        class FakeAgentOptions:
+            def __init__(self, **kwargs):
+                pass
+
+        class FakeLocalAgentOptions:
+            def __init__(self, **kwargs):
+                pass
+
+        with unittest.mock.patch.object(
+            self.mod,
+            "require_package",
+            return_value=(FakeAgent, FakeAgentOptions, FakeLocalAgentOptions),
+        ), unittest.mock.patch.dict(os.environ, {"CURSOR_API_KEY": "test-key"}, clear=False):
+            result = self.mod.generate_text_with_usage("hello cursor", "cursor", "composer-2.5")
+
+        self.assertEqual(result.text, "cursor ok")
+        self.assertEqual(result.input_tokens, self.mod.estimate_token_count("hello cursor"))
+        self.assertEqual(result.output_tokens, self.mod.estimate_token_count("cursor ok"))
+
+    def test_gemini_provider_alias_resolves_to_google(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            provider, model = self.mod.resolve_settings(
+                provider="gemini",
+                config_path=Path(tmp) / "missing-config.json",
+            )
+
+        self.assertEqual(provider, "google")
+        self.assertEqual(model, self.mod.default_model("google"))
 
     def test_utilities_autodetect_config_without_flags(self):
         import argparse

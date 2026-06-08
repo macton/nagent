@@ -48,7 +48,13 @@ TAG_PATTERNS: list[tuple[TagType, re.Pattern[str]]] = [
     ("write", re.compile(r'<nagent-write\s+path="([^"]*)">(.*?)</nagent-write>', re.DOTALL)),
     ("shell", re.compile(r"<nagent-shell>(.*?)</nagent-shell>", re.DOTALL)),
     ("next", re.compile(r"<nagent-next>(.*?)</nagent-next>", re.DOTALL)),
-    ("conversation", re.compile(r"<nagent-conversation>(.*?)</nagent-conversation>", re.DOTALL)),
+    (
+        "conversation",
+        re.compile(
+            r'<nagent-conversation((?:\s+[A-Za-z-]+="[^"]*")*)\s*>(.*?)</nagent-conversation>',
+            re.DOTALL,
+        ),
+    ),
 ]
 
 READ_SPLIT_THRESHOLD_BYTES = 64 * 1024
@@ -71,6 +77,7 @@ USER_VISIBLE_WRAPPER_PATTERNS: list[re.Pattern[str]] = [
 
 MARKDOWN_FENCE_PATTERN = re.compile(r"\A\s*```[^\n`]*\n(.*?)\n```\s*\Z", re.DOTALL)
 INITIAL_CONTEXT_PATTERN = re.compile(r"<initial_context>.*?</initial_context>", re.DOTALL)
+TAG_ATTRIBUTE_PATTERN = re.compile(r'\s+([A-Za-z-]+)="([^"]*)"')
 
 
 @dataclass
@@ -78,6 +85,8 @@ class NagentTag:
     kind: TagType
     content: str
     path: str | None = None
+    conversation_file: str | None = None
+    conversation_name: str | None = None
 
 
 @dataclass
@@ -127,7 +136,7 @@ def set_spinner_enabled(enabled: bool) -> None:
 
 
 def wait_spinner(message: str) -> WaitSpinner:
-    return WaitSpinner("Waiting...", enabled=_spinner_enabled)
+    return WaitSpinner(message, enabled=_spinner_enabled)
 
 
 def host_uname() -> str:
@@ -645,6 +654,8 @@ Respond only with one or more of these structured tags (no other text):
 - <nagent-shell>{{shell commands}}</nagent-shell>
 - <nagent-next>{{prompt}}</nagent-next>
 - <nagent-conversation>{{prompt}}</nagent-conversation>
+- <nagent-conversation conversation-file="{{path-to-conversation-file}}">{{prompt}}</nagent-conversation>
+- <nagent-conversation conversation-name="{{saved-conversation-name}}">{{prompt}}</nagent-conversation>
 
 Instance:
 - invocation: {invocation}
@@ -676,6 +687,7 @@ Use <nagent-read> for small files; use <nagent-file-read> when the file may exce
 Use <nagent-shell> for other commands; output will be appended to your conversation.
 Use <nagent-next> to continue reasoning with an appended prompt.
 Use <nagent-conversation> to delegate a sub-task to a separate nagent sub-conversation.
+Optional <nagent-conversation> parameters: conversation-file loads a specific --conversation file; conversation-name loads a saved conversation like --load-conversation.
 
 {file_edit_detail_block}
 {root_context_block}
@@ -779,6 +791,35 @@ def parse_response(text: str) -> tuple[list[NagentTag] | None, str | None]:
                 tags.append(NagentTag(kind=kind, content="", path=match.group(1)))
             elif kind in ("write",):
                 tags.append(NagentTag(kind=kind, content=match.group(2), path=match.group(1)))
+            elif kind == "conversation":
+                attr_text = match.group(1)
+                attrs: dict[str, str] = {}
+                consumed = 0
+                for attr_match in TAG_ATTRIBUTE_PATTERN.finditer(attr_text):
+                    if attr_match.start() != consumed:
+                        return None, f"Invalid attributes for <nagent-conversation>: {attr_text!r}"
+                    attr_name = attr_match.group(1)
+                    if attr_name not in ("conversation-file", "conversation-name"):
+                        return None, f"Unsupported <nagent-conversation> attribute: {attr_name}"
+                    if attr_name in attrs:
+                        return None, f"Duplicate <nagent-conversation> attribute: {attr_name}"
+                    attrs[attr_name] = attr_match.group(2)
+                    consumed = attr_match.end()
+                if consumed != len(attr_text):
+                    return None, f"Invalid attributes for <nagent-conversation>: {attr_text!r}"
+                if "conversation-file" in attrs and "conversation-name" in attrs:
+                    return None, (
+                        "<nagent-conversation> supports only one of conversation-file "
+                        "or conversation-name"
+                    )
+                tags.append(
+                    NagentTag(
+                        kind=kind,
+                        content=match.group(2),
+                        conversation_file=attrs.get("conversation-file"),
+                        conversation_name=attrs.get("conversation-name"),
+                    )
+                )
             else:
                 tags.append(NagentTag(kind=kind, content=match.group(1)))
 
@@ -892,7 +933,7 @@ def call_llm(
     token_stats.conversation_input_tokens = estimate_token_count(conversation_text)
 
     try:
-        with wait_spinner(token_stats.status_line()):
+        with wait_spinner("Waiting for LLM"):
             result = subprocess.run(
                 command,
                 capture_output=True,
@@ -1084,8 +1125,7 @@ def execute_write(
 
 
 def execute_shell(commands: str, token_stats: TokenStats | None = None) -> str:
-    message = token_stats.status_line() if token_stats is not None else "Running command"
-    with wait_spinner(message):
+    with wait_spinner("Running command"):
         result = subprocess.run(
             commands,
             shell=True,
@@ -1114,14 +1154,29 @@ def execute_agent(
     parent_conversation: str,
     pid: str,
     token_stats: TokenStats | None = None,
+    conversation_file: str | None = None,
+    conversation_name: str | None = None,
 ) -> str:
-    conversation_name = f"{uuid.uuid4()}-{pid}"
+    child_conversation_name = conversation_file or f"{uuid.uuid4()}-{pid}"
+    if conversation_name is not None:
+        source = resolve_saved_conversation_reference(root, pid, conversation_name)
+        try:
+            load_conversation(resolve_conversation(root, child_conversation_name), source)
+        except FileNotFoundError as exc:
+            return (
+                f'<nagent-conversation-result conversation="{child_conversation_name}" '
+                'tokens_in="0" tokens_out="0">\n'
+                "exit_code: 1\n"
+                "stderr:\n"
+                f"Error: {exc}\n"
+                "</nagent-conversation-result>"
+            )
     command = [
         str(nagent_path),
         "--root",
         str(root),
         "--conversation",
-        conversation_name,
+        child_conversation_name,
         "--provider",
         llm.provider,
         "--model",
@@ -1142,8 +1197,7 @@ def execute_agent(
         ]
     )
 
-    message = token_stats.status_line() if token_stats is not None else "Sub-conversation working"
-    with wait_spinner(message):
+    with wait_spinner("Sub-conversation working"):
         result = subprocess.run(
             command,
             capture_output=True,
@@ -1171,7 +1225,7 @@ def execute_agent(
     stderr = result.stderr.rstrip("\n")
     parts = [
         (
-            f'<nagent-conversation-result conversation="{conversation_name}" '
+            f'<nagent-conversation-result conversation="{child_conversation_name}" '
             f'tokens_in="{child_input_tokens}" tokens_out="{child_output_tokens}">'
         ),
         f"exit_code: {result.returncode}",
@@ -1231,6 +1285,8 @@ def process_tags(
                     conversation_file.name,
                     pid,
                     token_stats,
+                    conversation_file=tag.conversation_file,
+                    conversation_name=tag.conversation_name,
                 ),
             )
             should_continue = True
@@ -1348,6 +1404,17 @@ def resolve_conversation_reference(root: Path, name: str) -> Path:
     if reference.is_absolute() or reference.parent != Path("."):
         return reference
     return resolve_conversation(root, name)
+
+
+def resolve_saved_conversation_reference(root: Path, pid: str, name: str) -> Path:
+    payload = load_saved_conversations_index(root, pid)
+    for entry in payload["conversations"]:
+        if entry.get("name") != name:
+            continue
+        path_text = entry.get("path")
+        if isinstance(path_text, str) and path_text:
+            return Path(path_text).expanduser()
+    return resolve_conversation_reference(root, name)
 
 
 def migrate_legacy_conversation(root: Path, conversation_name: str, conversation_file: Path) -> Path | None:
@@ -1630,7 +1697,7 @@ def summarize_conversation(
         command.extend(["--config", str(config_path.expanduser())])
 
     try:
-        with wait_spinner(token_stats.status_line()):
+        with wait_spinner("Summarizing conversation"):
             result = subprocess.run(command, capture_output=True, text=True)
     finally:
         try:
