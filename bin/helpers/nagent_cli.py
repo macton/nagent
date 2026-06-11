@@ -1,11 +1,22 @@
 #!/usr/bin/python3
 
 import json
+import os
 import subprocess
 import sys
 import threading
 import time
 from pathlib import Path
+
+
+def default_pid() -> str:
+    # In screen, STY and WINDOW identify the current virtual terminal more
+    # stably than the shell process. BASHPID is not exported by bash by default;
+    # fall back to the parent shell process id so repeated terminal invocations
+    # share one conversation.
+    if os.environ.get("STY"):
+        return f"{os.environ['STY']}-{os.environ.get('WINDOW', '')}"
+    return os.environ.get("BASHPID") or str(os.getppid())
 
 
 def emit_json(payload: dict) -> None:

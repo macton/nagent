@@ -280,6 +280,35 @@ class ParseResponseTests(unittest.TestCase):
         self.assertIsNone(tags)
         self.assertIn("supports only one", err)
 
+    def test_write_tag_carries_raw_content(self):
+        body = 'line1\nif a < b && c: print("&")\nline3\n'
+        tags, err = self.mod.parse_response(
+            f'<nagent-write path="/tmp/out.py">{body}</nagent-write>'
+        )
+        self.assertIsNone(err)
+        self.assertEqual(tags[0].kind, "write")
+        self.assertEqual(tags[0].path, "/tmp/out.py")
+        self.assertEqual(tags[0].content, body)
+
+    def test_read_tag_requires_exactly_path_attribute(self):
+        tags, err = self.mod.parse_response("<nagent-read />")
+        self.assertIsNone(tags)
+        self.assertIn('requires exactly one path="..."', err)
+
+        tags, err = self.mod.parse_response('<nagent-read path="/tmp/f" extra="x" />')
+        self.assertIsNone(tags)
+        self.assertIn('requires exactly one path="..."', err)
+
+    def test_shell_tag_rejects_attributes(self):
+        tags, err = self.mod.parse_response('<nagent-shell mode="x">ls</nagent-shell>')
+        self.assertIsNone(tags)
+        self.assertIn("does not take attributes", err)
+
+    def test_unclosed_tag_is_an_error(self):
+        tags, err = self.mod.parse_response("<nagent-shell>ls")
+        self.assertIsNone(tags)
+        self.assertIn("missing </nagent-shell>", err)
+
     def test_invalid_leading_text(self):
         tags, err = self.mod.parse_response("oops <nagent-response>Hi</nagent-response>")
         self.assertIsNone(tags)
@@ -311,6 +340,21 @@ class ActionTests(unittest.TestCase):
             write_result = self.mod.execute_write(str(target), "written")
             self.assertIn('status="ok"', write_result)
             self.assertEqual(target.read_text(encoding="utf-8"), "written")
+
+    def test_execute_read_binary_file_returns_error_result(self):
+        # Undecodable bytes must become an error result in the conversation,
+        # not an uncaught UnicodeDecodeError that kills the loop.
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "blob.bin"
+            path.write_bytes(b"\x00\xff\xfe\x80binary")
+
+            read_result = self.mod.execute_read(str(path))
+            self.assertIn('<nagent-read-result path="', read_result)
+            self.assertIn("error=", read_result)
+
+            file_read_result = self.mod.execute_file_read(str(path), Path(tmp))
+            self.assertIn('<nagent-file-read-result path="', file_read_result)
+            self.assertIn("error=", file_read_result)
 
     def test_execute_shell(self):
         result = self.mod.execute_shell("echo hello-nagent")
@@ -1001,6 +1045,86 @@ class ActionTests(unittest.TestCase):
                 ],
             )
 
+    def test_main_save_conversation_indexes_saved_copy_when_summary_fails(self):
+        # Saving is a file copy; a provider/credential failure in the summary
+        # step must not leave the saved copy missing from the index.
+        mod = load_nagent_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            current = root / "conversations" / "current"
+            current.parent.mkdir(parents=True)
+            current.write_text("current history", encoding="utf-8")
+
+            def failing_summarize(path, provider, model, config_path):
+                raise RuntimeError("Error: missing credentials for provider 'openai'.")
+
+            argv = [
+                "nagent",
+                "--root",
+                str(root),
+                "--conversation",
+                "current",
+                "--pid",
+                "4242",
+                "--save-conversation",
+                "saved",
+            ]
+            stderr = io.StringIO()
+            with unittest.mock.patch.object(mod.sys, "argv", argv), \
+                unittest.mock.patch.object(mod.sys, "stdout", io.StringIO()), \
+                unittest.mock.patch.object(mod.sys, "stderr", stderr), \
+                unittest.mock.patch.object(mod, "summarize_saved_conversation", failing_summarize):
+                code = mod.main()
+
+            saved = root / "conversations" / "saved"
+            index = root / "conversations" / "index-saved-conversations-4242.json"
+            payload = json.loads(index.read_text(encoding="utf-8"))
+
+            self.assertEqual(code, 0)
+            self.assertEqual(saved.read_text(encoding="utf-8"), "current history")
+            self.assertEqual(len(payload["conversations"]), 1)
+            self.assertIn("summary unavailable", payload["conversations"][0]["summary"])
+            self.assertIn("summary unavailable", stderr.getvalue())
+
+    def test_main_fresh_conversation_builds_initial_context_once(self):
+        # A fresh conversation (the path every delegated sub-conversation
+        # takes) must pay tool discovery and git probes exactly once, not
+        # create-then-refresh.
+        mod = load_nagent_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            build_calls: list[tuple] = []
+            real_build = mod.build_initial_context
+
+            def counting_build(*args, **kwargs):
+                build_calls.append(args)
+                return real_build(*args, **kwargs)
+
+            def fake_run_agent_loop(conversation_file, *args, **kwargs):
+                return 0, ["done"]
+
+            argv = [
+                "nagent",
+                "--root",
+                str(root),
+                "--conversation",
+                "conv",
+                "--pid",
+                "4242",
+                "hello",
+            ]
+            with unittest.mock.patch.object(mod.sys, "argv", argv), \
+                unittest.mock.patch.object(mod.sys, "stdout", io.StringIO()), \
+                unittest.mock.patch.object(mod, "require_credentials"), \
+                unittest.mock.patch.object(mod, "build_initial_context", counting_build), \
+                unittest.mock.patch.object(mod, "run_agent_loop", fake_run_agent_loop):
+                code = mod.main()
+
+            self.assertEqual(code, 0)
+            self.assertEqual(len(build_calls), 1)
+            contents = (root / "conversations" / "conv").read_text(encoding="utf-8")
+            self.assertTrue(contents.startswith("<initial_context>"))
+
     def test_load_conversation_from_current_path_archives_and_restores(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -1120,9 +1244,74 @@ class ActionTests(unittest.TestCase):
                     )
 
             self.assertEqual(code, 0)
-            self.assertEqual(conversation.read_text(encoding="utf-8"), "edited history")
+            # The edited backup is loaded, then initial context is restored on load.
+            contents = conversation.read_text(encoding="utf-8")
+            self.assertTrue(contents.startswith("<initial_context>"))
+            self.assertTrue(contents.endswith("edited history"))
             self.assertIn("--clear", captured["cmd"])
             self.assertEqual(captured["cmd"][-1], "remove noise")
+
+    def test_edit_conversation_rolls_up_child_token_stats(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            conversation = root / "conversations" / "conv"
+            conversation.parent.mkdir(parents=True)
+            conversation.write_text("old history", encoding="utf-8")
+
+            child_payload = {
+                "exit_code": 0,
+                "responses": ["ok"],
+                "turn_count": 3,
+                "conversation_input_tokens": 120,
+                "recursive_input_tokens": 300,
+                "recursive_output_tokens": 40,
+                "tokens_in": 300,
+                "tokens_out": 40,
+            }
+
+            def fake_run(cmd, **kwargs):
+                if "--file-edit" not in cmd:
+                    return unittest.mock.Mock(returncode=1, stdout="", stderr="")
+                backup = Path(cmd[cmd.index("--file-edit") + 1])
+                backup.write_text("edited history", encoding="utf-8")
+                return unittest.mock.Mock(
+                    returncode=0, stdout=json.dumps(child_payload), stderr=""
+                )
+
+            stdout = io.StringIO()
+            with unittest.mock.patch.object(self.mod.subprocess, "run", fake_run):
+                with unittest.mock.patch.object(sys, "stdout", stdout):
+                    code = self.mod.edit_conversation(
+                        conversation,
+                        root,
+                        NAGENT.resolve(),
+                        "user",
+                        "conv",
+                        "4242",
+                        None,
+                        "remove noise",
+                        "openai",
+                        "gpt-5.5",
+                        None,
+                        json_mode=True,
+                    )
+
+            self.assertEqual(code, 0)
+            payload = json.loads(stdout.getvalue())
+            self.assertEqual(payload["turn_count"], 3)
+            self.assertEqual(payload["tokens_in"], 300)
+            self.assertEqual(payload["tokens_out"], 40)
+            self.assertEqual(payload["conversation_input_tokens"], 120)
+
+    def test_compact_prompt_path_prefers_root_copy(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self.assertEqual(self.mod.compact_prompt_path(root), self.mod.COMPACT_PROMPT_PATH)
+
+            user_prompt = root / "prompts" / "compact-conversation.md"
+            user_prompt.parent.mkdir(parents=True)
+            user_prompt.write_text("custom guidance", encoding="utf-8")
+            self.assertEqual(self.mod.compact_prompt_path(root), user_prompt)
 
 
 class InitialTextTests(unittest.TestCase):
@@ -1147,6 +1336,43 @@ class InitialTextTests(unittest.TestCase):
         self.assertIn("<nagent-conversation>{prompt}</nagent-conversation>", text)
         self.assertNotIn("<nagent-agent>", text)
         self.assertNotIn("User invocation:", text)
+
+    def test_install_context_injected_before_root_context(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            install = Path(tmp) / "install"
+            (install / "bin").mkdir(parents=True)
+            (install / "context").mkdir()
+            (install / "context" / "rules.md").write_text(
+                "install context rules", encoding="utf-8"
+            )
+            (install / "context.yaml").write_text("- context/rules.md\n", encoding="utf-8")
+            root = Path(tmp) / "root"
+            root.mkdir()
+            (root / "context.md").write_text("root context body", encoding="utf-8")
+
+            text = self.mod.build_initial_context(
+                root,
+                install / "bin" / "nagent",
+                "user",
+                "conv",
+            )
+
+            self.assertIn("install context rules", text)
+            self.assertIn("root context body", text)
+            self.assertLess(
+                text.index("install context rules"), text.index("root context body")
+            )
+
+    def test_repo_context_yaml_delivers_design_rules(self):
+        # The shipped context.yaml routes context/data-oriented-design.md into
+        # every initial context built from this checkout.
+        text = self.mod.build_initial_context(
+            Path("/tmp/nagent-root"),
+            NAGENT.resolve(),
+            "user",
+            "conv",
+        )
+        self.assertIn("Data-Oriented Design", text)
 
     def test_git_repo_context_outside_repo(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1273,6 +1499,34 @@ class RefreshInitialContextTests(unittest.TestCase):
             self.assertNotIn("/old/path", contents)
             self.assertIn("<user-prompt>", contents)
             self.assertIn("hello", contents)
+
+    def test_refresh_initial_context_preserves_backslashes_in_new_context(self):
+        # Rebuilt context can contain backslash sequences (file summaries,
+        # root context, uname output). They must be inserted literally, not
+        # interpreted as re replacement escapes like \s or \g<0>.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            conversation_file = root / "conv"
+            conversation_file.write_text(
+                "<initial_context>\nold\n</initial_context>\n<user-prompt>\nhello\n</user-prompt>\n",
+                encoding="utf-8",
+            )
+            new_context = "<initial_context>\nuses \\s and \\g<0> in parsing\n</initial_context>"
+            with unittest.mock.patch.object(
+                self.mod,
+                "build_initial_context",
+                return_value=new_context,
+            ):
+                self.mod.refresh_initial_context(
+                    conversation_file,
+                    root,
+                    NAGENT.resolve(),
+                    "user",
+                    "conv",
+                )
+            contents = conversation_file.read_text(encoding="utf-8")
+            self.assertIn("uses \\s and \\g<0> in parsing", contents)
+            self.assertNotIn("old", contents.split("<user-prompt>")[0])
 
     def test_refresh_initial_context_prepends_when_missing(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1554,7 +1808,10 @@ class CliTests(unittest.TestCase):
             )
 
             self.assertEqual(result.returncode, 0, result.stderr)
-            self.assertEqual(current_file.read_text(encoding="utf-8"), "source history")
+            # The branched copy is loaded, then initial context is restored on load.
+            contents = current_file.read_text(encoding="utf-8")
+            self.assertTrue(contents.startswith("<initial_context>"))
+            self.assertTrue(contents.endswith("source history"))
             lines = result.stdout.strip().splitlines()
             self.assertTrue(lines[0].startswith("archived:"))
             self.assertEqual(lines[1], f"loaded:{source_file}")
@@ -1909,6 +2166,143 @@ class NagentLlmConfigTests(unittest.TestCase):
         self.assertEqual(result.text, "cursor ok")
         self.assertEqual(result.input_tokens, self.mod.estimate_token_count("hello cursor"))
         self.assertEqual(result.output_tokens, self.mod.estimate_token_count("cursor ok"))
+
+    def _fake_claude_code_package(self, messages, captured_options):
+        import asyncio
+
+        class FakeTextBlock:
+            def __init__(self, text):
+                self.text = text
+
+        class FakeAssistantMessage:
+            def __init__(self, blocks):
+                self.content = blocks
+
+        class FakeResultMessage:
+            def __init__(self, result, usage=None, is_error=False, errors=None):
+                self.result = result
+                self.usage = usage
+                self.is_error = is_error
+                self.errors = errors
+
+        class FakeOptions:
+            def __init__(self, **kwargs):
+                captured_options.update(kwargs)
+
+        class FakeAnyio:
+            @staticmethod
+            def run(fn):
+                return asyncio.run(fn())
+
+        def fake_query(*, prompt, options):
+            async def iterate():
+                for message in messages(FakeAssistantMessage, FakeTextBlock, FakeResultMessage):
+                    yield message
+
+            return iterate()
+
+        return (
+            FakeAnyio,
+            fake_query,
+            FakeOptions,
+            FakeAssistantMessage,
+            FakeResultMessage,
+            FakeTextBlock,
+        ), FakeResultMessage
+
+    def test_claude_code_text_generation_uses_result_and_usage(self):
+        captured_options: dict = {}
+
+        def messages(FakeAssistantMessage, FakeTextBlock, FakeResultMessage):
+            return [
+                FakeAssistantMessage([FakeTextBlock("partial")]),
+                FakeResultMessage("claude-code ok", usage={"input_tokens": 21, "output_tokens": 5}),
+            ]
+
+        package, _ = self._fake_claude_code_package(messages, captured_options)
+        with unittest.mock.patch.object(self.mod, "require_package", return_value=package):
+            result = self.mod.generate_text_with_usage("hello", "claude-code", "default")
+
+        self.assertEqual(result.text, "claude-code ok")
+        self.assertEqual(result.input_tokens, 21)
+        self.assertEqual(result.output_tokens, 5)
+        # "default" model means: let Claude Code use its configured model.
+        self.assertIsNone(captured_options["model"])
+        self.assertEqual(captured_options["max_turns"], 1)
+        self.assertEqual(captured_options["tools"], [])
+
+    def test_claude_code_missing_model_means_default(self):
+        # Not specifying a model behaves exactly like specifying "default".
+        for model in (None, ""):
+            captured_options: dict = {}
+
+            def messages(FakeAssistantMessage, FakeTextBlock, FakeResultMessage):
+                return [FakeResultMessage("ok")]
+
+            package, _ = self._fake_claude_code_package(messages, captured_options)
+            with unittest.mock.patch.object(self.mod, "require_package", return_value=package):
+                result = self.mod.generate_text_with_usage("hello", "claude-code", model)
+
+            self.assertEqual(result.text, "ok")
+            self.assertIsNone(captured_options["model"], f"model={model!r}")
+
+    def test_claude_code_explicit_model_and_text_fallback(self):
+        captured_options: dict = {}
+
+        def messages(FakeAssistantMessage, FakeTextBlock, FakeResultMessage):
+            return [
+                FakeAssistantMessage([FakeTextBlock("from blocks")]),
+                FakeResultMessage(None),
+            ]
+
+        package, _ = self._fake_claude_code_package(messages, captured_options)
+        with unittest.mock.patch.object(self.mod, "require_package", return_value=package):
+            result = self.mod.generate_text_with_usage("hello", "claude-code", "claude-opus-4-8")
+
+        self.assertEqual(result.text, "from blocks")
+        self.assertEqual(captured_options["model"], "claude-opus-4-8")
+
+    def test_claude_code_error_result_raises(self):
+        captured_options: dict = {}
+
+        def messages(FakeAssistantMessage, FakeTextBlock, FakeResultMessage):
+            return [FakeResultMessage(None, is_error=True, errors=["login required"])]
+
+        package, _ = self._fake_claude_code_package(messages, captured_options)
+        with unittest.mock.patch.object(self.mod, "require_package", return_value=package):
+            with self.assertRaisesRegex(RuntimeError, "login required"):
+                self.mod.generate_text_with_usage("hello", "claude-code", "default")
+
+    def test_claude_code_upload_allows_read_tool(self):
+        captured_options: dict = {}
+
+        def messages(FakeAssistantMessage, FakeTextBlock, FakeResultMessage):
+            return [FakeResultMessage("file summary", usage={"input_tokens": 9, "output_tokens": 3})]
+
+        package, _ = self._fake_claude_code_package(messages, captured_options)
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / "diagram.txt"
+            target.write_text("content", encoding="utf-8")
+            with unittest.mock.patch.object(self.mod, "require_package", return_value=package):
+                result = self.mod.generate_with_upload_usage(
+                    target, "Explain this file.", "claude-code", "default"
+                )
+
+        self.assertEqual(result.text, "file summary")
+        self.assertEqual(captured_options["allowed_tools"], ["Read"])
+        self.assertEqual(captured_options["tools"], ["Read"])
+        self.assertIsNone(captured_options["max_turns"])
+
+    def test_claude_code_requires_no_credential_env(self):
+        env = os.environ.copy()
+        env.pop("ANTHROPIC_API_KEY", None)
+        with unittest.mock.patch.dict(os.environ, env, clear=True):
+            # Must not sys.exit: claude-code auth is the local Claude Code login.
+            self.mod.require_credentials("claude-code")
+
+    def test_claude_code_list_models_raises_with_guidance(self):
+        with self.assertRaisesRegex(RuntimeError, "does not expose a model list"):
+            self.mod.list_models("claude-code")
 
     def test_gemini_provider_alias_resolves_to_google(self):
         with tempfile.TemporaryDirectory() as tmp:

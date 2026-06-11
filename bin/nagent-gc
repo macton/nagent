@@ -1,0 +1,150 @@
+#!/usr/bin/python3
+
+import argparse
+import os
+import sys
+from pathlib import Path
+
+HELPERS_DIR = Path(__file__).resolve().parent / "helpers"
+sys.path.insert(0, str(HELPERS_DIR))
+from nagent_cli import WaitSpinner, emit_json, exit_on_description
+from nagent_llm import add_llm_arguments, generate_text, resolve_from_args
+from nagent_gc_lib import run_gc
+
+
+def wait_spinner(message: str) -> WaitSpinner:
+    return WaitSpinner(message, enabled=not os.environ.get("NAGENT_NO_SPINNER"))
+
+
+def print_progress(message: str) -> None:
+    # Progress goes to stderr so stdout stays clean for the report and --json.
+    print(message, file=sys.stderr)
+
+NAGENT_GC_DESCRIPTION = """\
+Reclaim dead nagent artifacts after distilling their knowledge.
+Classifies conversation archives, delegated sub-conversations, orphaned
+per-file conversations, and stale split directories; harvests facts,
+decisions, tasks, questions, and playbooks from dead conversations into
+editable files under {root}/knowledge/, then deletes the originals. Dry-run
+by default; pass --apply to mutate. Use when the nagent root has grown or
+when past-session knowledge should be folded into context."""
+
+
+def format_size(size_bytes: int) -> str:
+    if size_bytes >= 1024 * 1024:
+        return f"{size_bytes / (1024 * 1024):.1f}MB"
+    if size_bytes >= 1024:
+        return f"{size_bytes / 1024:.1f}KB"
+    return f"{size_bytes}B"
+
+
+def print_report(report: dict) -> None:
+    actionable = [a for a in report["artifacts"] if a["class"] in ("harvest", "prune")]
+    if actionable:
+        width = max(len(a["class"]) for a in actionable)
+        for artifact in actionable:
+            print(
+                f"{artifact['class']:<{width}}  {format_size(artifact['size_bytes']):>9}  "
+                f"{artifact['path']}  ({artifact['reason']})"
+            )
+    totals = report["totals"]
+    summary = ", ".join(f"{klass}:{count}" for klass, count in sorted(totals.items()))
+    print(f"artifacts: {summary}")
+    print(
+        f"harvest candidates: {format_size(report['harvest_candidate_bytes'])} "
+        f"(~{report['estimated_harvest_input_tokens']} input tokens), "
+        f"prune candidates: {format_size(report['prune_candidate_bytes'])}"
+    )
+
+    if not report["apply"]:
+        print("dry run; pass --apply to harvest and reclaim")
+        return
+
+    items = report.get("harvested_items", {})
+    item_summary = ", ".join(f"{category}:{count}" for category, count in sorted(items.items()) if count)
+    print(f"reclaimed: {format_size(report.get('reclaimed_bytes', 0))}")
+    print(f"harvested items: {item_summary or 'none'}")
+    if report.get("pruned_index_entries"):
+        print(f"pruned index entries: {report['pruned_index_entries']}")
+    if report.get("deferred"):
+        print(f"deferred (over --max-harvest-bytes): {report['deferred']}")
+    for failure in report.get("failures", []):
+        print(f"failed: {failure['path']}: {failure['error']}", file=sys.stderr)
+    if report.get("digest_path"):
+        print(f"digest: {report['digest_path']}")
+    print(f"ledger: {report['ledger_path']}")
+
+
+def main() -> int:
+    exit_on_description(NAGENT_GC_DESCRIPTION)
+
+    parser = argparse.ArgumentParser(
+        description=(
+            "Classify nagent artifacts, harvest knowledge from dead conversations "
+            "into {root}/knowledge/, and reclaim space. Dry-run by default."
+        ),
+    )
+    parser.add_argument(
+        "--root",
+        default="~/.nagent",
+        help="nagent root directory (default: ~/.nagent).",
+    )
+    parser.add_argument(
+        "--apply",
+        action="store_true",
+        help="Actually harvest and delete; without this flag nothing is mutated.",
+    )
+    parser.add_argument(
+        "--no-harvest",
+        action="store_true",
+        help="Delete dead conversations without the LLM harvest pass.",
+    )
+    parser.add_argument(
+        "--max-harvest-bytes",
+        type=int,
+        metavar="N",
+        help="Cap the conversation bytes sent to the LLM this run; the rest is deferred.",
+    )
+    parser.add_argument(
+        "--json",
+        action="store_true",
+        help="Print the full report as JSON instead of plain text.",
+    )
+    add_llm_arguments(parser)
+    args = parser.parse_args()
+
+    root = Path(args.root).expanduser()
+    if not root.is_dir():
+        print(f"Error: nagent root not found: {root}", file=sys.stderr)
+        return 1
+
+    harvest = not args.no_harvest
+    provider = model = None
+    config_path = args.config.expanduser() if args.config else None
+    if args.apply and harvest:
+        provider, model = resolve_from_args(args)
+
+    report = run_gc(
+        root,
+        apply=args.apply,
+        harvest=harvest,
+        max_harvest_bytes=args.max_harvest_bytes,
+        provider=provider,
+        model=model,
+        config_path=config_path,
+        generate=generate_text,
+        spinner=wait_spinner,
+        progress=print_progress if args.apply else None,
+    )
+
+    if args.json:
+        emit_json(report)
+    else:
+        print_report(report)
+    if report.get("failures"):
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

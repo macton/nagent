@@ -18,7 +18,7 @@ from typing import Literal
 HELPERS_DIR = Path(__file__).resolve().parent / "helpers"
 sys.path.insert(0, str(HELPERS_DIR))
 from nagent_llm import PROVIDERS, generate_text, list_models, require_credentials, resolve_provider, resolve_settings
-from nagent_cli import collect_bin_tool_descriptions, emit_json, exit_on_description, WaitSpinner
+from nagent_cli import collect_bin_tool_descriptions, default_pid, emit_json, exit_on_description, WaitSpinner
 from nagent_file_edit_lib import (
     file_id_for_path,
     is_split_segment_for_source,
@@ -28,6 +28,16 @@ from nagent_file_edit_lib import (
 )
 from nagent_file_patch_lib import apply_segment_patches
 from nagent_file_split_lib import slugify
+from nagent_gc_lib import digest_path, file_knowledge_path, knowledge_item_counts, root_size_bytes
+from nagent_tags import (
+    TagParseError,
+    extract_block,
+    find_block_span,
+    parse_tag_document,
+    remove_first_block,
+    replace_first_block,
+    unwrap_whole_element,
+)
 
 NAGENT_DESCRIPTION = """\
 Structured conversation orchestrator for terminal workflows.
@@ -40,22 +50,19 @@ sub-conversation tasks."""
 Invocation = Literal["user", "delegated"]
 TagType = Literal["response", "read", "file_read", "file_patch", "write", "shell", "next", "conversation"]
 
-TAG_PATTERNS: list[tuple[TagType, re.Pattern[str]]] = [
-    ("response", re.compile(r"<nagent-response>(.*?)</nagent-response>", re.DOTALL)),
-    ("read", re.compile(r'<nagent-read\s+path="([^"]*)"\s*/>')),
-    ("file_read", re.compile(r'<nagent-file-read\s+path="([^"]*)"\s*/>')),
-    ("file_patch", re.compile(r'<nagent-file-patch\s+index="([^"]*)"\s*/>')),
-    ("write", re.compile(r'<nagent-write\s+path="([^"]*)">(.*?)</nagent-write>', re.DOTALL)),
-    ("shell", re.compile(r"<nagent-shell>(.*?)</nagent-shell>", re.DOTALL)),
-    ("next", re.compile(r"<nagent-next>(.*?)</nagent-next>", re.DOTALL)),
-    (
-        "conversation",
-        re.compile(
-            r'<nagent-conversation((?:\s+[A-Za-z-]+="[^"]*")*)\s*>(.*?)</nagent-conversation>',
-            re.DOTALL,
-        ),
-    ),
-]
+# Protocol tag names -> NagentTag.kind. Shapes are validated in parse_response;
+# tokenization lives in nagent_tags (the protocol is XML-ish, not XML: bodies
+# are raw text, so a strict XML parser would reject valid output).
+TAG_KINDS: dict[str, TagType] = {
+    "nagent-response": "response",
+    "nagent-read": "read",
+    "nagent-file-read": "file_read",
+    "nagent-file-patch": "file_patch",
+    "nagent-write": "write",
+    "nagent-shell": "shell",
+    "nagent-next": "next",
+    "nagent-conversation": "conversation",
+}
 
 READ_SPLIT_THRESHOLD_BYTES = 64 * 1024
 NAGENT_FILE_SPLIT = Path(__file__).resolve().parent / "nagent-file-split"
@@ -71,15 +78,11 @@ _spinner_enabled = True
 # Whole-output wrappers that may accidentally be nested inside
 # <nagent-response>.  These are internal protocol details and should not be
 # printed to the human user.
-USER_VISIBLE_WRAPPER_PATTERNS: list[re.Pattern[str]] = [
-    re.compile(r"\A\s*<nagent-response>(.*?)</nagent-response>\s*\Z", re.DOTALL),
-    re.compile(r"\A\s*<agent-response>(.*?)</agent-response>\s*\Z", re.DOTALL),
-]
+USER_VISIBLE_WRAPPER_NAMES = ("nagent-response", "agent-response")
 
 MARKDOWN_FENCE_PATTERN = re.compile(r"\A\s*```[^\n`]*\n(.*?)\n```\s*\Z", re.DOTALL)
-INITIAL_CONTEXT_PATTERN = re.compile(r"<initial_context>.*?</initial_context>", re.DOTALL)
+INITIAL_CONTEXT_BLOCK = "initial_context"
 NAGENT_PREAMBLE = "You are nagent, a structured conversation loop."
-TAG_ATTRIBUTE_PATTERN = re.compile(r'\s+([A-Za-z-]+)="([^"]*)"')
 
 
 @dataclass
@@ -255,6 +258,15 @@ def load_context_path(root: Path, path: Path, seen: set[Path]) -> str:
         ]
         return "\n".join(part for part in parts if part)
     return content
+
+
+def load_context_file(path: Path) -> str:
+    if not path.is_file():
+        return ""
+    try:
+        return path.read_text(encoding="utf-8").strip()
+    except OSError:
+        return ""
 
 
 def load_root_context(root: Path) -> str:
@@ -500,7 +512,7 @@ def format_file_history(
     lines.extend(["", "Files edited in the same commits:"])
     coedited = coedited_file_rows(repo_root, rel_path, commits)
     if coedited:
-        lines.extend(["| file | commits together | P(other file changed | target file changed) |", "| --- | ---: | --- |"])
+        lines.extend(["| file | commits together | historical co-edit rate |", "| --- | ---: | --- |"])
         for changed, count, likelihood in coedited:
             lines.append(f"| {changed} | {count} | {likelihood} |")
         lines.extend(
@@ -622,6 +634,11 @@ def build_initial_context(
     git_section = f"\n{git_context}" if git_context else ""
     tools_section = collect_bin_tool_descriptions(process_path.parent)
     tools_block = f"\n\n{tools_section}" if tools_section else ""
+    # Install context ships with the nagent folder itself (context.yaml or
+    # context.md next to bin/); it is injected before the per-root context so
+    # root context can override or extend it.
+    install_context = load_root_context(process_path.resolve().parent.parent)
+    install_context_block = f"\n{install_context}\n" if install_context else ""
     root_context = load_root_context(root)
     root_context_block = f"\n{root_context}\n" if root_context else ""
     if file_edit_path is not None:
@@ -644,6 +661,12 @@ def build_initial_context(
         )
         if file_edit_details:
             file_edit_detail_block = f"\n{file_edit_details}\n"
+        file_knowledge = load_context_file(file_knowledge_path(root, file_edit_id)) if file_edit_id else ""
+        if file_knowledge:
+            file_edit_detail_block += f"\n{{file-knowledge}}\n{file_knowledge}\n{{/file-knowledge}}\n"
+
+    knowledge_digest = load_context_file(digest_path(root))
+    knowledge_block = f"\n{{knowledge}}\n{knowledge_digest}\n{{/knowledge}}\n" if knowledge_digest else ""
 
     return f"""<initial_context>
 {NAGENT_PREAMBLE}
@@ -693,7 +716,7 @@ Use <nagent-conversation> to delegate a sub-task to a separate nagent sub-conver
 Optional <nagent-conversation> parameters: conversation-file loads a specific --conversation file; conversation-name loads a saved conversation like --load-conversation.
 
 {file_edit_detail_block}
-{root_context_block}
+{install_context_block}{root_context_block}{knowledge_block}
 {role_instructions}
 </initial_context>"""
 
@@ -734,8 +757,7 @@ def refresh_initial_context(
     config_path: Path | None = None,
 ) -> None:
     content = conversation_file.read_text(encoding="utf-8")
-    existing_context_match = INITIAL_CONTEXT_PATTERN.search(content)
-    previous_initial_context = existing_context_match.group(0) if existing_context_match else None
+    previous_initial_context = extract_block(content, INITIAL_CONTEXT_BLOCK)
     updated_context = build_initial_context(
         root,
         process_path,
@@ -749,8 +771,10 @@ def refresh_initial_context(
         config_path,
         previous_initial_context,
     )
-    if INITIAL_CONTEXT_PATTERN.search(content):
-        content = INITIAL_CONTEXT_PATTERN.sub(updated_context, content, count=1)
+    if previous_initial_context is not None:
+        # Verbatim splice: replace_first_block has no escape semantics, so
+        # backslash sequences in the rebuilt context survive untouched.
+        content = replace_first_block(content, INITIAL_CONTEXT_BLOCK, updated_context)
     else:
         content = f"{updated_context}\n\n{content}"
     conversation_file.write_text(content, encoding="utf-8")
@@ -769,7 +793,7 @@ def ensure_initial_context(
     if not conversation_file.is_file():
         return
     content = conversation_file.read_text(encoding="utf-8")
-    if INITIAL_CONTEXT_PATTERN.search(content):
+    if find_block_span(content, INITIAL_CONTEXT_BLOCK) is not None:
         return
     block = build_initial_context(
         root,
@@ -784,84 +808,66 @@ def ensure_initial_context(
     conversation_file.write_text(content, encoding="utf-8")
 
 
-def default_pid() -> str:
-    # In screen, STY and WINDOW identify the current virtual terminal more
-    # stably than the shell process. BASHPID is not exported by bash by default;
-    # fall back to the parent shell process id so repeated terminal invocations
-    # share one conversation.
-    if os.environ.get("STY"):
-        return f"{os.environ['STY']}-{os.environ.get('WINDOW', '')}"
-    return os.environ.get("BASHPID") or str(os.getppid())
-
-
 def default_conversation_name(pid: str) -> str:
     hostname = socket.gethostname()
     return f"latest-{hostname}-{pid}"
 
 
 def parse_response(text: str) -> tuple[list[NagentTag] | None, str | None]:
-    tags: list[NagentTag] = []
-    pos = 0
-    length = len(text)
+    try:
+        nodes = parse_tag_document(text)
+    except TagParseError as exc:
+        snippet = text[exc.offset : exc.offset + 80].replace("\n", "\\n")
+        return None, f"Unexpected content at offset {exc.offset}: {exc.message} near {snippet!r}"
 
-    while pos < length:
-        while pos < length and text[pos].isspace():
-            pos += 1
-        if pos >= length:
-            break
-
-        matched = False
-        for kind, pattern in TAG_PATTERNS:
-            match = pattern.match(text, pos)
-            if not match:
-                continue
-
-            if kind == "read" or kind == "file_read" or kind == "file_patch":
-                tags.append(NagentTag(kind=kind, content="", path=match.group(1)))
-            elif kind in ("write",):
-                tags.append(NagentTag(kind=kind, content=match.group(2), path=match.group(1)))
-            elif kind == "conversation":
-                attr_text = match.group(1)
-                attrs: dict[str, str] = {}
-                consumed = 0
-                for attr_match in TAG_ATTRIBUTE_PATTERN.finditer(attr_text):
-                    if attr_match.start() != consumed:
-                        return None, f"Invalid attributes for <nagent-conversation>: {attr_text!r}"
-                    attr_name = attr_match.group(1)
-                    if attr_name not in ("conversation-file", "conversation-name"):
-                        return None, f"Unsupported <nagent-conversation> attribute: {attr_name}"
-                    if attr_name in attrs:
-                        return None, f"Duplicate <nagent-conversation> attribute: {attr_name}"
-                    attrs[attr_name] = attr_match.group(2)
-                    consumed = attr_match.end()
-                if consumed != len(attr_text):
-                    return None, f"Invalid attributes for <nagent-conversation>: {attr_text!r}"
-                if "conversation-file" in attrs and "conversation-name" in attrs:
-                    return None, (
-                        "<nagent-conversation> supports only one of conversation-file "
-                        "or conversation-name"
-                    )
-                tags.append(
-                    NagentTag(
-                        kind=kind,
-                        content=match.group(2),
-                        conversation_file=attrs.get("conversation-file"),
-                        conversation_name=attrs.get("conversation-name"),
-                    )
-                )
-            else:
-                tags.append(NagentTag(kind=kind, content=match.group(1)))
-
-            pos = match.end()
-            matched = True
-            break
-
-        if not matched:
-            snippet = text[pos : pos + 80].replace("\n", "\\n")
-            return None, f"Unexpected content at offset {pos}: {snippet!r}"
-
-    if not tags:
+    if not nodes:
         return None, "Response contains no nagent tags."
+
+    tags: list[NagentTag] = []
+    for node in nodes:
+        kind = TAG_KINDS.get(node.name)
+        if kind is None:
+            snippet = text[node.start : node.start + 80].replace("\n", "\\n")
+            return None, f"Unexpected content at offset {node.start}: unsupported tag near {snippet!r}"
+
+        if kind in ("response", "shell", "next"):
+            if node.self_closing:
+                return None, f"<{node.name}> requires a body, not a self-closing tag"
+            if node.attrs:
+                return None, f"<{node.name}> does not take attributes"
+            tags.append(NagentTag(kind=kind, content=node.content))
+        elif kind in ("read", "file_read", "file_patch"):
+            attr = "index" if kind == "file_patch" else "path"
+            if not node.self_closing:
+                return None, f'<{node.name}> must be self-closing: <{node.name} {attr}="..." />'
+            if set(node.attrs) != {attr}:
+                return None, f'<{node.name}> requires exactly one {attr}="..." attribute'
+            tags.append(NagentTag(kind=kind, content="", path=node.attrs[attr]))
+        elif kind == "write":
+            if node.self_closing:
+                return None, "<nagent-write> requires file content between open and close tags"
+            if set(node.attrs) != {"path"}:
+                return None, '<nagent-write> requires exactly one path="..." attribute'
+            tags.append(NagentTag(kind=kind, content=node.content, path=node.attrs["path"]))
+        else:  # conversation
+            if node.self_closing:
+                return None, "<nagent-conversation> requires a prompt body"
+            for attr_name in node.attrs:
+                if attr_name not in ("conversation-file", "conversation-name"):
+                    return None, f"Unsupported <nagent-conversation> attribute: {attr_name}"
+            if "conversation-file" in node.attrs and "conversation-name" in node.attrs:
+                return None, (
+                    "<nagent-conversation> supports only one of conversation-file "
+                    "or conversation-name"
+                )
+            tags.append(
+                NagentTag(
+                    kind=kind,
+                    content=node.content,
+                    conversation_file=node.attrs.get("conversation-file"),
+                    conversation_name=node.attrs.get("conversation-name"),
+                )
+            )
 
     return tags, None
 
@@ -888,10 +894,10 @@ def clean_user_output(text: str) -> str:
             changed = True
             continue
 
-        for pattern in USER_VISIBLE_WRAPPER_PATTERNS:
-            wrapper_match = pattern.match(cleaned)
-            if wrapper_match:
-                cleaned = wrapper_match.group(1).strip()
+        for wrapper_name in USER_VISIBLE_WRAPPER_NAMES:
+            unwrapped = unwrap_whole_element(cleaned, wrapper_name)
+            if unwrapped is not None:
+                cleaned = unwrapped.strip()
                 changed = True
                 break
 
@@ -999,7 +1005,10 @@ def execute_read(path: str) -> str:
             f'<nagent-read-result path="{path}" error="file too large; use '
             f'<nagent-file-read path=&quot;{path}&quot;/> instead" />'
         )
-    content = file_path.read_text(encoding="utf-8")
+    try:
+        content = file_path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError) as exc:
+        return f'<nagent-read-result path="{path}" error="{exc}" />'
     return f'<nagent-read-result path="{path}">\n{content}\n</nagent-read-result>'
 
 
@@ -1010,7 +1019,10 @@ def execute_file_read(path: str, root: Path) -> str:
 
     size = file_path.stat().st_size
     if size <= READ_SPLIT_THRESHOLD_BYTES:
-        content = file_path.read_text(encoding="utf-8")
+        try:
+            content = file_path.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError) as exc:
+            return f'<nagent-file-read-result path="{path}" error="{exc}" />'
         return (
             f'<nagent-file-read-result path="{path}" mode="inline" size_bytes="{size}">\n'
             f"{content}\n</nagent-file-read-result>"
@@ -1030,20 +1042,27 @@ def execute_file_read(path: str, root: Path) -> str:
         error = result.stderr.strip() or result.stdout.strip() or "nagent-file-split failed"
         return f'<nagent-file-read-result path="{path}" error="{error}" />'
 
-    payload = json.loads(result.stdout)
-    segments = payload.get("segments", [])
-    segment_lines = "\n".join(
-        f'- segment {segment["segment_index"]}: lines {segment["start_line_num"]}-'
-        f'{segment["end_line_num"]} at {segment["path"]}'
-        for segment in segments
-    )
+    try:
+        payload = json.loads(result.stdout)
+        segment_lines = "\n".join(
+            f'- segment {segment["segment_index"]}: lines {segment["start_line_num"]}-'
+            f'{segment["end_line_num"]} at {segment["path"]}'
+            for segment in payload.get("segments", [])
+        )
+        index_path = payload["index_path"]
+        segment_count = payload["segment_count"]
+    except (json.JSONDecodeError, KeyError, TypeError) as exc:
+        return (
+            f'<nagent-file-read-result path="{path}" '
+            f'error="invalid nagent-file-split output: {exc}" />'
+        )
     return (
         f'<nagent-file-read-result path="{path}" mode="split" size_bytes="{size}" '
-        f'index_path="{payload["index_path"]}" segment_count="{payload["segment_count"]}">\n'
+        f'index_path="{index_path}" segment_count="{segment_count}">\n'
         f"File exceeded {READ_SPLIT_THRESHOLD_BYTES} bytes and was split.\n"
-        f"index_path: {payload['index_path']}\n"
+        f"index_path: {index_path}\n"
         f"segments:\n{segment_lines}\n"
-        f"Edit segment files, then merge with: <nagent-file-patch index=\"{payload['index_path']}\"/>\n"
+        f"Edit segment files, then merge with: <nagent-file-patch index=\"{index_path}\"/>\n"
         f"</nagent-file-read-result>"
     )
 
@@ -1126,7 +1145,7 @@ def validate_write_path(
             "may be edited in this session"
         )
     try:
-        if is_tmp_path(file_path):
+        if is_tmp_path(file_path.expanduser()):
             return None
     except OSError:
         pass
@@ -1144,7 +1163,8 @@ def execute_write(
     if error is not None:
         return f'<nagent-write-result path="{path}" status="error">{error}</nagent-write-result>'
 
-    file_path = Path(path)
+    # Validation resolves "~"; write to the same expanded path, not a literal "~" directory.
+    file_path = Path(path).expanduser()
     try:
         file_path.parent.mkdir(parents=True, exist_ok=True)
         file_path.write_text(content, encoding="utf-8")
@@ -1606,10 +1626,14 @@ def print_conversation_status(
     conversation_file: Path,
     provider: str,
     model: str,
+    root: Path,
     *,
     json_mode: bool = False,
 ) -> None:
     size = conversation_file.stat().st_size if conversation_file.is_file() else 0
+    knowledge_counts = knowledge_item_counts(root)
+    knowledge_total = sum(knowledge_counts.values())
+    root_size = root_size_bytes(root)
     if json_mode:
         emit_json(
             {
@@ -1617,11 +1641,14 @@ def print_conversation_status(
                 "size": size,
                 "provider": provider,
                 "model": model,
+                "root_size_bytes": root_size,
+                "knowledge_items": knowledge_counts,
             }
         )
         return
     print(f"conversation:{conversation_file} size:{size}")
     print(f"provider:{provider} model:{model}")
+    print(f"knowledge_items:{knowledge_total} root_size_bytes:{root_size}")
 
 
 def print_save_conversation_result(
@@ -1804,10 +1831,9 @@ def edit_conversation(
         return 1
 
     archived_content = archived.read_text(encoding="utf-8")
-    context_match = INITIAL_CONTEXT_PATTERN.search(archived_content)
-    preserved_context = context_match.group(0) if context_match else None
+    preserved_context = extract_block(archived_content, INITIAL_CONTEXT_BLOCK)
     if preserved_context is not None:
-        stripped = INITIAL_CONTEXT_PATTERN.sub("", archived_content, count=1).lstrip("\n")
+        stripped = remove_first_block(archived_content, INITIAL_CONTEXT_BLOCK).lstrip("\n")
         archived.write_text(stripped, encoding="utf-8")
 
     command = [
@@ -1826,8 +1852,9 @@ def edit_conversation(
         command.extend(["--model", model])
     if config_path is not None:
         command.extend(["--config", str(config_path.expanduser())])
-    if json_mode:
-        command.append("--json")
+    # Always ask the child for JSON: its token accounting is data this
+    # invocation must roll up, in either output mode.
+    command.append("--json")
     command.append(prompt)
 
     with wait_spinner(spinner_message):
@@ -1838,6 +1865,23 @@ def edit_conversation(
         if result.stderr:
             print(result.stderr, end="", file=sys.stderr)
         return result.returncode
+
+    token_stats = TokenStats()
+    try:
+        child_payload = json.loads(result.stdout)
+    except json.JSONDecodeError:
+        child_payload = None
+    if isinstance(child_payload, dict):
+        token_stats.turn_count = coerce_token_count(child_payload.get("turn_count"))
+        token_stats.conversation_input_tokens = coerce_token_count(
+            child_payload.get("conversation_input_tokens")
+        )
+        token_stats.recursive_input_tokens = coerce_token_count(
+            child_payload.get("recursive_input_tokens") or child_payload.get("tokens_in")
+        )
+        token_stats.recursive_output_tokens = coerce_token_count(
+            child_payload.get("recursive_output_tokens") or child_payload.get("tokens_out")
+        )
 
     edited_body = archived.read_text(encoding="utf-8").lstrip("\n")
     if preserved_context is not None:
@@ -1858,14 +1902,28 @@ def edit_conversation(
         payload = {
             "conversation_path": str(conversation_file.resolve()),
             "edited_path": str(archived.resolve()),
+            **token_stats.as_dict(),
         }
+        payload["tokens_in"] = token_stats.recursive_input_tokens
+        payload["tokens_out"] = token_stats.recursive_output_tokens
         if loaded_archive is not None:
             payload["archived_path"] = str(loaded_archive.resolve())
         emit_json(payload)
     else:
         print(f"edited:{archived}")
         print(f"conversation:{conversation_file}")
+        print(token_stats.status_line())
     return 0
+
+
+def compact_prompt_path(root: Path) -> Path:
+    # The compaction prompt is user-editable data. A copy under the nagent
+    # root wins over the repo copy shipped next to the executable, and the
+    # repo copy keeps --compact working from a plain checkout.
+    user_prompt = root / "prompts" / "compact-conversation.md"
+    if user_prompt.is_file():
+        return user_prompt
+    return COMPACT_PROMPT_PATH
 
 
 def compact_conversation(
@@ -1885,7 +1943,7 @@ def compact_conversation(
     json_mode: bool = False,
 ) -> int:
     try:
-        compact_guidance = COMPACT_PROMPT_PATH.read_text(encoding="utf-8").strip()
+        compact_guidance = compact_prompt_path(root).read_text(encoding="utf-8").strip()
     except OSError as exc:
         print(f"Error: {exc}", file=sys.stderr)
         return 1
@@ -1965,7 +2023,7 @@ def resolve_initial_prompt(prompt_arg: str | list[str] | None) -> str | None:
     return prompt if prompt else None
 
 
-def main() -> None:
+def main() -> int:
     exit_on_description(NAGENT_DESCRIPTION)
 
     parser = argparse.ArgumentParser(description="Run the nagent conversation loop.")
@@ -2132,7 +2190,7 @@ def main() -> None:
         except ValueError as exc:
             print(f"Error: {exc}", file=sys.stderr)
             return 1
-        print_conversation_status(conversation_file, provider, model, json_mode=args.json)
+        print_conversation_status(conversation_file, provider, model, root, json_mode=args.json)
         return 0
 
     if args.list_file_edits:
@@ -2292,17 +2350,25 @@ def main() -> None:
         target = resolve_conversation_reference(root, args.save_conversation)
         try:
             saved = save_conversation(conversation_file, target)
-            summary = summarize_saved_conversation(saved, args.provider, args.model, args.config)
-            index_path = update_saved_conversations_index(
-                root,
-                pid,
-                args.save_conversation,
-                saved,
-                summary,
-            )
-        except (FileNotFoundError, RuntimeError) as exc:
+        except FileNotFoundError as exc:
             print(f"Error: {exc}", file=sys.stderr)
             return 1
+        # Saving is a file copy; the summary is best-effort metadata. A
+        # provider or credential failure must not leave the saved copy
+        # missing from the index.
+        try:
+            summary = summarize_saved_conversation(saved, args.provider, args.model, args.config)
+        except RuntimeError as exc:
+            error_line = str(exc).strip().splitlines()[0] if str(exc).strip() else "unknown error"
+            summary = f"(summary unavailable: {error_line})"
+            print(f"Warning: conversation summary unavailable: {error_line}", file=sys.stderr)
+        index_path = update_saved_conversations_index(
+            root,
+            pid,
+            args.save_conversation,
+            saved,
+            summary,
+        )
         print_save_conversation_result(
             conversation_file,
             saved,
@@ -2340,8 +2406,12 @@ def main() -> None:
     conversation_file.parent.mkdir(parents=True, exist_ok=True)
 
     if not cleared and not conversation_file.exists():
+        # Fresh conversation: build the full context exactly once. Provider and
+        # model are resolved at this point, so the file-edit history block is
+        # included; refreshing again would re-run tool discovery and git probes
+        # for nothing. Every delegated sub-conversation takes this path.
         conversation_file.write_text(
-            create_initial_text(
+            build_initial_context(
                 root,
                 process_path,
                 args.invocation,
@@ -2349,23 +2419,27 @@ def main() -> None:
                 args.parent_conversation,
                 file_edit_path,
                 file_edit_id,
-            ),
+                provider,
+                model,
+                args.config,
+            )
+            + "\n",
             encoding="utf-8",
         )
-
-    refresh_initial_context(
-        conversation_file,
-        root,
-        process_path,
-        args.invocation,
-        conversation_name,
-        args.parent_conversation,
-        file_edit_path,
-        file_edit_id,
-        provider,
-        model,
-        args.config,
-    )
+    else:
+        refresh_initial_context(
+            conversation_file,
+            root,
+            process_path,
+            args.invocation,
+            conversation_name,
+            args.parent_conversation,
+            file_edit_path,
+            file_edit_id,
+            provider,
+            model,
+            args.config,
+        )
 
     token_stats = TokenStats()
     try:

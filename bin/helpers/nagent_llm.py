@@ -8,21 +8,29 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
-PROVIDERS = ("openai", "anthropic", "google", "gemini", "cursor")
+PROVIDERS = ("openai", "anthropic", "google", "gemini", "cursor", "claude-code")
 PROVIDER_ALIASES = {"gemini": "google"}
+
+# For the claude-code provider, "default" means Claude Code's own configured
+# model: the SDK is invoked with model=None and Claude Code decides.
+CLAUDE_CODE_DEFAULT_MODEL = "default"
 
 DEFAULT_MODELS = {
     "openai": "gpt-5.5",
     "anthropic": "claude-sonnet-4-6",
     "google": "gemini-2.5-flash",
     "cursor": "composer-2.5",
+    "claude-code": CLAUDE_CODE_DEFAULT_MODEL,
 }
 
+# An empty tuple means the provider manages its own credentials; claude-code
+# uses the local Claude Code login (subscription or API key), not an env var.
 CREDENTIAL_ENV = {
     "openai": ("OPENAI_API_KEY",),
     "anthropic": ("ANTHROPIC_API_KEY",),
     "google": ("GOOGLE_API_KEY", "GEMINI_API_KEY"),
     "cursor": ("CURSOR_API_KEY",),
+    "claude-code": (),
 }
 
 PACKAGE_HINTS = {
@@ -30,6 +38,7 @@ PACKAGE_HINTS = {
     "anthropic": "anthropic",
     "google": "google-genai",
     "cursor": "cursor-sdk",
+    "claude-code": "claude-agent-sdk",
 }
 
 
@@ -110,6 +119,10 @@ def credential_env_var(provider: str) -> str | None:
 
 
 def require_credentials(provider: str) -> None:
+    if not CREDENTIAL_ENV[provider]:
+        # Provider manages its own credentials (e.g. claude-code uses the
+        # local Claude Code login); nothing to check here.
+        return
     env_var = credential_env_var(provider)
     if env_var is None:
         expected = " or ".join(CREDENTIAL_ENV[provider])
@@ -146,6 +159,19 @@ def require_package(provider: str):
         except ImportError:
             _missing_package(provider)
         return Agent, AgentOptions, LocalAgentOptions
+    if provider == "claude-code":
+        try:
+            import anyio
+            from claude_agent_sdk import (
+                AssistantMessage,
+                ClaudeAgentOptions,
+                ResultMessage,
+                TextBlock,
+                query,
+            )
+        except ImportError:
+            _missing_package(provider)
+        return anyio, query, ClaudeAgentOptions, AssistantMessage, ResultMessage, TextBlock
     raise ValueError(f"Unsupported provider: {provider}")
 
 
@@ -233,6 +259,13 @@ def list_models(provider: str) -> list[str]:
             raise RuntimeError("Cursor.models.list() returned no models.")
         return sorted(set(names))
 
+    if provider == "claude-code":
+        raise RuntimeError(
+            "claude-code does not expose a model list; pass --model with any "
+            "Claude model id or alias (e.g. sonnet, opus, haiku), or "
+            f"{CLAUDE_CODE_DEFAULT_MODEL!r} to use Claude Code's configured model."
+        )
+
     raise ValueError(f"Unsupported provider: {provider}")
 
 
@@ -285,6 +318,61 @@ def _result_with_usage(text: str, usage, input_text: str | None = None) -> LlmRe
     )
 
 
+def _claude_code_generate(
+    message: str,
+    model: str,
+    *,
+    allowed_tools: list[str] | None = None,
+    max_turns: int | None = 1,
+) -> LlmResult:
+    """Run one prompt through the local Claude Code via the Claude Agent SDK.
+
+    Authentication is Claude Code's own login (subscription or API key) —
+    no environment variable is read here. Tools are disabled by default so
+    this behaves as plain text generation; pass allowed_tools to permit
+    specific tools (e.g. Read for file analysis)."""
+    anyio, query, ClaudeAgentOptions, AssistantMessage, ResultMessage, TextBlock = require_package(
+        "claude-code"
+    )
+
+    # No model and "default" mean the same thing: Claude Code's configured model.
+    options = ClaudeAgentOptions(
+        model=None if not model or model == CLAUDE_CODE_DEFAULT_MODEL else model,
+        max_turns=max_turns,
+        tools=list(allowed_tools) if allowed_tools else [],
+        allowed_tools=list(allowed_tools) if allowed_tools else [],
+        cwd=os.getcwd(),
+    )
+
+    async def run_query():
+        texts: list[str] = []
+        result_message = None
+        async for sdk_message in query(prompt=message, options=options):
+            if isinstance(sdk_message, AssistantMessage):
+                for block in sdk_message.content:
+                    if isinstance(block, TextBlock):
+                        texts.append(block.text)
+            elif isinstance(sdk_message, ResultMessage):
+                result_message = sdk_message
+        return texts, result_message
+
+    texts, result_message = anyio.run(run_query)
+
+    if result_message is not None and result_message.is_error:
+        errors = getattr(result_message, "errors", None) or []
+        detail = errors[0] if errors else (result_message.result or "claude-code query failed")
+        raise RuntimeError(f"claude-code provider failed: {detail}")
+
+    text = ""
+    usage = None
+    if result_message is not None:
+        text = result_message.result or ""
+        usage = result_message.usage
+    if not text:
+        text = "\n".join(texts)
+    return _result_with_usage(text, usage, message)
+
+
 def generate_text_with_usage(message: str, provider: str, model: str) -> LlmResult:
     if provider == "openai":
         OpenAI = require_package(provider)
@@ -308,6 +396,9 @@ def generate_text_with_usage(message: str, provider: str, model: str) -> LlmResu
         client = genai.Client(api_key=api_key)
         response = client.models.generate_content(model=model, contents=message)
         return _result_with_usage(response.text or "", getattr(response, "usage_metadata", None), message)
+
+    if provider == "claude-code":
+        return _claude_code_generate(message, model)
 
     Agent, AgentOptions, LocalAgentOptions = require_package(provider)
     result = Agent.prompt(
@@ -339,6 +430,8 @@ def generate_with_upload_usage(path: Path, prompt: str, provider: str, model: st
         return _google_upload(path, prompt, model)
     if provider == "cursor":
         return LlmResult(text=_cursor_upload(path, prompt, model))
+    if provider == "claude-code":
+        return _claude_code_upload(path, prompt, model)
     raise ValueError(f"Unsupported provider: {provider}")
 
 
@@ -458,3 +551,14 @@ def _cursor_upload(path: Path, prompt: str, model: str) -> str:
         "Read the file and respond to the prompt."
     )
     return generate_text(message, "cursor", model)
+
+
+def _claude_code_upload(path: Path, prompt: str, model: str) -> LlmResult:
+    # Claude Code reads the file locally; permit only the Read tool and leave
+    # the turn count open so read-then-answer can complete.
+    message = (
+        f"{prompt}\n\n"
+        f"Analyze the file at this absolute path:\n{path.resolve()}\n"
+        "Read the file and respond to the prompt."
+    )
+    return _claude_code_generate(message, model, allowed_tools=["Read"], max_turns=None)

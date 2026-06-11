@@ -2,7 +2,6 @@
 
 import argparse
 import json
-import os
 import subprocess
 import sys
 from pathlib import Path
@@ -11,7 +10,7 @@ NAGENT = Path(__file__).resolve().parent / "nagent"
 
 HELPERS_DIR = Path(__file__).resolve().parent / "helpers"
 sys.path.insert(0, str(HELPERS_DIR))
-from nagent_cli import emit_json, exit_on_description
+from nagent_cli import default_pid, emit_json, exit_on_description
 from nagent_file_edit_lib import file_index_path, resolve_file_edit_conversation
 
 NAGENT_FILE_EDIT_DESCRIPTION = """\
@@ -20,10 +19,6 @@ Use when a parent nagent conversation (or you) needs to edit a project file
 without bloating the main conversation. Each file gets a stable file id and
 conversation under conversations/file-index-{pid}.json for continuity across
 edits."""
-
-
-def default_pid() -> str:
-    return os.environ.get("BASHPID") or str(os.getppid())
 
 
 def conversations_dir(root: Path) -> Path:

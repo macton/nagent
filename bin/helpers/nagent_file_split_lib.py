@@ -312,6 +312,22 @@ def py_score(end_idx: int, lines: list[Line], start_idx: int) -> int:
     return -1
 
 
+# Depth arrays are a pure function of the full lines list, but score functions
+# are called once per line. Compute each depth array once per lines list and
+# reuse it; the cached lines list is pinned by the entry, so an `is` check is
+# a safe identity test (one entry per depth function, bounded by one file).
+_depth_cache: dict[Callable[[list[Line]], list[int]], tuple[list[Line], list[int]]] = {}
+
+
+def _depths_for(lines: list[Line], compute: Callable[[list[Line]], list[int]]) -> list[int]:
+    entry = _depth_cache.get(compute)
+    if entry is not None and entry[0] is lines:
+        return entry[1]
+    depths = compute(lines)
+    _depth_cache[compute] = (lines, depths)
+    return depths
+
+
 def brace_depth(lines: list[Line]) -> list[int]:
     depths: list[int] = []
     depth = 0
@@ -326,7 +342,7 @@ def brace_depth(lines: list[Line]) -> list[int]:
 
 
 def cpp_score(end_idx: int, lines: list[Line], start_idx: int) -> int:
-    depths = brace_depth(lines)
+    depths = _depths_for(lines, brace_depth)
     _, text = lines[end_idx]
     stripped = text.strip()
     if stripped == "" and depths[end_idx] == 0:
@@ -341,7 +357,7 @@ def cpp_score(end_idx: int, lines: list[Line], start_idx: int) -> int:
 
 
 def js_score(end_idx: int, lines: list[Line], start_idx: int) -> int:
-    depths = brace_depth(lines)
+    depths = _depths_for(lines, brace_depth)
     _, text = lines[end_idx]
     stripped = text.strip()
     if stripped == "" and depths[end_idx] == 0:
@@ -371,7 +387,7 @@ def json_depth(lines: list[Line]) -> list[int]:
 
 
 def json_score(end_idx: int, lines: list[Line], start_idx: int) -> int:
-    depths = json_depth(lines)
+    depths = _depths_for(lines, json_depth)
     _, text = lines[end_idx]
     stripped = text.strip()
     if stripped == "" and depths[end_idx] == 0:
@@ -412,7 +428,7 @@ def go_score(end_idx: int, lines: list[Line], start_idx: int) -> int:
 
 
 def rs_score(end_idx: int, lines: list[Line], start_idx: int) -> int:
-    depths = brace_depth(lines)
+    depths = _depths_for(lines, brace_depth)
     _, text = lines[end_idx]
     stripped = text.strip()
     if stripped == "" and depths[end_idx] == 0:
@@ -427,7 +443,7 @@ def rs_score(end_idx: int, lines: list[Line], start_idx: int) -> int:
 
 
 def java_score(end_idx: int, lines: list[Line], start_idx: int) -> int:
-    depths = brace_depth(lines)
+    depths = _depths_for(lines, brace_depth)
     _, text = lines[end_idx]
     stripped = text.strip()
     if stripped == "" and depths[end_idx] == 0:
@@ -459,7 +475,7 @@ def xml_depth(lines: list[Line]) -> list[int]:
 
 
 def xml_score(end_idx: int, lines: list[Line], start_idx: int) -> int:
-    depths = xml_depth(lines)
+    depths = _depths_for(lines, xml_depth)
     _, text = lines[end_idx]
     stripped = text.strip()
     if stripped == "":
