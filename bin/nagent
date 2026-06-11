@@ -63,6 +63,7 @@ NAGENT_FILE_SUMMARIZE = Path(__file__).resolve().parent / "nagent-file-summarize
 SAVED_CONVERSATION_SUMMARY_WORD_COUNT = 50
 MAX_FORMAT_RETRIES = 3
 NAGENT_LLM_TEXT = Path(__file__).resolve().parent / "nagent-llm-text"
+COMPACT_PROMPT_PATH = Path(__file__).resolve().parent.parent / "prompts" / "compact-conversation.md"
 INTERRUPTED_MESSAGE = "Interrupted..."
 FILE_HISTORY_COMMIT_LIMIT = 50
 _spinner_enabled = True
@@ -77,6 +78,7 @@ USER_VISIBLE_WRAPPER_PATTERNS: list[re.Pattern[str]] = [
 
 MARKDOWN_FENCE_PATTERN = re.compile(r"\A\s*```[^\n`]*\n(.*?)\n```\s*\Z", re.DOTALL)
 INITIAL_CONTEXT_PATTERN = re.compile(r"<initial_context>.*?</initial_context>", re.DOTALL)
+NAGENT_PREAMBLE = "You are nagent, a structured conversation loop."
 TAG_ATTRIBUTE_PATTERN = re.compile(r'\s+([A-Za-z-]+)="([^"]*)"')
 
 
@@ -644,6 +646,7 @@ def build_initial_context(
             file_edit_detail_block = f"\n{file_edit_details}\n"
 
     return f"""<initial_context>
+{NAGENT_PREAMBLE}
 
 Respond only with one or more of these structured tags (no other text):
 - <nagent-response>{{text to respond to user}}</nagent-response>
@@ -714,9 +717,7 @@ def create_initial_text(
         file_edit_id,
     )
 
-    return f"""You are nagent, a structured conversation loop.
-{initial_context}
-"""
+    return f"{initial_context}\n"
 
 
 def refresh_initial_context(
@@ -752,6 +753,34 @@ def refresh_initial_context(
         content = INITIAL_CONTEXT_PATTERN.sub(updated_context, content, count=1)
     else:
         content = f"{updated_context}\n\n{content}"
+    conversation_file.write_text(content, encoding="utf-8")
+
+
+def ensure_initial_context(
+    conversation_file: Path,
+    root: Path,
+    process_path: Path,
+    invocation: Invocation,
+    conversation_name: str,
+    parent_conversation: str | None = None,
+    file_edit_path: Path | None = None,
+    file_edit_id: str | None = None,
+) -> None:
+    if not conversation_file.is_file():
+        return
+    content = conversation_file.read_text(encoding="utf-8")
+    if INITIAL_CONTEXT_PATTERN.search(content):
+        return
+    block = build_initial_context(
+        root,
+        process_path,
+        invocation,
+        conversation_name,
+        parent_conversation,
+        file_edit_path,
+        file_edit_id,
+    )
+    content = f"{block}\n\n{content}" if content.strip() else f"{block}\n"
     conversation_file.write_text(content, encoding="utf-8")
 
 
@@ -1758,6 +1787,7 @@ def edit_conversation(
     file_edit_id: str | None = None,
     *,
     json_mode: bool = False,
+    spinner_message: str = "Editing conversation",
 ) -> int:
     archived = clear_conversation(
         conversation_file,
@@ -1772,6 +1802,13 @@ def edit_conversation(
     if archived is None:
         print(f"Error: conversation not found: {conversation_file}", file=sys.stderr)
         return 1
+
+    archived_content = archived.read_text(encoding="utf-8")
+    context_match = INITIAL_CONTEXT_PATTERN.search(archived_content)
+    preserved_context = context_match.group(0) if context_match else None
+    if preserved_context is not None:
+        stripped = INITIAL_CONTEXT_PATTERN.sub("", archived_content, count=1).lstrip("\n")
+        archived.write_text(stripped, encoding="utf-8")
 
     command = [
         str(process_path),
@@ -1793,7 +1830,8 @@ def edit_conversation(
         command.append("--json")
     command.append(prompt)
 
-    result = subprocess.run(command, capture_output=True, text=True)
+    with wait_spinner(spinner_message):
+        result = subprocess.run(command, capture_output=True, text=True)
     if result.returncode != 0:
         if result.stdout:
             print(result.stdout, end="")
@@ -1801,7 +1839,21 @@ def edit_conversation(
             print(result.stderr, end="", file=sys.stderr)
         return result.returncode
 
+    edited_body = archived.read_text(encoding="utf-8").lstrip("\n")
+    if preserved_context is not None:
+        archived.write_text(f"{preserved_context}\n\n{edited_body}", encoding="utf-8")
+
     loaded_archive = load_conversation(conversation_file, archived)
+    ensure_initial_context(
+        conversation_file,
+        root,
+        process_path,
+        invocation,
+        conversation_name,
+        parent_conversation,
+        file_edit_path,
+        file_edit_id,
+    )
     if json_mode:
         payload = {
             "conversation_path": str(conversation_file.resolve()),
@@ -1814,6 +1866,53 @@ def edit_conversation(
         print(f"edited:{archived}")
         print(f"conversation:{conversation_file}")
     return 0
+
+
+def compact_conversation(
+    conversation_file: Path,
+    root: Path,
+    process_path: Path,
+    invocation: Invocation,
+    conversation_name: str,
+    pid: str,
+    parent_conversation: str | None,
+    provider: str | None,
+    model: str | None,
+    config_path: Path | None,
+    file_edit_path: Path | None = None,
+    file_edit_id: str | None = None,
+    *,
+    json_mode: bool = False,
+) -> int:
+    try:
+        compact_guidance = COMPACT_PROMPT_PATH.read_text(encoding="utf-8").strip()
+    except OSError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
+
+    prompt = (
+        f"{compact_guidance}\n\n"
+        "Compact this conversation now, following the guidance above. "
+        "Rewrite it in place so it is substantially smaller while preserving "
+        "future capability."
+    )
+    return edit_conversation(
+        conversation_file,
+        root,
+        process_path,
+        invocation,
+        conversation_name,
+        pid,
+        parent_conversation,
+        prompt,
+        provider,
+        model,
+        config_path,
+        file_edit_path,
+        file_edit_id,
+        json_mode=json_mode,
+        spinner_message="Compacting conversation",
+    )
 
 
 def print_file_edits(root: Path, pid: str, *, json_mode: bool = False) -> None:
@@ -1972,6 +2071,14 @@ def main() -> None:
         ),
     )
     parser.add_argument(
+        "--compact",
+        action="store_true",
+        help=(
+            "Archive the current conversation, rewrite that backup into a compacted "
+            "form using the compaction guidance, then load the compacted backup."
+        ),
+    )
+    parser.add_argument(
         "--read",
         action="append",
         default=[],
@@ -2089,6 +2196,23 @@ def main() -> None:
             json_mode=args.json,
         )
 
+    if args.compact:
+        return compact_conversation(
+            conversation_file,
+            root,
+            process_path,
+            args.invocation,
+            conversation_name,
+            pid,
+            args.parent_conversation,
+            args.provider,
+            args.model,
+            args.config,
+            file_edit_path,
+            file_edit_id,
+            json_mode=args.json,
+        )
+
     cleared = False
     if args.clear:
         archived = clear_conversation(
@@ -2133,6 +2257,16 @@ def main() -> None:
         except FileNotFoundError as exc:
             print(f"Error: {exc}", file=sys.stderr)
             return 1
+        ensure_initial_context(
+            conversation_file,
+            root,
+            process_path,
+            args.invocation,
+            conversation_name,
+            args.parent_conversation,
+            file_edit_path,
+            file_edit_id,
+        )
         print_load_conversation_result(conversation_file, source, archived, json_mode=args.json)
 
     if args.load_conversation is not None:
@@ -2142,6 +2276,16 @@ def main() -> None:
         except FileNotFoundError as exc:
             print(f"Error: {exc}", file=sys.stderr)
             return 1
+        ensure_initial_context(
+            conversation_file,
+            root,
+            process_path,
+            args.invocation,
+            conversation_name,
+            args.parent_conversation,
+            file_edit_path,
+            file_edit_id,
+        )
         print_load_conversation_result(conversation_file, source, archived, json_mode=args.json)
 
     if args.save_conversation is not None:
