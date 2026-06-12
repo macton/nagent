@@ -1075,7 +1075,8 @@ def call_llm(
         command.extend(["--cache-prefix-chars", str(boundary)])
 
     try:
-        with wait_spinner("Waiting for LLM"):
+        target = f"{llm.provider}/{llm.model}" if llm.model else llm.provider
+        with wait_spinner(f"Waiting for {target}"):
             result = subprocess.run(
                 command,
                 capture_output=True,

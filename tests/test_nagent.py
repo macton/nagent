@@ -1007,31 +1007,38 @@ class ActionTests(unittest.TestCase):
             "[Turns:2 Conversation-Tokens:100 Tokens-In:150 Tokens-Out:40]",
         )
 
-    def test_call_llm_uses_plain_wait_spinner_message(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            conversation = Path(tmp) / "conversation"
-            conversation.write_text("prompt text", encoding="utf-8")
-            result = unittest.mock.Mock(
-                returncode=0,
-                stdout=json.dumps(
-                    {
-                        "response": "<nagent-response>ok</nagent-response>",
-                        "input_tokens": 4,
-                        "output_tokens": 2,
-                    }
-                ),
-                stderr="",
-            )
-
-            with unittest.mock.patch.object(self.mod, "WaitSpinner") as spinner, \
-                unittest.mock.patch.object(self.mod.subprocess, "run", return_value=result):
-                self.mod.call_llm(
-                    conversation,
-                    self.mod.LlmSettings(provider="openai", model="gpt-5.5"),
-                    self.mod.TokenStats(),
+    def test_call_llm_wait_spinner_names_provider_and_model(self):
+        # The spinner says what it's waiting on; model is omitted when empty
+        # (e.g. claude-code using Claude Code's configured model).
+        cases = [
+            (self.mod.LlmSettings(provider="openai", model="gpt-5.5"), "Waiting for openai/gpt-5.5"),
+            (self.mod.LlmSettings(provider="claude-code", model=""), "Waiting for claude-code"),
+        ]
+        for settings, expected in cases:
+            with tempfile.TemporaryDirectory() as tmp:
+                conversation = Path(tmp) / "conversation"
+                conversation.write_text("prompt text", encoding="utf-8")
+                result = unittest.mock.Mock(
+                    returncode=0,
+                    stdout=json.dumps(
+                        {
+                            "response": "<nagent-response>ok</nagent-response>",
+                            "input_tokens": 4,
+                            "output_tokens": 2,
+                        }
+                    ),
+                    stderr="",
                 )
 
-        spinner.assert_called_once_with("Waiting for LLM", enabled=True)
+                with unittest.mock.patch.object(self.mod, "WaitSpinner") as spinner, \
+                    unittest.mock.patch.object(self.mod.subprocess, "run", return_value=result):
+                    self.mod.call_llm(
+                        conversation,
+                        settings,
+                        self.mod.TokenStats(),
+                    )
+
+            spinner.assert_called_once_with(expected, enabled=True)
 
     def test_main_prints_final_status_for_user_direct_mode(self):
         with tempfile.TemporaryDirectory() as tmp:
