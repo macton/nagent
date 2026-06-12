@@ -1,9 +1,9 @@
 # Prep
 
 Read bin/nagent.
-Run --description on every executable in bin/ (this includes nagent-gc).
+Run --description on every executable in bin/ (this includes nagent-distill).
 Read the helper modules under bin/helpers/ — including nagent_tags.py and
-nagent_gc_lib.py — and the tests when more detail is needed.
+nagent_distill_lib.py — and the tests when more detail is needed.
 Read context.yaml and context/ at the repository root.
 
 Ground every claim in the implementation that actually exists. Do not rely
@@ -73,11 +73,16 @@ a disposable transformation loop over it. Workers are temporary; artifacts
 are durable. Rename the parts for what they are.
 
 **Part III — Own the data.** *Teach: conversation data must be managed and
-owned by the user.* The conversation is not chat history trapped in a
-session; it is working state in a file the user owns. Editing it is
-maintenance, not corruption. Cover both explicit maintenance commands and
-implicit file editing. The prompt-side inputs the user owns include root
-context, install context, and the user-editable prompts under prompts/.
+owned by the user — at the right scope.* The conversation is not chat
+history trapped in a session; it is working state in a file the user owns.
+Editing it is maintenance, not corruption. Cover both explicit maintenance
+commands and implicit file editing. Then teach that ownership has scopes:
+memory that belongs to a project was trapped in a personal dotdir, therefore
+the root moves into the repository — what a project learned travels with the
+project, and personal rules (`~/.nagent`) still apply everywhere. The
+prompt-side inputs the user owns arrive in the same layers: install, user,
+project, root — each one a directory of plain files, each overridable by the
+more specific one.
 
 **Part IV — Exploit the files.** *Teach: state as file artifacts creates real
 opportunities that are otherwise difficult.* This is the payoff argument.
@@ -85,8 +90,12 @@ Because everything is a file, capabilities fall out that opaque session state
 cannot offer: transforming git history into editing context; distilling dead
 conversations into a durable knowledge store that feeds back into every
 future conversation; diffing, branching, versioning, and scripting
-conversations; replaying and auditing what happened. Show concrete problems
-that become easy.
+conversations; replaying and auditing what happened. And because the root is
+project-local, the artifacts compound across people, not just across
+sessions: commit `.nagent/` and a collaborator's first conversation already
+knows what yours learned — knowledge, per-file memory, and graduated tools
+in `.nagent/bin` arrive with `git clone`, reviewable in the same pull
+requests as the code they describe. Show concrete problems that become easy.
 
 **Part V — Name the principles.** *Teach: data-oriented principles.* The
 reader has now used the principles without naming them. Name them: the data
@@ -220,6 +229,9 @@ Use these reductions where they belong in the arc:
   split/index/patch artifacts. (Part VI)
 - Memory becomes stale. Therefore: allow conversations to be edited,
   summarized, branched, compacted, and rewritten. (Part III)
+- Project memory trapped in a personal dotdir cannot travel or be shared.
+  Therefore: default the root into the repository, and keep personal rules
+  in a user layer that applies everywhere. (Parts III, IV)
 - Dead conversations accumulate, and deleting them loses what was learned.
   Therefore: harvest knowledge into editable category files, gate deletion on
   the harvest, and inject a bounded digest back into context. (Part IV)
@@ -337,15 +349,22 @@ Explicit maintenance: `--save-conversation` (with summarized index),
 user-editable compaction prompt). Implicit maintenance: conversations are
 ordinary files — open, trim, rewrite, diff, copy, version, script.
 
-User-owned prompt-side inputs: root context (`~/.nagent/context.yaml` or
-`context.md`, recursive expansion), install context (a `context.yaml` or
-`context.md` in the nagent folder itself — this repository ships one pointing
-at `context/data-oriented-design.md`), project context (the same files at the
-git toplevel of the working directory, so per-project instructions travel
-with the repo; deduplicated when the project is the install or root
-directory), and the prompts under `prompts/` (compaction, harvest), resolved
-root-first so a copy under the nagent root overrides the shipped copy.
-Injection order is install → project → root.
+The root is project-local: inside a git repository the default root is
+`{toplevel}/.nagent` — conversations, knowledge, and per-file memory live
+with the repo and can be committed and shared (with the review-first secrets
+caveat); `--root` overrides; outside a repo the root is `~/.nagent`; a newly
+created root ships a `.gitignore` covering `splits/` only.
+
+User-owned prompt-side inputs come in four layers, least personal first,
+each a `context.yaml` (recursive expansion) or `context.md`: install (the
+nagent folder — this repository ships one pointing at
+`context/data-oriented-design.md`), user (`~/.nagent`, read in every run),
+project (the git toplevel), and root (the project's `.nagent`). A layer
+whose directory equals an earlier layer's is included once. The prompts
+(compaction, harvest) resolve project root → user → install; tools are
+discovered from install `bin/` + `~/.nagent/bin/` + project `.nagent/bin/`
+with the most specific layer shadowing by basename; config resolves CLI →
+`NAGENT_CONFIG` → project `.nagent/config.json` → `~/.nagent/config.json`.
 
 ## Part IV sections
 
@@ -360,10 +379,10 @@ git history -> commit/file summaries -> file-edit initial context -> better edit
 
 Historical context is a hint, not a command.
 
-**Harvest knowledge; reclaim space.** `nagent-gc` classifies artifacts
+**Harvest knowledge; reclaim space.** `nagent-distill` classifies artifacts
 (live / user-kept / prune / harvest+delete; unknown is kept, never deleted),
 distills dead conversations through a user-editable harvest prompt into
-category files under `~/.nagent/knowledge/` — facts, decisions, tasks
+category files under the root's `knowledge/` — facts, decisions, tasks
 (open/done), questions, playbooks, per-file notes — every item carrying
 provenance. Deletion is gated on a sha256 ledger entry proving the harvest
 happened. A bounded `digest.md` regenerates from the category files (user
@@ -378,6 +397,16 @@ user-editable knowledge.
 states; branch a conversation before a risky direction; script maintenance;
 audit exactly what the model saw; replay a prompt against a different
 provider by pointing the same file at it.
+
+**Project memory is team memory.** The project-local root turns every
+opportunity above from personal to shared: commit `.nagent/` and knowledge,
+per-file conversations, and graduated tools in `.nagent/bin` arrive with
+`git clone`; a teammate's first conversation starts from what the project
+already learned, and changes to the project's memory are reviewable in the
+same pull request as the code. State the caveat plainly: conversations
+contain tool output — review before committing, like any other file. Note
+the choice stays with the user: the scaffolded `.gitignore` excludes only
+regenerable `splits/`; everything else is deliberate.
 
 ## Part V section
 
@@ -481,14 +510,17 @@ and bounded write authority; add split/index/patch for large files; add child
 loops for delegation. Include the code reading order and the helper-module
 list (nagent_llm.py, nagent_cli.py, nagent_tags.py, nagent_file_edit_lib.py,
 nagent_file_split_lib.py, nagent_file_patch_lib.py,
-nagent_file_summarize_lib.py, nagent_gc_lib.py). Tests are executable notes.
+nagent_file_summarize_lib.py, nagent_distill_lib.py). Tests are executable notes.
 
 **Setup / Common Commands / Tests.** Ground in the current implementation:
-pip install, PATH, config (`NAGENT_CONFIG` or `~/.nagent/config.json`, CLI
-overrides config), the provider table including `claude-code` (default model
-`default`, no credential env var — uses the local Claude Code login), the
-common command list including `--status`, `--list-models`,
-`--list-conversations`, `--branch-conversation`, `--compact`, `nagent-gc`
+pip install, PATH, the project-local root default
+(`{git-toplevel}/.nagent`, `--root` override, `~/.nagent` outside repos,
+scaffolded `.gitignore`), config resolution (CLI → `NAGENT_CONFIG` →
+project `.nagent/config.json` → `~/.nagent/config.json`), the provider
+table including `claude-code` (default model `default`, no credential env
+var — uses the local Claude Code login), the common command list including
+`--status`, `--list-models`, `--list-conversations`,
+`--branch-conversation`, `--compact`, `nagent-distill`
 dry-run/apply/no-harvest, and the unittest invocation.
 
 ---
@@ -500,7 +532,9 @@ Verify the README explicitly explains all of these:
 - [ ] durable explicit state
 - [ ] editable conversations; direct conversation-file editing
 - [ ] conversation maintenance commands incl. branch and compact
-- [ ] user-owned prompt inputs: root, install, and project context; prompts/
+- [ ] project-local root default; committed/shareable project memory
+- [ ] context in four layers (install/user/project/root) with dedup;
+      layered prompts, tools (`.nagent/bin` shadowing), and config
 - [ ] artifact-local memory; per-file conversations; stable file ids
 - [ ] bounded write authority per mode (temp-only vs per-file)
 - [ ] repository history as data; commit summaries; file summaries; editors
@@ -593,7 +627,7 @@ the state is explicit, and why artifacts matter more than workers.
       (problem → therefore → design).
 - [ ] Every major numbered section ends with **Build your own:**.
 - [ ] Every design claim is grounded in the current implementation — including
-      knowledge harvest (nagent-gc), install context, the shared tag parser,
+      knowledge harvest (nagent-distill), install context, the shared tag parser,
       compaction, branching, and the claude-code provider.
 - [ ] Novelty is attributed to data flow and artifact management, not tool
       calling.

@@ -243,13 +243,13 @@ it. Nothing else to register.
 | `nagent-file-split`     | Split large file into segments + `index.json`.    |
 | `nagent-file-patch`     | Merge segments, write patch, validate hashes.     |
 | `nagent-file-summarize` | Summarize inline or via split summaries.          |
-| `nagent-gc`             | Harvest knowledge from dead artifacts, reclaim.   |
+| `nagent-distill`             | Harvest knowledge from dead artifacts, reclaim.   |
 
 **Example**
 
 ```bash
 nagent --description
-nagent-gc --description
+nagent-distill --description
 ```
 
 **Build your own:** tools emit capability text. Assemble prompts from that.
@@ -341,20 +341,34 @@ files: open them, trim them, rewrite them, diff them, copy them, version
 them, script them. Delete stale tool spam, fix a bad assumption, replace ten
 pages with one paragraph.
 
-The prompt-side inputs are yours too. Root context: `load_root_context()`
-reads `~/.nagent/context.yaml` or `context.md`; YAML can be a list or
-`{ "paths": [...] }`; nested `context.yaml` files expand recursively. Install
-context works the same way from the nagent folder itself (the parent of
-`bin/`) — this repository ships `context.yaml` pointing at
-`context/data-oriented-design.md`, the operating rules every conversation
-starts with. Project context: when nagent runs inside a git repository, a
-`context.yaml`/`context.md` at that repository's toplevel is included as
-well — per-project instructions that travel with the repo. Injection order is
-install → project → root, so the more personal context can override the more
-general; when the project toplevel *is* the install or root directory (e.g.
-running nagent from its own checkout), the file is included once, not twice.
-The compaction and harvest prompts under `prompts/` resolve root-first: put
-your own copy under `~/.nagent/prompts/` and it wins.
+The root itself is project-local: inside a git repository the default root
+is `{toplevel}/.nagent` — conversations, knowledge, and per-file memory live
+with the repo and can be committed and shared (review first: conversations
+contain tool output). `--root` overrides; outside a repo the root is
+`~/.nagent`. A newly created root ships a `.gitignore` covering only
+regenerable artifacts (`splits/`).
+
+The prompt-side inputs are yours too, in four layers, least personal first —
+each loaded from a `context.yaml` (a list or `{ "paths": [...] }`, nested
+files expanding recursively) or a `context.md`:
+
+1. **Install** — the nagent folder itself; this repository ships
+   `context.yaml` pointing at `context/data-oriented-design.md`.
+2. **User** — `~/.nagent/context.*`, read in every run, everywhere.
+3. **Project** — the git toplevel's `context.yaml`/`context.md`,
+   instructions that travel with the repo.
+4. **Root** — the resolved root's own context (the project's `.nagent/`).
+
+More specific layers come later and can override; a layer whose directory
+equals an earlier layer's is included once, not twice (e.g. running nagent
+from inside its own checkout). The compaction and harvest prompts resolve
+through the same layering — project `.nagent/prompts/`, then
+`~/.nagent/prompts/`, then the install copy — and so do tools: executables
+in the project's `.nagent/bin/` and in `~/.nagent/bin/` join discovery,
+shadowing same-named install tools, most specific layer winning. Drop a
+script in `.nagent/bin/` and every conversation in that project knows it.
+Config resolves CLI flags → `NAGENT_CONFIG` → project `.nagent/config.json`
+→ `~/.nagent/config.json`.
 
 **Example**
 
@@ -432,7 +446,7 @@ This is the strongest version of the "files create opportunities" argument.
 Session state that other tools discard becomes compounding, user-editable
 knowledge.
 
-**Implementation** — `nagent-gc` scans the nagent root and classifies every
+**Implementation** — `nagent-distill` scans the nagent root and classifies every
 artifact: live conversations, user-kept saves, prunable stale splits and dead
 index entries, and harvest candidates — conversation archives, delegated
 sub-conversations, per-file conversations whose target file is gone. Unknown
@@ -440,8 +454,8 @@ is kept, never deleted.
 
 For each harvest candidate, an LLM pass driven by the user-editable
 `prompts/harvest-conversation.md` extracts facts, decisions, completed and
-open tasks, open questions, and playbooks into category files under
-`~/.nagent/knowledge/` — every bullet carrying provenance
+open tasks, open questions, and playbooks into category files under the
+root's `knowledge/` — every bullet carrying provenance
 (`[from: conversation, date]`). Notes tied to a specific file mirror into
 `knowledge/files/{file_id}.md`. Deletion is gated on a sha256 entry in
 `knowledge/ledger.json` proving the harvest happened; identical content never
@@ -459,9 +473,9 @@ harvest cost in tokens before anyone pays it.
 **Example**
 
 ```bash
-nagent-gc                        # dry run: classify, estimate cost
-nagent-gc --apply                # harvest into ~/.nagent/knowledge/, reclaim
-nagent-gc --apply --no-harvest   # reclaim only, no LLM pass
+nagent-distill                        # dry run: classify, estimate cost
+nagent-distill --apply                # harvest into {root}/knowledge/, reclaim
+nagent-distill --apply --no-harvest   # reclaim only, no LLM pass
 ```
 
 **Build your own:** never delete an artifact you have not distilled, and
@@ -565,7 +579,7 @@ target file
 same commits as the target and labels high/medium/low co-edit rates.
 `format_file_history()` puts the table in file-edit context with guidance:
 inspect high co-edit files when the change may touch interfaces, tests,
-config, or paired code. Per-file knowledge notes harvested by `nagent-gc`
+config, or paired code. Per-file knowledge notes harvested by `nagent-distill`
 join the same neighborhood.
 
 **Example**
@@ -807,14 +821,14 @@ bin/helpers/nagent_file_edit_lib.py
 bin/helpers/nagent_file_split_lib.py
 bin/helpers/nagent_file_patch_lib.py
 bin/helpers/nagent_file_summarize_lib.py
-bin/helpers/nagent_gc_lib.py
+bin/helpers/nagent_distill_lib.py
 ```
 
 Tests are executable notes: parser and protocol, conversation lifecycle, root
 and install context, retries, tokens, sub-conversations, result wrappers,
 write validation, file ids, file-edit index, git history, co-edited files,
-summaries, split/patch, gc classification and harvest, providers, tool
-descriptions, JSON output.
+summaries, split/patch, distill classification and harvest, root and layer
+resolution, providers, tool descriptions, JSON output.
 
 ---
 
@@ -827,7 +841,11 @@ mkdir -p ~/.nagent
 cp config.example.json ~/.nagent/config.json
 ```
 
-Config: `NAGENT_CONFIG` or `~/.nagent/config.json`. CLI overrides config.
+The root: inside a git repo, `{toplevel}/.nagent` (created on first use, with
+a `.gitignore` covering `splits/`); outside, `~/.nagent`; `--root` overrides.
+
+Config: CLI flags → `NAGENT_CONFIG` → project `.nagent/config.json` →
+`~/.nagent/config.json`.
 
 ```json
 {
@@ -878,9 +896,9 @@ nagent-file-split --file src/big.py --output /tmp/big-split --json
 nagent-file-patch --index /tmp/big-split/index.json --json
 nagent-file-summarize --file src/big.py --json
 
-nagent-gc                        # dry run: classify artifacts, estimate harvest cost
-nagent-gc --apply                # harvest knowledge into ~/.nagent/knowledge/, reclaim space
-nagent-gc --apply --no-harvest   # reclaim only, no LLM pass
+nagent-distill                        # dry run: classify artifacts, estimate harvest cost
+nagent-distill --apply                # harvest knowledge into {root}/knowledge/, reclaim space
+nagent-distill --apply --no-harvest   # reclaim only, no LLM pass
 ```
 
 `--help` for flags. `--description` for what a tool contributes to startup
