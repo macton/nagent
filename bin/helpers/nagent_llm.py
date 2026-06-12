@@ -357,18 +357,36 @@ def _claude_code_generate(
         tools=list(allowed_tools) if allowed_tools else [],
         allowed_tools=list(allowed_tools) if allowed_tools else [],
         cwd=os.getcwd(),
+        # This provider bills through Claude Code's own login. An inherited
+        # ANTHROPIC_API_KEY would silently redirect billing to that key
+        # (Claude Code prefers it over its login); blank it in the subprocess.
+        # Use the "anthropic" provider for API-key billing.
+        env={"ANTHROPIC_API_KEY": ""},
     )
 
     async def run_query():
         texts: list[str] = []
         result_message = None
-        async for sdk_message in query(prompt=message, options=options):
-            if isinstance(sdk_message, AssistantMessage):
-                for block in sdk_message.content:
-                    if isinstance(block, TextBlock):
-                        texts.append(block.text)
-            elif isinstance(sdk_message, ResultMessage):
-                result_message = sdk_message
+        try:
+            async for sdk_message in query(prompt=message, options=options):
+                if isinstance(sdk_message, AssistantMessage):
+                    if getattr(sdk_message, "error", None):
+                        # Synthetic error message (e.g. billing_error): its
+                        # text is an error report, not generated output.
+                        continue
+                    for block in sdk_message.content:
+                        if isinstance(block, TextBlock):
+                            texts.append(block.text)
+                elif isinstance(sdk_message, ResultMessage):
+                    result_message = sdk_message
+        except Exception:
+            # After an error result the CLI exits non-zero on purpose, which
+            # the SDK surfaces as an exception AFTER yielding the
+            # ResultMessage — whose .result carries the real error text
+            # ("Credit balance is too low"), unlike the generic exception.
+            # Keep the result and let the is_error path below report it.
+            if result_message is None or not result_message.is_error:
+                raise
         return texts, result_message
 
     texts, result_message = anyio.run(run_query)

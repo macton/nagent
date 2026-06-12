@@ -2633,8 +2633,9 @@ class NagentLlmConfigTests(unittest.TestCase):
                 self.text = text
 
         class FakeAssistantMessage:
-            def __init__(self, blocks):
+            def __init__(self, blocks, error=None):
                 self.content = blocks
+                self.error = error
 
         class FakeResultMessage:
             def __init__(self, result, usage=None, is_error=False, errors=None):
@@ -2730,6 +2731,70 @@ class NagentLlmConfigTests(unittest.TestCase):
         with unittest.mock.patch.object(self.mod, "require_package", return_value=package):
             with self.assertRaisesRegex(RuntimeError, "login required"):
                 self.mod.generate_text_with_usage("hello", "claude-code", "default")
+
+    def test_claude_code_error_result_survives_stream_exception(self):
+        # After an error result the CLI exits non-zero; the SDK yields the
+        # ResultMessage (real error text) and THEN raises a generic exception
+        # ("Claude Code returned an error result: success"). The provider must
+        # report the result's text, not the masked exception.
+        captured_options: dict = {}
+
+        def messages(FakeAssistantMessage, FakeTextBlock, FakeResultMessage):
+            yield FakeAssistantMessage(
+                [FakeTextBlock("Credit balance is too low")], error="billing_error"
+            )
+            yield FakeResultMessage("Credit balance is too low", is_error=True)
+            raise Exception("Claude Code returned an error result: success")
+
+        package, _ = self._fake_claude_code_package(messages, captured_options)
+        with unittest.mock.patch.object(self.mod, "require_package", return_value=package):
+            with self.assertRaisesRegex(RuntimeError, "Credit balance is too low"):
+                self.mod.generate_text_with_usage("hello", "claude-code", "default")
+
+    def test_claude_code_stream_exception_without_error_result_propagates(self):
+        captured_options: dict = {}
+
+        def messages(FakeAssistantMessage, FakeTextBlock, FakeResultMessage):
+            yield FakeAssistantMessage([FakeTextBlock("partial")])
+            raise Exception("transport died")
+
+        package, _ = self._fake_claude_code_package(messages, captured_options)
+        with unittest.mock.patch.object(self.mod, "require_package", return_value=package):
+            with self.assertRaisesRegex(Exception, "transport died"):
+                self.mod.generate_text_with_usage("hello", "claude-code", "default")
+
+    def test_claude_code_synthetic_error_text_is_not_output(self):
+        # A synthetic assistant message (error attribute set) carries an error
+        # report as its text; it must not be returned as generated output.
+        captured_options: dict = {}
+
+        def messages(FakeAssistantMessage, FakeTextBlock, FakeResultMessage):
+            return [
+                FakeAssistantMessage([FakeTextBlock("some error")], error="billing_error"),
+                FakeAssistantMessage([FakeTextBlock("real output")]),
+                FakeResultMessage(None),
+            ]
+
+        package, _ = self._fake_claude_code_package(messages, captured_options)
+        with unittest.mock.patch.object(self.mod, "require_package", return_value=package):
+            result = self.mod.generate_text_with_usage("hello", "claude-code", "default")
+
+        self.assertEqual(result.text, "real output")
+
+    def test_claude_code_blanks_inherited_api_key(self):
+        # Billing must stay on Claude Code's own login: an inherited
+        # ANTHROPIC_API_KEY would silently hijack it, so the subprocess env
+        # blanks the variable.
+        captured_options: dict = {}
+
+        def messages(FakeAssistantMessage, FakeTextBlock, FakeResultMessage):
+            return [FakeResultMessage("ok")]
+
+        package, _ = self._fake_claude_code_package(messages, captured_options)
+        with unittest.mock.patch.object(self.mod, "require_package", return_value=package):
+            self.mod.generate_text_with_usage("hello", "claude-code", "default")
+
+        self.assertEqual(captured_options["env"], {"ANTHROPIC_API_KEY": ""})
 
     def test_claude_code_upload_allows_read_tool(self):
         captured_options: dict = {}
