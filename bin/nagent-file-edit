@@ -10,7 +10,7 @@ NAGENT = Path(__file__).resolve().parent / "nagent"
 
 HELPERS_DIR = Path(__file__).resolve().parent / "helpers"
 sys.path.insert(0, str(HELPERS_DIR))
-from nagent_cli import default_pid, emit_json, exit_on_description
+from nagent_cli import default_pid, emit_json, ensure_root_scaffold, exit_on_description, resolve_default_root
 from nagent_file_edit_lib import file_index_path, resolve_file_edit_conversation
 
 NAGENT_FILE_EDIT_DESCRIPTION = """\
@@ -34,8 +34,10 @@ def main() -> None:
     parser.add_argument("--file", required=True, type=Path, help="Path to the file to edit.")
     parser.add_argument(
         "--root",
-        default="~/.nagent",
-        help="nagent root directory (default: ~/.nagent).",
+        help=(
+            "nagent root directory (default: {git-toplevel}/.nagent inside "
+            "a git repo, else ~/.nagent)."
+        ),
     )
     parser.add_argument(
         "--pid",
@@ -67,7 +69,8 @@ def main() -> None:
     parser.add_argument("prompt", nargs="?", help="Prompt text describing the edit.")
     args = parser.parse_args()
 
-    root = Path(args.root).expanduser()
+    root = resolve_default_root(args.root)
+    ensure_root_scaffold(root)
     pid = args.pid or default_pid()
     source = args.file.expanduser()
 

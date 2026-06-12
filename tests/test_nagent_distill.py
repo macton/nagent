@@ -14,10 +14,10 @@ from pathlib import Path
 BIN = Path(__file__).resolve().parent.parent / "bin"
 HELPERS = BIN / "helpers"
 NAGENT = BIN / "nagent"
-NAGENT_GC = BIN / "nagent-gc"
+NAGENT_DISTILL = BIN / "nagent-distill"
 
 sys.path.insert(0, str(HELPERS))
-import nagent_gc_lib as gc
+import nagent_distill_lib as gc
 from nagent_file_edit_lib import file_id_for_path
 
 
@@ -554,7 +554,7 @@ class ContextInjectionTests(unittest.TestCase):
 
 class GcCliTests(unittest.TestCase):
     def test_description_flag(self):
-        result = subprocess.run([str(NAGENT_GC), "--description"], capture_output=True, text=True)
+        result = subprocess.run([str(NAGENT_DISTILL), "--description"], capture_output=True, text=True)
         self.assertEqual(result.returncode, 0)
         self.assertIn("Reclaim dead nagent artifacts", result.stdout)
 
@@ -565,7 +565,7 @@ class GcCliTests(unittest.TestCase):
             archive.write_text("archived conversation", encoding="utf-8")
 
             result = subprocess.run(
-                [str(NAGENT_GC), "--root", str(root)],
+                [str(NAGENT_DISTILL), "--root", str(root)],
                 capture_output=True,
                 text=True,
             )
@@ -582,7 +582,7 @@ class GcCliTests(unittest.TestCase):
             archive.write_text("archived conversation", encoding="utf-8")
 
             result = subprocess.run(
-                [str(NAGENT_GC), "--root", str(root), "--json"],
+                [str(NAGENT_DISTILL), "--root", str(root), "--json"],
                 capture_output=True,
                 text=True,
             )
@@ -599,7 +599,7 @@ class GcCliTests(unittest.TestCase):
             archive.write_text("archived conversation", encoding="utf-8")
 
             result = subprocess.run(
-                [str(NAGENT_GC), "--root", str(root), "--apply", "--no-harvest"],
+                [str(NAGENT_DISTILL), "--root", str(root), "--apply", "--no-harvest"],
                 capture_output=True,
                 text=True,
                 env={"PATH": "/usr/bin:/bin"},
@@ -613,7 +613,7 @@ class GcCliTests(unittest.TestCase):
 
     def test_missing_root_errors(self):
         result = subprocess.run(
-            [str(NAGENT_GC), "--root", "/nonexistent/nagent-root"],
+            [str(NAGENT_DISTILL), "--root", "/nonexistent/nagent-root"],
             capture_output=True,
             text=True,
         )

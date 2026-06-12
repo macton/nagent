@@ -8,6 +8,8 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
+from nagent_cli import git_toplevel
+
 PROVIDERS = ("openai", "anthropic", "google", "gemini", "cursor", "claude-code")
 PROVIDER_ALIASES = {"gemini": "google"}
 
@@ -50,9 +52,17 @@ class LlmResult:
 
 
 def default_config_path() -> Path:
+    """Config resolution: NAGENT_CONFIG, then the project's .nagent/config.json
+    when inside a git repo, then the user config. CLI --config wins above all
+    (callers pass it as config_path)."""
     env_path = os.environ.get("NAGENT_CONFIG")
     if env_path:
         return Path(env_path).expanduser()
+    toplevel = git_toplevel()
+    if toplevel is not None:
+        project_config = toplevel / ".nagent" / "config.json"
+        if project_config.is_file():
+            return project_config
     return Path("~/.nagent/config.json").expanduser()
 
 

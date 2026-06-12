@@ -7,9 +7,9 @@ from pathlib import Path
 
 HELPERS_DIR = Path(__file__).resolve().parent / "helpers"
 sys.path.insert(0, str(HELPERS_DIR))
-from nagent_cli import WaitSpinner, emit_json, exit_on_description
+from nagent_cli import WaitSpinner, emit_json, exit_on_description, resolve_default_root
 from nagent_llm import add_llm_arguments, generate_text, resolve_from_args
-from nagent_gc_lib import run_gc
+from nagent_distill_lib import run_gc
 
 
 def wait_spinner(message: str) -> WaitSpinner:
@@ -20,7 +20,7 @@ def print_progress(message: str) -> None:
     # Progress goes to stderr so stdout stays clean for the report and --json.
     print(message, file=sys.stderr)
 
-NAGENT_GC_DESCRIPTION = """\
+NAGENT_DISTILL_DESCRIPTION = """\
 Reclaim dead nagent artifacts after distilling their knowledge.
 Classifies conversation archives, delegated sub-conversations, orphaned
 per-file conversations, and stale split directories; harvests facts,
@@ -76,7 +76,7 @@ def print_report(report: dict) -> None:
 
 
 def main() -> int:
-    exit_on_description(NAGENT_GC_DESCRIPTION)
+    exit_on_description(NAGENT_DISTILL_DESCRIPTION)
 
     parser = argparse.ArgumentParser(
         description=(
@@ -86,8 +86,10 @@ def main() -> int:
     )
     parser.add_argument(
         "--root",
-        default="~/.nagent",
-        help="nagent root directory (default: ~/.nagent).",
+        help=(
+            "nagent root directory (default: {git-toplevel}/.nagent inside "
+            "a git repo, else ~/.nagent)."
+        ),
     )
     parser.add_argument(
         "--apply",
@@ -113,7 +115,7 @@ def main() -> int:
     add_llm_arguments(parser)
     args = parser.parse_args()
 
-    root = Path(args.root).expanduser()
+    root = resolve_default_root(args.root)
     if not root.is_dir():
         print(f"Error: nagent root not found: {root}", file=sys.stderr)
         return 1

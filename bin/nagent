@@ -18,7 +18,18 @@ from typing import Literal
 HELPERS_DIR = Path(__file__).resolve().parent / "helpers"
 sys.path.insert(0, str(HELPERS_DIR))
 from nagent_llm import PROVIDERS, generate_text, list_models, require_credentials, resolve_provider, resolve_settings
-from nagent_cli import collect_bin_tool_descriptions, default_pid, emit_json, exit_on_description, WaitSpinner
+from nagent_cli import (
+    WaitSpinner,
+    collect_bin_tool_descriptions,
+    default_pid,
+    emit_json,
+    ensure_root_scaffold,
+    exit_on_description,
+    resolve_default_root,
+    resolve_prompt_path,
+    tool_search_dirs,
+    user_root,
+)
 from nagent_file_edit_lib import (
     file_id_for_path,
     is_split_segment_for_source,
@@ -28,7 +39,7 @@ from nagent_file_edit_lib import (
 )
 from nagent_file_patch_lib import apply_segment_patches
 from nagent_file_split_lib import slugify
-from nagent_gc_lib import digest_path, file_knowledge_path, knowledge_item_counts, root_size_bytes
+from nagent_distill_lib import digest_path, file_knowledge_path, knowledge_item_counts, root_size_bytes
 from nagent_tags import (
     TagParseError,
     extract_block,
@@ -630,32 +641,35 @@ def build_initial_context(
 
     git_context = git_repo_context()
     git_section = f"\n{git_context}" if git_context else ""
-    tools_section = collect_bin_tool_descriptions(process_path.parent)
+    tools_section = collect_bin_tool_descriptions(tool_search_dirs(process_path.parent, root))
     tools_block = f"\n{tools_section}\n" if tools_section else ""
-    # Install context ships with the nagent folder itself (context.yaml or
-    # context.md next to bin/); it is injected before the per-root context so
-    # root context can override or extend it.
+    # Layered context, least personal first: install (ships with the nagent
+    # folder), user (~/.nagent), project (git toplevel of cwd), root (the
+    # resolved root, e.g. the project's .nagent). More specific layers come
+    # later and can override. Any layer whose directory equals an earlier
+    # layer's directory is skipped once, so the same file is never included
+    # twice (e.g. running nagent from inside its own checkout, or root being
+    # the user root outside a repo).
     install_dir = process_path.resolve().parent.parent
-    install_context = load_root_context(install_dir)
-    install_context_block = f"\n{install_context}\n" if install_context else ""
-    # Project context: a context.yaml/context.md at the git toplevel of the
-    # current working directory. Skipped when that directory is the install
-    # or root directory, so the same file is not included twice (e.g. running
-    # nagent from inside the nagent checkout).
-    project_context_block = ""
     project_dir = git_toplevel_for_path(Path.cwd())
+    layer_dirs: list[Path] = [install_dir, user_root()]
     if project_dir is not None:
+        layer_dirs.append(project_dir)
+    layer_dirs.append(root)
+    seen_layer_dirs: set[Path] = set()
+    layer_blocks: list[str] = []
+    for layer_dir in layer_dirs:
         try:
-            project_resolved = project_dir.resolve()
-            is_duplicate = project_resolved == install_dir or project_resolved == root.resolve()
+            resolved_dir = layer_dir.resolve()
         except OSError:
-            is_duplicate = True
-        if not is_duplicate:
-            project_context = load_root_context(project_dir)
-            if project_context:
-                project_context_block = f"\n{project_context}\n"
-    root_context = load_root_context(root)
-    root_context_block = f"\n{root_context}\n" if root_context else ""
+            continue
+        if resolved_dir in seen_layer_dirs:
+            continue
+        seen_layer_dirs.add(resolved_dir)
+        layer_context = load_root_context(layer_dir)
+        if layer_context:
+            layer_blocks.append(layer_context)
+    context_layers_block = "".join(f"\n{block}\n" for block in layer_blocks)
     file_edit_block = ""
     file_edit_detail_block = ""
     if file_edit_path is not None:
@@ -679,7 +693,7 @@ def build_initial_context(
     if knowledge_digest:
         knowledge_block = (
             "\nThe {knowledge} block below is distilled from previous conversations "
-            "by nagent-gc; items carry provenance. Treat them as hints and verify "
+            "by nagent-distill; items carry provenance. Treat them as hints and verify "
             "before relying on them.\n"
             f"{{knowledge}}\n{knowledge_digest}\n{{/knowledge}}\n"
         )
@@ -731,7 +745,7 @@ Conversations are data (create, reuse, hand off):
 - This conversation persists across invocations, and the user may edit it between runs. The current file is the source of truth.
 
 {file_edit_rules(file_edit_path)}
-{tools_block}{install_context_block}{project_context_block}{root_context_block}{knowledge_block}{file_edit_detail_block}
+{tools_block}{context_layers_block}{knowledge_block}{file_edit_detail_block}
 Instance:
 - invocation: {invocation}
 - conversation: {conversation_name}
@@ -1963,13 +1977,9 @@ def edit_conversation(
 
 
 def compact_prompt_path(root: Path) -> Path:
-    # The compaction prompt is user-editable data. A copy under the nagent
-    # root wins over the repo copy shipped next to the executable, and the
-    # repo copy keeps --compact working from a plain checkout.
-    user_prompt = root / "prompts" / "compact-conversation.md"
-    if user_prompt.is_file():
-        return user_prompt
-    return COMPACT_PROMPT_PATH
+    # The compaction prompt is user-editable data, resolved through the
+    # layered prompt order: project root, user, install.
+    return resolve_prompt_path(root, "compact-conversation.md")
 
 
 def compact_conversation(
@@ -2075,8 +2085,10 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Run the nagent conversation loop.")
     parser.add_argument(
         "--root",
-        default="~/.nagent",
-        help="Root directory for config and conversations (default: ~/.nagent).",
+        help=(
+            "Root directory for conversations and knowledge (default: "
+            "{git-toplevel}/.nagent inside a git repo, else ~/.nagent)."
+        ),
     )
     parser.add_argument(
         "--conversation",
@@ -2205,13 +2217,14 @@ def main() -> int:
     )
     args = parser.parse_args()
 
-    root = Path(args.root).expanduser()
+    root = resolve_default_root(args.root)
     user_direct_mode = args.invocation == "user" and args.pid is None
     pid = args.pid or default_pid()
     file_edit_path: Path | None = None
     file_edit_id: str | None = None
 
     if args.file_edit is not None:
+        ensure_root_scaffold(root)  # resolving a file-edit writes the index
         try:
             conversation_name, file_edit_path, file_edit_id = resolve_file_edit_conversation(
                 root, pid, args.file_edit
@@ -2275,6 +2288,10 @@ def main() -> int:
             json_mode=args.json,
             print_status=user_direct_mode,
         )
+
+    # Every path past this point can write under the root; a newly created
+    # root gets its scaffold (.gitignore for regenerable artifacts).
+    ensure_root_scaffold(root)
 
     initial_prompt = resolve_initial_prompt(args.prompt)
 

@@ -234,6 +234,155 @@ class NagentLlmUploadTests(unittest.TestCase):
         self.assertIn("file not found", result.stderr)
 
 
+class RootAndLayerResolutionTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        import importlib.util
+        from importlib.machinery import SourceFileLoader
+
+        loader = SourceFileLoader("nagent_cli_mod", str(BIN / "helpers" / "nagent_cli.py"))
+        spec = importlib.util.spec_from_loader("nagent_cli_mod", loader)
+        cls.cli = importlib.util.module_from_spec(spec)
+        loader.exec_module(cls.cli)
+
+    def test_resolve_default_root_explicit_wins(self):
+        self.assertEqual(
+            self.cli.resolve_default_root("/some/where"), Path("/some/where")
+        )
+
+    def test_resolve_default_root_uses_project_dotdir_in_git_repo(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            project = Path(tmp) / "proj"
+            (project / "sub").mkdir(parents=True)
+            subprocess.run(["git", "init"], cwd=project, check=True, capture_output=True)
+            previous_cwd = os.getcwd()
+            os.chdir(project / "sub")
+            try:
+                root = self.cli.resolve_default_root(None)
+            finally:
+                os.chdir(previous_cwd)
+        self.assertEqual(root.resolve(), (project / ".nagent").resolve())
+
+    def test_resolve_default_root_falls_back_to_user_root(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp) / "home"
+            outside = Path(tmp) / "outside"
+            home.mkdir()
+            outside.mkdir()
+            previous_cwd = os.getcwd()
+            os.chdir(outside)
+            try:
+                with unittest.mock.patch.dict(os.environ, {"HOME": str(home)}):
+                    root = self.cli.resolve_default_root(None)
+            finally:
+                os.chdir(previous_cwd)
+        self.assertEqual(root, home / ".nagent")
+
+    def test_ensure_root_scaffold_writes_gitignore_only_on_creation(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            fresh = Path(tmp) / "fresh-root"
+            self.cli.ensure_root_scaffold(fresh)
+            self.assertEqual(
+                (fresh / ".gitignore").read_text(encoding="utf-8"), "splits/\n"
+            )
+
+            existing = Path(tmp) / "existing-root"
+            existing.mkdir()
+            self.cli.ensure_root_scaffold(existing)
+            self.assertFalse((existing / ".gitignore").exists())
+
+            # A user-deleted .gitignore stays deleted.
+            (fresh / ".gitignore").unlink()
+            self.cli.ensure_root_scaffold(fresh)
+            self.assertFalse((fresh / ".gitignore").exists())
+
+    def test_resolve_prompt_path_layers_root_then_user_then_install(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp) / "home"
+            root = Path(tmp) / "root"
+            (home / ".nagent" / "prompts").mkdir(parents=True)
+            (root / "prompts").mkdir(parents=True)
+            name = "compact-conversation.md"
+
+            with unittest.mock.patch.dict(os.environ, {"HOME": str(home)}):
+                install_copy = self.cli.resolve_prompt_path(root, name)
+                self.assertEqual(install_copy, self.cli.INSTALL_DIR / "prompts" / name)
+
+                user_copy = home / ".nagent" / "prompts" / name
+                user_copy.write_text("user", encoding="utf-8")
+                self.assertEqual(self.cli.resolve_prompt_path(root, name), user_copy)
+
+                root_copy = root / "prompts" / name
+                root_copy.write_text("root", encoding="utf-8")
+                self.assertEqual(self.cli.resolve_prompt_path(root, name), root_copy)
+
+    def test_tool_discovery_layers_shadow_by_basename(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            install_bin = Path(tmp) / "install" / "bin"
+            user_bin = Path(tmp) / "home" / ".nagent" / "bin"
+            root_bin = Path(tmp) / "root" / "bin"
+            for directory in (install_bin, user_bin, root_bin):
+                directory.mkdir(parents=True)
+
+            def write_tool(directory, name, description):
+                tool = directory / name
+                tool.write_text(
+                    "#!/usr/bin/env python3\n"
+                    f"print({description!r})\n",
+                    encoding="utf-8",
+                )
+                tool.chmod(0o755)
+
+            write_tool(install_bin, "shared-tool", "install version")
+            write_tool(user_bin, "shared-tool", "user version")
+            write_tool(root_bin, "shared-tool", "project version")
+            write_tool(install_bin, "install-only", "install only tool")
+            write_tool(root_bin, "project-only", "project only tool")
+
+            with unittest.mock.patch.dict(os.environ, {"HOME": str(Path(tmp) / "home")}):
+                dirs = self.cli.tool_search_dirs(install_bin, Path(tmp) / "root")
+                text = self.cli.collect_bin_tool_descriptions(dirs)
+
+        self.assertIn("project version", text)
+        self.assertNotIn("install version", text)
+        self.assertNotIn("user version", text)
+        self.assertIn("install only tool", text)
+        self.assertIn("project only tool", text)
+
+    def test_default_config_path_layers(self):
+        nagent_llm = load_nagent_llm_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp) / "home"
+            home.mkdir()
+            project = Path(tmp) / "proj"
+            project.mkdir()
+            subprocess.run(["git", "init"], cwd=project, check=True, capture_output=True)
+
+            previous_cwd = os.getcwd()
+            os.chdir(project)
+            try:
+                env = {"HOME": str(home), "NAGENT_CONFIG": str(Path(tmp) / "env.json")}
+                with unittest.mock.patch.dict(os.environ, env):
+                    # NAGENT_CONFIG wins.
+                    self.assertEqual(
+                        nagent_llm.default_config_path(), Path(tmp) / "env.json"
+                    )
+                with unittest.mock.patch.dict(os.environ, {"HOME": str(home)}, clear=False):
+                    os.environ.pop("NAGENT_CONFIG", None)
+                    # No project config yet: user config.
+                    self.assertEqual(
+                        nagent_llm.default_config_path(),
+                        home / ".nagent" / "config.json",
+                    )
+                    # Project config exists: it wins over the user config.
+                    project_config = project / ".nagent" / "config.json"
+                    project_config.parent.mkdir(parents=True)
+                    project_config.write_text("{}", encoding="utf-8")
+                    self.assertEqual(nagent_llm.default_config_path(), project_config)
+            finally:
+                os.chdir(previous_cwd)
+
+
 class ParseResponseTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -1471,6 +1620,67 @@ class InitialTextTests(unittest.TestCase):
 
         self.assertIn("PROJECT-CONTEXT-MARKER", text)
 
+    def test_context_layers_ordered_install_user_project_root(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            install = Path(tmp) / "install"
+            (install / "bin").mkdir(parents=True)
+            (install / "context.md").write_text("INSTALL-MARKER", encoding="utf-8")
+            home = Path(tmp) / "home"
+            (home / ".nagent").mkdir(parents=True)
+            (home / ".nagent" / "context.md").write_text("USER-MARKER", encoding="utf-8")
+            project = Path(tmp) / "proj"
+            project.mkdir()
+            subprocess.run(["git", "init"], cwd=project, check=True, capture_output=True)
+            (project / "context.md").write_text("PROJECT-MARKER", encoding="utf-8")
+            root = project / ".nagent"
+            root.mkdir()
+            (root / "context.md").write_text("ROOT-MARKER", encoding="utf-8")
+
+            previous_cwd = os.getcwd()
+            os.chdir(project)
+            try:
+                with unittest.mock.patch.dict(os.environ, {"HOME": str(home)}):
+                    text = self.mod.build_initial_context(
+                        root, install / "bin" / "nagent", "user", "conv"
+                    )
+            finally:
+                os.chdir(previous_cwd)
+
+        positions = [
+            text.index("INSTALL-MARKER"),
+            text.index("USER-MARKER"),
+            text.index("PROJECT-MARKER"),
+            text.index("ROOT-MARKER"),
+        ]
+        self.assertEqual(positions, sorted(positions))
+        # Each layer appears exactly once.
+        for marker in ("INSTALL-MARKER", "USER-MARKER", "PROJECT-MARKER", "ROOT-MARKER"):
+            self.assertEqual(text.count(marker), 1, marker)
+
+    def test_context_layers_dedup_when_root_is_user_root(self):
+        # Outside a repo the root is ~/.nagent: the user layer and the root
+        # layer are the same directory and its context appears once.
+        with tempfile.TemporaryDirectory() as tmp:
+            install = Path(tmp) / "install"
+            (install / "bin").mkdir(parents=True)
+            home = Path(tmp) / "home"
+            (home / ".nagent").mkdir(parents=True)
+            (home / ".nagent" / "context.md").write_text("USER-MARKER", encoding="utf-8")
+            outside = Path(tmp) / "outside"
+            outside.mkdir()
+
+            previous_cwd = os.getcwd()
+            os.chdir(outside)
+            try:
+                with unittest.mock.patch.dict(os.environ, {"HOME": str(home)}):
+                    text = self.mod.build_initial_context(
+                        home / ".nagent", install / "bin" / "nagent", "user", "conv"
+                    )
+            finally:
+                os.chdir(previous_cwd)
+
+        self.assertEqual(text.count("USER-MARKER"), 1)
+
     def test_project_context_not_duplicated_inside_install_checkout(self):
         # Running nagent from within its own checkout: the project toplevel is
         # the install dir, whose context is already included once.
@@ -1915,6 +2125,73 @@ class CliTests(unittest.TestCase):
             fresh = conversation_file.read_text(encoding="utf-8")
             self.assertIn("<initial_context>", fresh)
             self.assertNotIn("old history", fresh)
+
+    def test_default_root_is_project_dotdir_inside_git_repo(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            project = Path(tmp) / "proj"
+            project.mkdir()
+            subprocess.run(["git", "init"], cwd=project, check=True, capture_output=True)
+
+            result = subprocess.run(
+                [str(NAGENT), "--conversation", "conv", "--status"],
+                capture_output=True,
+                text=True,
+                cwd=project,
+                env=self.clean_env(),
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            expected = project / ".nagent" / "conversations" / "conv"
+            self.assertIn(f"conversation:{expected}", result.stdout)
+            # --status is read-only: it must not create the root.
+            self.assertFalse((project / ".nagent").exists())
+
+    def test_explicit_root_still_wins_inside_git_repo(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            project = Path(tmp) / "proj"
+            project.mkdir()
+            subprocess.run(["git", "init"], cwd=project, check=True, capture_output=True)
+            explicit = Path(tmp) / "elsewhere"
+
+            result = subprocess.run(
+                [str(NAGENT), "--root", str(explicit), "--conversation", "conv", "--status"],
+                capture_output=True,
+                text=True,
+                cwd=project,
+                env=self.clean_env(),
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn(f"conversation:{explicit / 'conversations' / 'conv'}", result.stdout)
+
+    def test_fresh_root_gets_gitignore_scaffold(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "fresh-root"
+
+            result = subprocess.run(
+                [str(NAGENT), "--root", str(root), "--conversation", "conv", "--clear"],
+                capture_output=True,
+                text=True,
+                env=self.clean_env(),
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual((root / ".gitignore").read_text(encoding="utf-8"), "splits/\n")
+
+    def test_existing_root_does_not_gain_gitignore(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "old-root"
+            root.mkdir()
+
+            result = subprocess.run(
+                [str(NAGENT), "--root", str(root), "--conversation", "conv", "--clear"],
+                capture_output=True,
+                text=True,
+                env=self.clean_env(),
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertFalse((root / ".gitignore").exists())
 
     def test_clear_without_existing_conversation(self):
         with tempfile.TemporaryDirectory() as tmp:
