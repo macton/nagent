@@ -25,20 +25,20 @@ matters, it needs to be saveable, maintainable, organizable, and editable.
 
 The LLM is temporary. The process is temporary. Sub-conversations are
 temporary. Context windows are temporary. What survives is explicit data:
-conversations, per-file conversations, install, project, and root context
-files, repository history summaries, historical coupling tables, file
-summaries, split indexes, patch artifacts, and a harvested knowledge store
-you can open in an editor.
+conversations, per-file conversations, campaign plans, checkpoints,
+install/user/project/root context files, repository history summaries,
+historical coupling tables, file summaries, split indexes, patch artifacts,
+and a harvested knowledge store you can open in an editor.
 
 A text file, an LLM, structured tags, and a loop are how this repo implements
 that idea. They are not the idea.
 
 This README teaches in order: how to build an agent-like interface; why
 "agent" is the wrong name for what you built; why the conversation data must
-be owned by you; what owning it as files makes possible; the data-oriented
-principles underneath; the data structures that fall out of those principles;
-and how all of this compares to frameworks. Stop anywhere and you still leave
-with something true. Finish and you can build your own.
+be owned by you — at the right scope; what owning it as files makes possible;
+the data-oriented principles underneath; the data structures that fall out of
+those principles; and how all of this compares to frameworks. Stop anywhere
+and you still leave with something true. Finish and you can build your own.
 
 ## What It Looks Like
 
@@ -85,8 +85,7 @@ provider and model settings, calls `generate_text_with_usage()` from
 Providers: `openai`, `anthropic`, `google`, `cursor`, and `claude-code` —
 which runs the prompt through your locally installed Claude Code via the
 Claude Agent SDK and authenticates with Claude Code's own login, no API key
-in the environment. Defaults come from `NAGENT_CONFIG` or
-`~/.nagent/config.json`. CLI flags win.
+in the environment.
 
 `bin/nagent-llm-upload` is the sibling for artifacts that need upload APIs:
 images, PDFs, office files, code documents. It rejects `.zip`, enforces a
@@ -113,12 +112,12 @@ strict: recognized tags and whitespace. Nothing else.
 
 **Implementation** — `build_initial_context()` in `bin/nagent` assembles the
 runtime context: role instructions and the structured tag protocol first,
-then context-management and write rules, discovered tool descriptions,
-install, project, and root context, the knowledge digest — and instance facts and
-environment last. The ordering is stable-to-volatile on purpose: request
-prefixes stay byte-identical across conversations of the same mode. The tag
-list carries its usage guidance inline and lives inside `<initial_context>`,
-so refreshed context carries the current protocol with it.
+then context-management and write rules, discovered tool descriptions, the
+context layers, the knowledge digest — and instance facts and environment
+last. The ordering is stable-to-volatile on purpose: request prefixes stay
+byte-identical across conversations of the same mode. The tag list carries
+its usage guidance inline and lives inside `<initial_context>`, so refreshed
+context carries the current protocol with it.
 
 The context also states the protocol rules outright, because they are the
 failure modes that matter: tag bodies are raw text (no escaping; the first
@@ -191,17 +190,13 @@ project files are edited through per-file conversations (Part VI). Say it
 plainly: this is a convention-based reference implementation, not a sandbox.
 `<nagent-shell>` runs with your user's permissions.
 
-`TokenStats` tracks turns, conversation input size, and recursive
-input/output tokens. Child `--json` output rolls up into the parent's totals,
-including `--edit-conversation` and `--compact` children. No provider usage?
+The loop passes the conversation's stable prefix boundaries to
+`nagent-llm-text` (`--cache-prefix-chars`), and providers that cache on block
+boundaries reuse the shared context each turn. `TokenStats` tracks turns,
+conversation input size, and recursive input/output tokens; child `--json`
+output rolls up into the parent's totals, and cached prompt tokens fold back
+into the counts, so accounting still means "tokens sent". No provider usage?
 Estimate from character count.
-
-The loop also exploits the stable-to-volatile context ordering: each call
-passes the conversation's stable prefix boundaries (`--cache-prefix-chars`)
-to `nagent-llm-text`, and providers that cache on block boundaries (anthropic)
-reuse the shared context instead of re-reading it every turn. Cached tokens
-are folded back into the reported input counts, so accounting still means
-"tokens sent".
 
 **Example**
 
@@ -229,28 +224,30 @@ No central registry. Tools describe themselves.
 
 **Implementation** — `exit_on_description()` in `bin/helpers/nagent_cli.py`
 prints path + description when `--description` is in `sys.argv`.
-`collect_bin_tool_descriptions()` runs each executable in `bin/` with
-`--description` and inserts the results into initial context. Add an
-executable to `bin/` that answers `--description` and the loop knows about
-it. Nothing else to register.
+`collect_bin_tool_descriptions()` runs each executable with `--description`
+and inserts the results into initial context. Discovery is layered: the
+install `bin/`, then `~/.nagent/bin/`, then the project's `.nagent/bin/`,
+deduplicated by basename with the most specific layer winning. Drop an
+executable in `.nagent/bin/` and every conversation in that project knows it.
+Nothing else to register.
 
-| Tool                    | Role                                              |
-| ----------------------- | ------------------------------------------------- |
-| `nagent`                | Main structured conversation loop.                |
-| `nagent-llm-text`       | Send a text file to the configured LLM.           |
-| `nagent-llm-upload`     | Upload a supported file with a prompt.            |
-| `nagent-file-edit`      | Per-file conversation for one source file.        |
-| `nagent-file-split`     | Split large file into segments + `index.json`.    |
-| `nagent-file-patch`     | Merge segments, write patch, validate hashes.     |
-| `nagent-file-summarize` | Summarize inline or via split summaries.          |
-| `nagent-distill`             | Harvest knowledge from dead artifacts, reclaim.   |
+| Tool                    | Role                                                |
+| ----------------------- | --------------------------------------------------- |
+| `nagent`                | Main structured conversation loop.                  |
+| `nagent-llm-text`       | Send a text file to the configured LLM.             |
+| `nagent-llm-upload`     | Upload a supported file with a prompt.              |
+| `nagent-file-edit`      | Per-file conversation for one source file.          |
+| `nagent-file-split`     | Split large file into segments + `index.json`.      |
+| `nagent-file-patch`     | Merge segments, write patch, validate hashes.       |
+| `nagent-file-summarize` | Summarize inline or via split summaries.            |
+| `nagent-distill`        | Harvest, merge, and graduate knowledge; reclaim.    |
 | `nagent-campaign`       | Operate campaigns: plans as data, driven in passes. |
 
 **Example**
 
 ```bash
 nagent --description
-nagent-distill --description
+nagent-campaign --description
 ```
 
 **Build your own:** tools emit capability text. Assemble prompts from that.
@@ -284,9 +281,9 @@ durable artifacts
 next temporary worker
 ```
 
-**Implementation** — `bin/nagent` stores conversations under
-`~/.nagent/conversations/`. It appends user prompts, model responses, tool
-results, parser corrections, interrupts, and sub-conversation results to the
+**Implementation** — `bin/nagent` stores conversations under the root's
+`conversations/`. It appends user prompts, model responses, tool results,
+parser corrections, interrupts, and sub-conversation results to the
 conversation file. Kill the process mid-task and the file holds everything;
 the next process picks it up. The Python process is a worker. The files are
 the system.
@@ -306,10 +303,11 @@ running loop a conversation, because that is what is on disk.
 
 # Part III — Own the Data
 
-## 6. Conversations Are Editable State
+## 6. Conversations Are Editable State — at the Right Scope
 
 **Idea** — The conversation file is not chat history. It is working state,
-and it belongs to you.
+it belongs to you, and it belongs *somewhere*: memory that belongs to a
+project should live with the project.
 
 Tool transcript. Correction channel. Continuation point. Mutable artifact.
 Memory goes stale; therefore editing history is maintenance, not corruption.
@@ -326,9 +324,9 @@ Memory goes stale; therefore editing history is maintenance, not corruption.
 **Implementation** — Explicit maintenance commands:
 
 - `--save-conversation NAME` copies the conversation and records it, with an
-  LLM-generated summary, in a saved-conversations index. If the summary fails
-  (no credentials, provider down), the save still completes — the index gets
-  a visible "(summary unavailable)" marker instead of losing the entry.
+  LLM-generated summary, in a saved-conversations index. If the summary
+  fails, the save still completes — the index gets a visible
+  "(summary unavailable)" marker instead of losing the entry.
 - `--load-conversation` / `--branch-conversation` archive the current file
   and copy a saved or named conversation into place.
 - `--summarize` prints an LLM summary of the loaded conversation.
@@ -339,19 +337,19 @@ Memory goes stale; therefore editing history is maintenance, not corruption.
 
 Implicit maintenance comes from the fact that conversations are ordinary
 files: open them, trim them, rewrite them, diff them, copy them, version
-them, script them. Delete stale tool spam, fix a bad assumption, replace ten
-pages with one paragraph.
+them, script them.
 
-The root itself is project-local: inside a git repository the default root
-is `{toplevel}/.nagent` — conversations, knowledge, and per-file memory live
-with the repo and can be committed and shared (review first: conversations
-contain tool output). `--root` overrides; outside a repo the root is
-`~/.nagent`. A newly created root ships a `.gitignore` covering only
-regenerable artifacts (`splits/`).
+Ownership has scopes, and the root follows them. Project memory was trapped
+in a personal dotdir; therefore, inside a git repository the default root is
+`{toplevel}/.nagent` — conversations, knowledge, campaigns, and per-file
+memory live with the repo and can be committed and shared (review first:
+conversations contain tool output). `--root` overrides; outside a repo the
+root is `~/.nagent`. A newly created root ships a `.gitignore` covering only
+regenerable artifacts (`splits/`); committing the rest is deliberate.
 
 The prompt-side inputs are yours too, in four layers, least personal first —
-each loaded from a `context.yaml` (a list or `{ "paths": [...] }`, nested
-files expanding recursively) or a `context.md`:
+each a `context.yaml` (a list or `{ "paths": [...] }`, nested files expanding
+recursively) or a `context.md`:
 
 1. **Install** — the nagent folder itself; this repository ships
    `context.yaml` pointing at `context/data-oriented-design.md`.
@@ -361,15 +359,11 @@ files expanding recursively) or a `context.md`:
 4. **Root** — the resolved root's own context (the project's `.nagent/`).
 
 More specific layers come later and can override; a layer whose directory
-equals an earlier layer's is included once, not twice (e.g. running nagent
-from inside its own checkout). The compaction and harvest prompts resolve
-through the same layering — project `.nagent/prompts/`, then
-`~/.nagent/prompts/`, then the install copy — and so do tools: executables
-in the project's `.nagent/bin/` and in `~/.nagent/bin/` join discovery,
-shadowing same-named install tools, most specific layer winning. Drop a
-script in `.nagent/bin/` and every conversation in that project knows it.
-Config resolves CLI flags → `NAGENT_CONFIG` → project `.nagent/config.json`
-→ `~/.nagent/config.json`.
+equals an earlier layer's is included once, not twice. The prompts under
+`prompts/` (compaction, harvest, checkpoint, campaign) resolve through the
+same layering — project `.nagent/prompts/`, then `~/.nagent/prompts/`, then
+the install copy. Config resolves CLI flags → `NAGENT_CONFIG` → project
+`.nagent/config.json` → `~/.nagent/config.json`.
 
 **Example**
 
@@ -382,7 +376,8 @@ nagent --edit-conversation "keep the decisions and remove obsolete logs"
 ```
 
 **Build your own:** memory is a data structure on disk. Give the user the
-same rights over it that they have over any other file, because it is one.
+same rights over it that they have over any other file, because it is one —
+and put it at the scope where it belongs.
 
 ---
 
@@ -420,38 +415,21 @@ summarized commits. `run_file_summary()` adds a current-content summary.
 Injected as `{file-history}` and `{file-summary}` blocks. Hints, not
 commands.
 
-**Example**
-
-```text
-{file-history}
-File: src/foo.py
-
-Individuals who edited this file:
-- Alice <alice@example.com>: 3 commits
-
-Step-by-step history:
-- 2026-05-01 abc123 Alice: Adds validation.
-{/file-history}
-```
-
 **Build your own:** turn history into explicit context blocks. Cache the
 summaries in the durable conversation. Do not re-pay LLM cost for unchanged
 history.
 
-## 8. Harvest Knowledge, Reclaim Space
+## 8. Distill: Harvest, Merge, Graduate
 
 **Idea** — Dead conversations accumulate, and deleting them loses what was
 learned. Therefore: distill, then delete — and feed the distillate back in.
 
-This is the strongest version of the "files create opportunities" argument.
-Session state that other tools discard becomes compounding, user-editable
-knowledge.
-
-**Implementation** — `nagent-distill` scans the nagent root and classifies every
-artifact: live conversations, user-kept saves, prunable stale splits and dead
-index entries, and harvest candidates — conversation archives, delegated
-sub-conversations, per-file conversations whose target file is gone. Unknown
-is kept, never deleted.
+**Implementation** — `nagent-distill` scans the root and classifies every
+artifact: live conversations, user-kept saves, prunable stale splits and
+dead index entries, and harvest candidates — conversation archives,
+delegated sub-conversations, per-file conversations whose target file is
+gone, and a finished campaign's conversations (the plan files stay as the
+record). Unknown is kept, never deleted.
 
 For each harvest candidate, an LLM pass driven by the user-editable
 `prompts/harvest-conversation.md` extracts facts, decisions, completed and
@@ -459,42 +437,39 @@ open tasks, open questions, and playbooks into category files under the
 root's `knowledge/` — every bullet carrying provenance
 (`[from: conversation, date]`). Notes tied to a specific file mirror into
 `knowledge/files/{file_id}.md`. Deletion is gated on a sha256 entry in
-`knowledge/ledger.json` proving the harvest happened; identical content never
-pays the LLM twice.
+`knowledge/ledger.json` proving the harvest happened; identical content
+never pays the LLM twice.
 
 A bounded `digest.md` (open tasks and questions first, newest first)
 regenerates from the category files — never from raw conversations, so your
-edits to the category files propagate — and is injected into every
-conversation's `<initial_context>` as a `{knowledge}` block. Delete
-`digest.md` and injection turns off. That is the whole switch.
+edits propagate — and is injected into every conversation's
+`<initial_context>` as a `{knowledge}` block. Delete `digest.md` and
+injection turns off. That is the whole switch.
 
-Dry run is the default and prints the classification table plus the estimated
-harvest cost in tokens before anyone pays it.
-
-Two more distillation passes keep the store healthy. `--merge` rewrites each
+Two maintenance passes keep the store healthy. `--merge` rewrites each
 category file — dedup, merge, compress, provenance preserved — keeping the
-previous content as `{file}.pre-merge`; the digest regenerates from the
-result, so a merge propagates exactly like a hand edit. `--graduate` drafts
-reusable artifacts: proven playbooks become `.draft` tools or prompts under
-the root, and a finished campaign's `bin/` and `prompts/` are staged the same
-way. Drafts are deliberately not executable — invisible to tool discovery
-until you review, rename, and `chmod +x`. Nothing lands silently. Finished
-campaigns' conversations also classify as harvest sources, so a completed
-plan's working state feeds the knowledge store before reclaim.
+previous content as `{file}.pre-merge`. `--graduate` answers the question
+"why is this proven playbook still prose?": playbooks become `.draft` tools
+or prompts under the root, and a finished campaign's `bin/` and `prompts/`
+are staged the same way. Drafts are deliberately not executable — invisible
+to tool discovery until you review, rename, and `chmod +x`. Knowledge
+becomes capability, gated by review. Nothing lands silently.
+
+Dry run is the default everywhere, with the estimated cost in tokens printed
+before anyone pays it.
 
 **Example**
 
 ```bash
 nagent-distill                        # dry run: classify, estimate cost
 nagent-distill --apply                # harvest into {root}/knowledge/, reclaim
-nagent-distill --apply --no-harvest   # reclaim only, no LLM pass
 nagent-distill --merge --apply        # dedup/compress the knowledge files
-nagent-distill --graduate --apply     # draft proven playbooks as tools/prompts
+nagent-distill --graduate --apply     # draft proven playbooks as tools
 ```
 
-**Build your own:** never delete an artifact you have not distilled, and
-keep the proof of distillation in data. Make the distillate editable — the
-user will know which "facts" are wrong before any model does.
+**Build your own:** never delete an artifact you have not distilled, keep
+the proof of distillation in data, and give knowledge a path to become a
+tool — with the user as the gate.
 
 ## 9. Everything Else Files Buy You
 
@@ -511,11 +486,31 @@ None of these required a feature. They required the state to be files.
 **Build your own:** before building a feature, check whether `cat`, `diff`,
 and `cp` already do it. With file-based state, they often do.
 
+## 10. Project Memory Is Team Memory
+
+**Idea** — The project-local root turns every opportunity above from
+personal to shared.
+
+Commit `.nagent/` and knowledge, per-file conversations, campaign plans, and
+graduated tools in `.nagent/bin` arrive with `git clone`. A teammate's first
+conversation starts from what the project already learned, and changes to
+the project's memory are reviewable in the same pull request as the code
+they describe. The artifacts compound across people, not just across
+sessions.
+
+Say the caveat plainly: conversations contain tool output and can contain
+secrets — review before committing, like any other file. The choice stays
+with you: the scaffolded `.gitignore` excludes only regenerable `splits/`;
+everything else is deliberate.
+
+**Build your own:** sharing memory should not need a memory service. A
+directory in the repo and code review are the synchronization protocol.
+
 ---
 
 # Part V — Name the Principles
 
-## 10. Data-Oriented Design
+## 11. Data-Oriented Design
 
 **Idea** — You have been using these principles since Part I. Here are their
 names.
@@ -528,15 +523,16 @@ names.
   appended text, not control flow (Part I).
 - **Separate durable artifacts from temporary execution.** Workers are
   disposable; artifacts are durable (Part II).
-- **Optimize the shape, availability, and maintenance of the data.** Editable
-  conversations, cached commit summaries, harvested digests (Parts III–IV).
+- **Optimize the shape, availability, and maintenance of the data.**
+  Editable conversations, cached commit summaries, merged knowledge,
+  project-scoped roots (Parts III–IV).
 
 The whole system is one transformation:
 
 ```text
 repository history
         +
-install + project + root context
+install + user + project + root context
         +
 conversation
         +
@@ -569,9 +565,9 @@ lifetime, who edits it, and what transforms it.
 
 # Part VI — The Data Structures That Fall Out
 
-Three applied chapters. Each is the principles from Part V doing work.
+Four applied chapters. Each is the principles from Part V doing work.
 
-## 11. Artifact Neighborhoods
+## 12. Artifact Neighborhoods
 
 **Idea** — A file lives in a neighborhood of related artifacts.
 
@@ -593,8 +589,8 @@ target file
 same commits as the target and labels high/medium/low co-edit rates.
 `format_file_history()` puts the table in file-edit context with guidance:
 inspect high co-edit files when the change may touch interfaces, tests,
-config, or paired code. Per-file knowledge notes harvested by `nagent-distill`
-join the same neighborhood.
+config, or paired code. Per-file knowledge notes harvested by
+`nagent-distill` join the same neighborhood.
 
 **Example**
 
@@ -611,14 +607,10 @@ targets.**
 inspection guidance. Ground edits in the current request and current code,
 not historical association alone.
 
-## 12. Managing Context and Large Files
+## 13. Managing Context and Large Files
 
-**Idea** — Context windows are a budget. Spend it explicitly.
-
-Large files exceed context windows. Therefore split them into explicit
-artifacts. Conversations grow too. Therefore compact them, bound the
-knowledge digest, and push noisy exploration into disposable
-sub-conversations.
+**Idea** — Context windows are a budget. Spend it explicitly — and have a
+safety net for the conversation that outgrows its window anyway.
 
 ```text
 large source file
@@ -634,53 +626,20 @@ updated source file
 
 **Implementation** — Inline reads cap at 64 KB. `<nagent-file-read>` calls
 `nagent-file-split` beyond that. Splitting uses language-aware natural
-splitters (`txt`, `md`, `cpp`, `py`, `xml`, `js`, `ts`, `json`, `yaml`, `go`,
-`rs`, `java`) that prefer structural boundaries — headings, blank lines,
-defs, brace depth — and writes segment files plus `index.json`: source path,
-hash, size, line ranges, split type. `nagent-file-patch` validates the source
-hash (unless `--force`), merges segments, writes a unified diff patch,
-applies it, and refreshes the index. `--refresh` re-splits after the source
-changes. `nagent-file-summarize` handles small files inline and large ones
-per-segment with summaries stored in the index.
+splitters (`txt`, `md`, `cpp`, `py`, `xml`, `js`, `ts`, `json`, `yaml`,
+`go`, `rs`, `java`) that prefer structural boundaries and writes segment
+files plus `index.json`: source path, hash, size, line ranges, split type.
+`nagent-file-patch` validates the source hash (unless `--force`), merges
+segments, writes a unified diff patch, applies it, and refreshes the index.
+`nagent-file-summarize` handles small files inline and large ones
+per-segment.
 
-Conversation-side budget tools: `--compact` rewrites the conversation against
-editable guidance; the knowledge digest is byte-capped before injection; and
-`<nagent-conversation>` spawns a child nagent with an isolated conversation
-file — the parent keeps coordination, the child keeps the noise, and only the
-distilled result returns as a `<nagent-conversation-result>` with its token
-totals rolled up. Delegation is context management before it is parallelism.
-
-A safety net catches the conversation that outgrows its window anyway.
-Checkpoints: a separate one-call writer (not the working model — asking a
-mid-task model to also keep the log degrades both jobs) maintains
-`{conversation}.checkpoint.md`, a fixed-schema, user-editable working-state
-file. The cadence is wall-clock with a burst guard, computed from data on
-disk — the checkpoint records its own timestamp and the conversation size:
-fire after `checkpoint_interval_minutes` (default 60) when the conversation
-has grown, or immediately after `checkpoint_max_new_kb` (default 256) of
-new content regardless of time, because a five-minute log-reading burst is
-exactly when a stale checkpoint is worthless. An idle hour costs nothing.
-Rebuild: past `rebuild_at_kb` (default 384) the loop runs a synchronous
-checkpoint (failure widens the raw tail instead of blocking), archives the
-conversation, and assembles a fresh window — initial context + checkpoint +
-recent tail — deterministically, no LLM rewrite. A long task becomes an
-inspectable chain of window files linked by checkpoints, and the archives
-feed `nagent-distill`. Three config numbers, all verifiable with `ls -l`.
-
-The initial context directs the model to exploit conversations as data, not
-just spawn them. Reuse a named worker: `conversation-file="name"` continues
-that conversation with its accumulated context — a specialist (a test runner,
-a schema navigator) that gets cheaper and better-grounded each call. Resume
-saved work: `conversation-name` starts a child from a conversation the user
-saved. Author a worker's context: the model's write boundary includes temp
-directories, so it can write a curated briefing file and spawn a child on it —
-controlling exactly what the worker knows instead of re-narrating context
-into a prompt. And hand off when noisy: when its own conversation is mostly
-stale tool output, distill goal, state, and decisions into a fresh
-sub-conversation and delegate the rest — compaction semantics through the one
-mechanism the model already has, without racing the live file. The model is
-also told the conversation persists and the user may edit it between runs:
-the current file is the source of truth.
+Conversation-side budget tools: `--compact` rewrites the conversation
+against editable guidance; the knowledge digest is byte-capped before
+injection; and `<nagent-conversation>` spawns a child nagent with an
+isolated conversation file — the parent keeps coordination, the child keeps
+the noise, and only the distilled result returns with its token totals
+rolled up. Delegation is context management before it is parallelism.
 
 | Long-lived agent abstractions  | Disposable workers               |
 | ------------------------------ | -------------------------------- |
@@ -688,6 +647,34 @@ the current file is the source of truth.
 | Shared context gets noisy      | Child context is isolated        |
 | Parent absorbs all exploration | Parent gets a concise result     |
 | Delegation implies personality | Delegation is context management |
+
+The safety net catches what decomposition cannot bound. Checkpoints: a
+separate one-call writer — not the working model; asking a mid-task model to
+also keep the log degrades both jobs — maintains
+`{conversation}.checkpoint.md`, a fixed-schema, user-editable working-state
+file. The cadence is wall-clock with a burst guard, computed from data on
+disk (the checkpoint records its own timestamp and the conversation size):
+fire after `checkpoint_interval_minutes` (default 60) when the conversation
+has grown, or immediately after `checkpoint_max_new_kb` (default 256) of new
+content regardless of time — a five-minute log-reading burst is exactly when
+a stale checkpoint is worthless. An idle hour costs nothing. Your edits to
+the checkpoint survive the next writer pass.
+
+Rebuild: past `rebuild_at_kb` (default 384) the loop runs a synchronous
+checkpoint (failure widens the raw tail instead of blocking), archives the
+conversation, and assembles a fresh window — initial context + `{checkpoint}`
+block + recent raw tail — deterministically, no LLM rewrite. A long task
+becomes an inspectable chain of window files linked by checkpoints, and the
+archives feed `nagent-distill`. Three config numbers, all verifiable with
+`ls -l`.
+
+The initial context also directs the model to exploit conversations as data:
+reuse a named worker (`conversation-file="name"` continues that conversation
+with its accumulated context), resume saved work (`conversation-name`),
+author a worker's briefing under the temp write boundary and spawn a child
+on it, hand off to a fresh sub-conversation when its own context is mostly
+stale tool output, and — for a high-stakes decision — brief 2–3 workers plus
+a judge, spending those tokens only when the decision warrants it.
 
 **Example**
 
@@ -697,18 +684,12 @@ nagent-file-split --file src/big.py --output /tmp/big-split --json
 nagent-file-patch --index /tmp/big-split/index.json --json
 ```
 
-```xml
-<nagent-conversation>
-Inspect the split and patch tests. Return only the behaviors the README should explain.
-</nagent-conversation>
-```
+**Build your own:** chunking is a data structure — index it, hash the
+source, edit bounded segments, emit a patch artifact. Checkpoint working
+state on a clock you can explain, rebuild deterministically, and keep every
+window on disk.
 
-**Build your own:** chunking is a data structure — index it, hash the source,
-edit bounded segments, emit a patch artifact. And give every noisy
-investigation its own disposable conversation; return a distilled artifact,
-not the noise.
-
-## 13. Per-File Write Conversations
+## 14. Per-File Write Conversations
 
 **Idea** — Work recurs around individual files. Give each file its own
 persistent conversation — memory and write authority attached to the
@@ -726,7 +707,7 @@ main conversation
 
 **Implementation** — `bin/nagent-file-edit` resolves a file-specific
 conversation and delegates to `bin/nagent --file-edit`. The index,
-`~/.nagent/conversations/file-index-{pid}.json`, keys files by stable file id
+`conversations/file-index-{pid}.json`, keys files by stable file id
 (device + inode via `file_id_for_path()`), so renames keep their memory. The
 per-file conversation's initial context carries the file's history block,
 commit summaries, current summary, and harvested knowledge notes.
@@ -748,31 +729,101 @@ not of whoever happens to be running a session.
 
 ```bash
 nagent-file-edit --file src/foo.py "add error handling"
-nagent-file-edit --file src/foo.py --clear
 nagent --list-file-edits
-```
-
-```json
-{
-  "by_file_id": {
-    "2050:123456": {
-      "file_id": "2050:123456",
-      "path": "/repo/src/foo.py",
-      "conversation": "foo-0c2f..."
-    }
-  }
-}
 ```
 
 **Build your own:** when work orbits one artifact, store memory on that
 artifact's identity and scope write authority to it. Session memory = what
 happened today. Artifact memory = what we learned about this file.
 
+## 15. Campaigns: Plans as Operable Artifacts
+
+**Idea** — After everything else became a file, the model's sense of what to
+do next is the last hidden state: re-decided every turn, invisible,
+degrading as context grows. Make the plan a first-class artifact and the
+driver a deterministic transform over it.
+
+Be precise about what is extracted. The model's non-determinism is not
+removed; it is *relocated and bounded*. Selection, blocking, sequencing, and
+completion mechanics become code reading a tree; the model is scoped to
+narrow judgments — decompose *this* item, execute *this* item, judge *this*
+condition — each with a curated context. The determinism boundary is exactly
+the schema.
+
+**Implementation** — A campaign lives at `{root}/campaigns/{slug}/`: a
+hand-editable `index.yaml` spine (tree of item ids, statuses, `blocked_by`
+edges, review thresholds, dispatch budget), per-item `items/{id}/item.yaml`
+detail, and a per-item conversation — artifact-local memory where the
+artifact is a unit of work, continuable across dispatches. The one-pass
+driver, `nagent-campaign update`: merge worker results, route answered
+questions, check completion conditions, gate decomposition proposals,
+dispatch unblocked todo leaves, then exit. Four invariants are load-bearing:
+
+- **One pass, then exit.** No resident process, no watch mode. Looping is
+  your composition — a scheduler growing inside the tool means the design
+  failed its own test.
+- **One writer for the tree.** Workers return structured results
+  (`result.json` in their own item dir); only the driver mutates the plan.
+  LLMs produce data; code mutates artifacts.
+- **Plan changes pass a review gate, not a cap.** Large projects must not be
+  inhibited; you make an informed choice. Decomposition lands as proposals
+  with their scope reported — items added, depth, estimated cost; changes
+  within your thresholds auto-confirm; a new campaign's initial
+  decomposition always waits. Edit the proposal file directly, then confirm.
+- **The schema is the whole schema.** If the YAML needs a manual, the
+  "interface is the editor" property is lost.
+
+Completion is conditions, not claims: executable `test:` scripts in the
+campaign's `tests/` (deterministic, preferred) and `judge:` prose only when
+unavoidable. A premature "done" bounces back to `todo` by mechanism, not
+exhortation. Open questions are first-class blockers: workers raise them,
+they land in `questions.md`, you answer by editing the file, and the next
+update routes the answer into the item's briefing.
+
+The initial context directs the model to create campaigns for work that
+outlives a conversation ("the plan must survive you"), injects an ambient
+status block for active campaigns, and runs dispatched workers in a
+dedicated `--campaign-item` mode carrying the contract; a campaign's own
+`bin/` joins tool discovery for its workers.
+
+**Example**
+
+```yaml
+name: Migrate config format
+description: Replace the legacy loader with the new format.
+status: active
+review:
+  auto_confirm_max_items: 5
+  auto_confirm_max_depth: 2
+dispatch:
+  max_per_update: 4
+items:
+- id: 0001-inventory-call-sites
+  status: done
+- id: 0002-implement-new-loader
+  status: todo
+  blocked_by:
+  - 0001-inventory-call-sites
+```
+
+```bash
+nagent-campaign new "Migrate config format" --goal "Replace the loader."
+nagent-campaign add migrate-config-format "Inventory call sites"
+nagent-campaign update migrate-config-format --dry-run   # preview the pass
+nagent-campaign update migrate-config-format             # merge, check, gate, dispatch
+nagent-campaign review migrate-config-format             # pending proposals + scope
+nagent-campaign confirm migrate-config-format            # accept the plan change
+```
+
+**Build your own:** plan-as-artifact plus a dumb driver beats
+plan-as-program. If your orchestrator needs a runtime, your plan has stopped
+being data.
+
 ---
 
 # Part VII — How This Differs From Frameworks
 
-## 14. Own the Inputs
+## 16. Own the Inputs
 
 **Idea** — Use a framework when it buys something concrete. The question to
 ask first is who owns the data.
@@ -780,11 +831,11 @@ ask first is who owns the data.
 nagent uses plain files, Python, subprocesses, and structured text. The
 interesting part is artifact management and explicit data flow, not tool
 calling. The point is not "frameworks bad." The point is that the inputs to
-the system — prompts, conversations, tool results, summaries, indexes,
-patches, harvested knowledge — should not be trapped inside an opaque layer
-that hides, rewrites, stores, or modifies them beyond the transformations LLM
-providers already perform. nagent keeps as much control as it can by making
-every input transparent and editable.
+the system — prompts, conversations, plans, tool results, summaries,
+indexes, patches, harvested knowledge — should not be trapped inside an
+opaque layer that hides, rewrites, stores, or modifies them beyond the
+transformations LLM providers already perform. nagent keeps as much control
+as it can by making every input transparent and editable.
 
 | Framework-style system       | nagent                  |
 | ---------------------------- | ----------------------- |
@@ -826,11 +877,15 @@ in the same order this README taught it:
 6. Loop after actions
 7. Visible retry on malformed output
 8. Save/load/branch/edit/compact for conversation maintenance
-9. Repository history → context blocks
-10. Harvest dead conversations into a knowledge store; inject a bounded digest
-11. Per-artifact memory with stable ids and bounded write authority
-12. Split/index/patch for large files
-13. Child loops for delegation
+9. A project-local root with layered context, prompts, tools, and config
+10. Repository history → context blocks
+11. Harvest dead conversations into a knowledge store; inject a bounded
+    digest; merge it; graduate proven playbooks into tools
+12. Per-artifact memory with stable ids and bounded write authority
+13. Wall-clock checkpoints and deterministic rebuild into window chains
+14. Plans as operable artifacts: a hand-editable tree, a one-pass driver, a
+    review gate, completion conditions
+15. Child loops for delegation
 
 Code reading order:
 
@@ -853,13 +908,15 @@ bin/helpers/nagent_file_split_lib.py
 bin/helpers/nagent_file_patch_lib.py
 bin/helpers/nagent_file_summarize_lib.py
 bin/helpers/nagent_distill_lib.py
+bin/helpers/nagent_campaign_lib.py
 ```
 
-Tests are executable notes: parser and protocol, conversation lifecycle, root
-and install context, retries, tokens, sub-conversations, result wrappers,
-write validation, file ids, file-edit index, git history, co-edited files,
-summaries, split/patch, distill classification and harvest, root and layer
-resolution, providers, tool descriptions, JSON output.
+Tests are executable notes: parser and protocol, conversation lifecycle,
+root and layer resolution, retries, tokens, sub-conversations, result
+wrappers, write validation, file ids, file-edit index, git history,
+co-edited files, summaries, split/patch, distill classification, harvest,
+merge and graduate, campaign schema, driver, review gate and conditions,
+checkpoint triggers and rebuild, providers, tool descriptions, JSON output.
 
 ---
 
@@ -881,7 +938,10 @@ Config: CLI flags → `NAGENT_CONFIG` → project `.nagent/config.json` →
 ```json
 {
   "provider": "openai",
-  "model": "gpt-5.5"
+  "model": "gpt-5.5",
+  "checkpoint_interval_minutes": 60,
+  "checkpoint_max_new_kb": 256,
+  "rebuild_at_kb": 384
 }
 ```
 
