@@ -618,13 +618,11 @@ def build_initial_context(
 ) -> str:
     parent = parent_conversation or "none"
     if invocation == "user":
-        response_hint = "Use <nagent-response> to communicate with the human user."
         role_instructions = """User invocation:
 - A human started this nagent instance from the command line.
 - Use <nagent-response> for human-facing replies.
 - Coordinate the overall request; delegate execution and research."""
     else:
-        response_hint = "Use <nagent-response> to return your final result to the parent nagent."
         role_instructions = """Delegated invocation:
 - A parent nagent conversation spawned you for one scoped task (see <user-prompt>).
 - Use <nagent-response> for your final result to the parent—concise and structured, not conversational.
@@ -633,20 +631,31 @@ def build_initial_context(
     git_context = git_repo_context()
     git_section = f"\n{git_context}" if git_context else ""
     tools_section = collect_bin_tool_descriptions(process_path.parent)
-    tools_block = f"\n\n{tools_section}" if tools_section else ""
+    tools_block = f"\n{tools_section}\n" if tools_section else ""
     # Install context ships with the nagent folder itself (context.yaml or
     # context.md next to bin/); it is injected before the per-root context so
     # root context can override or extend it.
-    install_context = load_root_context(process_path.resolve().parent.parent)
+    install_dir = process_path.resolve().parent.parent
+    install_context = load_root_context(install_dir)
     install_context_block = f"\n{install_context}\n" if install_context else ""
+    # Project context: a context.yaml/context.md at the git toplevel of the
+    # current working directory. Skipped when that directory is the install
+    # or root directory, so the same file is not included twice (e.g. running
+    # nagent from inside the nagent checkout).
+    project_context_block = ""
+    project_dir = git_toplevel_for_path(Path.cwd())
+    if project_dir is not None:
+        try:
+            project_resolved = project_dir.resolve()
+            is_duplicate = project_resolved == install_dir or project_resolved == root.resolve()
+        except OSError:
+            is_duplicate = True
+        if not is_duplicate:
+            project_context = load_root_context(project_dir)
+            if project_context:
+                project_context_block = f"\n{project_context}\n"
     root_context = load_root_context(root)
     root_context_block = f"\n{root_context}\n" if root_context else ""
-    if file_edit_path is not None:
-        write_hint = "Use <nagent-write> according to the File editing (this session) rules above."
-    else:
-        write_hint = (
-            "Use <nagent-write> for temp files only; use nagent-file-edit for project files."
-        )
     file_edit_block = ""
     file_edit_detail_block = ""
     if file_edit_path is not None:
@@ -666,33 +675,42 @@ def build_initial_context(
             file_edit_detail_block += f"\n{{file-knowledge}}\n{file_knowledge}\n{{/file-knowledge}}\n"
 
     knowledge_digest = load_context_file(digest_path(root))
-    knowledge_block = f"\n{{knowledge}}\n{knowledge_digest}\n{{/knowledge}}\n" if knowledge_digest else ""
+    knowledge_block = ""
+    if knowledge_digest:
+        knowledge_block = (
+            "\nThe {knowledge} block below is distilled from previous conversations "
+            "by nagent-gc; items carry provenance. Treat them as hints and verify "
+            "before relying on them.\n"
+            f"{{knowledge}}\n{knowledge_digest}\n{{/knowledge}}\n"
+        )
 
+    # Block order is stable-to-volatile on purpose: the protocol, rules, tools,
+    # and context blocks are byte-identical across conversations of the same
+    # mode, so request prefixes stay shareable; instance facts and environment
+    # go last.
     return f"""<initial_context>
 {NAGENT_PREAMBLE}
 
+{role_instructions}
+
 Respond only with one or more of these structured tags (no other text):
-- <nagent-response>{{text to respond to user}}</nagent-response>
-- <nagent-read path="{{file-path-to-read}}" />
-- <nagent-file-read path="{{file-path-to-read}}" />
-- <nagent-file-patch index="{{index-json-path}}" />
-- <nagent-write path="{{file-path-to-write}}">{{file content}}</nagent-write>
-- <nagent-shell>{{shell commands}}</nagent-shell>
-- <nagent-next>{{prompt}}</nagent-next>
-- <nagent-conversation>{{prompt}}</nagent-conversation>
-- <nagent-conversation conversation-file="{{path-to-conversation-file}}">{{prompt}}</nagent-conversation>
-- <nagent-conversation conversation-name="{{saved-conversation-name}}">{{prompt}}</nagent-conversation>
+- <nagent-response>{{text}}</nagent-response> — your final reply to your caller. A turn containing only this tag ends the run.
+- <nagent-read path="{{file-path-to-read}}" /> — read a small file (<= {READ_SPLIT_THRESHOLD_BYTES // 1024}KB) inline.
+- <nagent-file-read path="{{file-path-to-read}}" /> — read a file of any size; large files are split automatically.
+- <nagent-file-patch index="{{index-json-path}}" /> — merge edited split segments back into the source file.
+- <nagent-write path="{{file-path-to-write}}">{{file content}}</nagent-write> — write a file inside your write boundary (see File editing).
+- <nagent-shell>{{shell commands}}</nagent-shell> — run shell commands; output is appended to this conversation.
+- <nagent-next>{{prompt}}</nagent-next> — append a prompt to yourself and continue reasoning.
+- <nagent-conversation>{{prompt}}</nagent-conversation> — delegate a sub-task to an isolated sub-conversation.
+- <nagent-conversation conversation-file="{{name-or-path}}">{{prompt}}</nagent-conversation> — continue a named worker conversation, or start one from a file you wrote.
+- <nagent-conversation conversation-name="{{saved-conversation-name}}">{{prompt}}</nagent-conversation> — start a child from a saved conversation.
 
-Instance:
-- invocation: {invocation}
-- conversation: {conversation_name}
-- parent conversation: {parent}{file_edit_block}
-
-Environment:
-- nagent root: {root}
-- nagent process: {process_path}
-- cwd: {Path.cwd()}
-- host (uname -a): {host_uname()}{git_section}{tools_block}
+Protocol rules:
+- Tag bodies are raw text. Do not escape characters. Never emit a literal close tag (e.g. </nagent-shell>) inside a body; the first matching close tag ends the body.
+- Emit nothing outside tags. The parser rejects prose, unknown tags, and unknown attributes; an invalid turn comes back with a correction request.
+- After your action tags run, each result is appended to this conversation as a <nagent-*-result> block and you are called again. Never fabricate results; act on the appended ones.
+- Multiple tags in one turn run in order.
+- A result with an error status is data: change your approach instead of retrying the identical action.
 
 Context management (every nagent conversation, including sub-conversations):
 - Each nagent instance has its own private conversation file; parent and child conversations do not share context.
@@ -703,21 +721,27 @@ Context management (every nagent conversation, including sub-conversations):
   - research-heavy (many files, codebase search, comparing options)
   - likely to produce large output (long logs, big reads) that would bloat your thread
 - Keep in your own conversation only coordination, decisions, and small direct steps for your assigned task.
-- Start each sub-conversation a self-contained prompt with goal, constraints, paths, and the result format you need back.
+- Start each sub-conversation with a self-contained prompt: goal, constraints, paths, and the result format you need back.
+
+Conversations are data (create, reuse, hand off):
+- Reuse a worker: <nagent-conversation conversation-file="{{name}}"> continues that conversation with its accumulated context. Name workers you will call again (e.g. "test-runner"); use a fresh unnamed sub-conversation when isolation matters more than memory.
+- Resume saved work: conversation-name="{{saved-name}}" starts the child from a conversation the user saved with --save-conversation.
+- Author a worker's context: write a curated briefing to a temp file with <nagent-write>, then spawn <nagent-conversation conversation-file="/tmp/...">. Include only what the worker needs: goal, constraints, paths, known facts.
+- Hand off when noisy: if this conversation is mostly stale tool output, distill goal/state/decisions into a sub-conversation prompt, delegate the rest, and tell your caller about the handoff. Never rewrite your own conversation file while running.
+- This conversation persists across invocations, and the user may edit it between runs. The current file is the source of truth.
 
 {file_edit_rules(file_edit_path)}
+{tools_block}{install_context_block}{project_context_block}{root_context_block}{knowledge_block}{file_edit_detail_block}
+Instance:
+- invocation: {invocation}
+- conversation: {conversation_name}
+- parent conversation: {parent}{file_edit_block}
 
-{response_hint}
-Use <nagent-read> for small files; use <nagent-file-read> when the file may exceed {READ_SPLIT_THRESHOLD_BYTES // 1024}KB.
-{write_hint}
-Use <nagent-shell> for other commands; output will be appended to your conversation.
-Use <nagent-next> to continue reasoning with an appended prompt.
-Use <nagent-conversation> to delegate a sub-task to a separate nagent sub-conversation.
-Optional <nagent-conversation> parameters: conversation-file loads a specific --conversation file; conversation-name loads a saved conversation like --load-conversation.
-
-{file_edit_detail_block}
-{install_context_block}{root_context_block}{knowledge_block}
-{role_instructions}
+Environment:
+- nagent root: {root}
+- nagent process: {process_path}
+- cwd: {Path.cwd()}
+- host (uname -a): {host_uname()}{git_section}
 </initial_context>"""
 
 
@@ -943,11 +967,37 @@ def parse_llm_json_output(stdout: str) -> tuple[str, int, int] | None:
     )
 
 
+def conversation_cache_boundaries(text: str) -> list[int]:
+    """Character offsets ending the stable prefixes of a conversation file.
+
+    Two boundaries when the file starts with an initial-context block: the
+    start of the volatile Instance section (shared byte-for-byte across
+    conversations of the same mode and root) and the end of the context block
+    (stable across every turn of this conversation). Providers that cache on
+    block boundaries reuse those prefixes instead of re-reading them."""
+    span = find_block_span(text, INITIAL_CONTEXT_BLOCK)
+    if span is None or span[0] != 0:
+        return []
+    boundaries: list[int] = []
+    volatile_at = text.find("\nInstance:", span[0], span[1])
+    if volatile_at > 0:
+        boundaries.append(volatile_at)
+    if span[1] < len(text):
+        boundaries.append(span[1])
+    return boundaries
+
+
 def call_llm(
     conversation_file: Path,
     llm: LlmSettings,
     token_stats: TokenStats,
 ) -> tuple[str | None, str | None]:
+    try:
+        conversation_text = conversation_file.read_text(encoding="utf-8")
+    except OSError:
+        conversation_text = ""
+    token_stats.conversation_input_tokens = estimate_token_count(conversation_text)
+
     command = [
         str(NAGENT_LLM_TEXT),
         "--file",
@@ -960,12 +1010,8 @@ def call_llm(
     ]
     if llm.config_path is not None:
         command.extend(["--config", str(llm.config_path)])
-
-    try:
-        conversation_text = conversation_file.read_text(encoding="utf-8")
-    except OSError:
-        conversation_text = ""
-    token_stats.conversation_input_tokens = estimate_token_count(conversation_text)
+    for boundary in conversation_cache_boundaries(conversation_text):
+        command.extend(["--cache-prefix-chars", str(boundary)])
 
     try:
         with wait_spinner("Waiting for LLM"):

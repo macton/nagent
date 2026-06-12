@@ -297,6 +297,11 @@ def _usage_value(usage, *names: str) -> int:
 
 def _result_with_usage(text: str, usage, input_text: str | None = None) -> LlmResult:
     input_tokens = _usage_value(usage, "input_tokens", "prompt_tokens", "prompt_token_count")
+    # Anthropic reports cached prompt tokens separately; fold them back in so
+    # input_tokens stays "tokens sent" across providers. Other providers lack
+    # these fields and contribute zero.
+    input_tokens += _usage_value(usage, "cache_read_input_tokens")
+    input_tokens += _usage_value(usage, "cache_creation_input_tokens")
     output_tokens = _usage_value(
         usage,
         "output_tokens",
@@ -373,7 +378,38 @@ def _claude_code_generate(
     return _result_with_usage(text, usage, message)
 
 
-def generate_text_with_usage(message: str, provider: str, model: str) -> LlmResult:
+def cache_prefix_blocks(message: str, cache_boundaries: list[int] | None):
+    """Split a message into content blocks at the given character offsets,
+    marking each prefix block with cache_control so providers that cache on
+    block boundaries can reuse stable prefixes. Returns the plain string when
+    no valid boundary exists. At most 3 prefix blocks (provider limit is 4
+    breakpoints per request)."""
+    if not cache_boundaries:
+        return message
+    points = sorted({b for b in cache_boundaries if 0 < b < len(message)})[:3]
+    if not points:
+        return message
+    blocks = []
+    start = 0
+    for point in points:
+        blocks.append(
+            {
+                "type": "text",
+                "text": message[start:point],
+                "cache_control": {"type": "ephemeral"},
+            }
+        )
+        start = point
+    blocks.append({"type": "text", "text": message[start:]})
+    return blocks
+
+
+def generate_text_with_usage(
+    message: str,
+    provider: str,
+    model: str,
+    cache_boundaries: list[int] | None = None,
+) -> LlmResult:
     if provider == "openai":
         OpenAI = require_package(provider)
         client = OpenAI()
@@ -386,7 +422,7 @@ def generate_text_with_usage(message: str, provider: str, model: str) -> LlmResu
         response = client.messages.create(
             model=model,
             max_tokens=8192,
-            messages=[{"role": "user", "content": message}],
+            messages=[{"role": "user", "content": cache_prefix_blocks(message, cache_boundaries)}],
         )
         return _result_with_usage(_anthropic_text(response), getattr(response, "usage", None), message)
 

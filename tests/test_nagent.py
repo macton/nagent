@@ -50,6 +50,16 @@ def load_nagent_llm_module():
     return module
 
 
+def load_nagent_llm_text_module():
+    from importlib.machinery import SourceFileLoader
+
+    loader = SourceFileLoader("nagent_llm_text_mod", str(NAGENT_LLM_TEXT))
+    spec = importlib.util.spec_from_loader("nagent_llm_text_mod", loader)
+    module = importlib.util.module_from_spec(spec)
+    loader.exec_module(module)
+    return module
+
+
 def load_nagent_llm_upload_module():
     from importlib.machinery import SourceFileLoader
 
@@ -356,6 +366,50 @@ class ActionTests(unittest.TestCase):
             self.assertIn('<nagent-file-read-result path="', file_read_result)
             self.assertIn("error=", file_read_result)
 
+    def test_conversation_cache_boundaries(self):
+        text = (
+            "<initial_context>\nstable rules\nInstance:\n- conversation: c\n"
+            "</initial_context>\n<user-prompt>\nhi\n</user-prompt>"
+        )
+        boundaries = self.mod.conversation_cache_boundaries(text)
+        volatile_at = text.find("\nInstance:")
+        context_end = text.index("</initial_context>") + len("</initial_context>")
+        self.assertEqual(boundaries, [volatile_at, context_end])
+
+        # No initial context, or context not at the start: no boundaries.
+        self.assertEqual(self.mod.conversation_cache_boundaries("plain text"), [])
+        self.assertEqual(self.mod.conversation_cache_boundaries(f"x{text}"), [])
+
+        # File that is exactly the context: only the volatile boundary.
+        context_only = text[:context_end]
+        self.assertEqual(self.mod.conversation_cache_boundaries(context_only), [volatile_at])
+
+    def test_call_llm_passes_cache_boundaries(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            conversation = Path(tmp) / "conv"
+            text = (
+                "<initial_context>\nstable rules\nInstance:\n- conversation: c\n"
+                "</initial_context>\n<user-prompt>\nhi\n</user-prompt>"
+            )
+            conversation.write_text(text, encoding="utf-8")
+            captured: dict = {}
+
+            def fake_run(cmd, **kwargs):
+                captured["cmd"] = cmd
+                payload = {"response": "ok", "input_tokens": 1, "output_tokens": 1}
+                return unittest.mock.Mock(returncode=0, stdout=json.dumps(payload), stderr="")
+
+            with unittest.mock.patch.object(self.mod.subprocess, "run", fake_run):
+                self.mod.call_llm(
+                    conversation,
+                    self.mod.LlmSettings(provider="anthropic", model="m"),
+                    self.mod.TokenStats(),
+                )
+
+            cmd = captured["cmd"]
+            values = [int(cmd[i + 1]) for i, arg in enumerate(cmd) if arg == "--cache-prefix-chars"]
+            self.assertEqual(values, self.mod.conversation_cache_boundaries(text))
+
     def test_execute_shell(self):
         result = self.mod.execute_shell("echo hello-nagent")
         self.assertIn("hello-nagent", result)
@@ -565,10 +619,12 @@ class ActionTests(unittest.TestCase):
                 "First context.\n\nSecond context.",
             )
 
-    def test_build_initial_context_inserts_root_context_before_role_instructions(self):
+    def test_build_initial_context_orders_stable_before_volatile(self):
+        # Role and protocol lead; context blocks follow; instance facts and
+        # environment are the volatile tail so request prefixes stay shareable.
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            (root / "context.md").write_text("Custom root context.\n", encoding="utf-8")
+            (root / "context.md").write_text("Custom root context.", encoding="utf-8")
             context = self.mod.build_initial_context(
                 root,
                 NAGENT.resolve(),
@@ -578,9 +634,43 @@ class ActionTests(unittest.TestCase):
 
         self.assertIn("Custom root context.", context)
         self.assertLess(
-            context.index("Custom root context."),
             context.index("User invocation:"),
+            context.index("Respond only with"),
         )
+        self.assertLess(
+            context.index("Respond only with"),
+            context.index("Custom root context."),
+        )
+        self.assertLess(
+            context.index("Custom root context."),
+            context.index("Instance:"),
+        )
+        self.assertLess(
+            context.index("Instance:"),
+            context.index("Environment:"),
+        )
+
+    def test_build_initial_context_states_loop_contract_and_conversation_reuse(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            context = self.mod.build_initial_context(
+                Path(tmp),
+                NAGENT.resolve(),
+                "user",
+                "conv",
+            )
+
+        # Loop contract and raw-body protocol rules.
+        self.assertIn("Never fabricate results", context)
+        self.assertIn("Tag bodies are raw text", context)
+        self.assertIn("first matching close tag ends the body", context)
+        self.assertIn("error status is data", context)
+        # Conversations-as-data direction.
+        self.assertIn("Conversations are data", context)
+        self.assertIn("Reuse a worker", context)
+        self.assertIn("Author a worker's context", context)
+        self.assertIn("Hand off when noisy", context)
+        self.assertIn("Never rewrite your own conversation file while running", context)
+        self.assertIn("the user may edit it between runs", context)
 
     def test_resolve_initial_prompt_prefers_cli_prompt(self):
         with unittest.mock.patch.object(self.mod.sys, "stdin", io.StringIO("from stdin")):
@@ -1362,6 +1452,71 @@ class InitialTextTests(unittest.TestCase):
             self.assertLess(
                 text.index("install context rules"), text.index("root context body")
             )
+
+    def test_project_context_included_from_git_toplevel(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            project = Path(tmp) / "proj"
+            (project / "sub").mkdir(parents=True)
+            subprocess.run(["git", "init"], cwd=project, check=True, capture_output=True)
+            (project / "context.md").write_text("PROJECT-CONTEXT-MARKER", encoding="utf-8")
+            root = Path(tmp) / "root"
+            root.mkdir()
+
+            previous_cwd = os.getcwd()
+            os.chdir(project / "sub")
+            try:
+                text = self.mod.build_initial_context(root, NAGENT.resolve(), "user", "conv")
+            finally:
+                os.chdir(previous_cwd)
+
+        self.assertIn("PROJECT-CONTEXT-MARKER", text)
+
+    def test_project_context_not_duplicated_inside_install_checkout(self):
+        # Running nagent from within its own checkout: the project toplevel is
+        # the install dir, whose context is already included once.
+        with tempfile.TemporaryDirectory() as tmp:
+            install = Path(tmp) / "install"
+            (install / "bin").mkdir(parents=True)
+            subprocess.run(["git", "init"], cwd=install, check=True, capture_output=True)
+            (install / "context.md").write_text("INSTALL-AND-PROJECT-MARKER", encoding="utf-8")
+            root = Path(tmp) / "root"
+            root.mkdir()
+
+            previous_cwd = os.getcwd()
+            os.chdir(install)
+            try:
+                text = self.mod.build_initial_context(
+                    root, install / "bin" / "nagent", "user", "conv"
+                )
+            finally:
+                os.chdir(previous_cwd)
+
+        self.assertEqual(text.count("INSTALL-AND-PROJECT-MARKER"), 1)
+
+    def test_project_context_ordered_between_install_and_root(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            install = Path(tmp) / "install"
+            (install / "bin").mkdir(parents=True)
+            (install / "context.md").write_text("INSTALL-MARKER", encoding="utf-8")
+            project = Path(tmp) / "proj"
+            project.mkdir()
+            subprocess.run(["git", "init"], cwd=project, check=True, capture_output=True)
+            (project / "context.md").write_text("PROJECT-MARKER", encoding="utf-8")
+            root = Path(tmp) / "root"
+            root.mkdir()
+            (root / "context.md").write_text("ROOT-MARKER", encoding="utf-8")
+
+            previous_cwd = os.getcwd()
+            os.chdir(project)
+            try:
+                text = self.mod.build_initial_context(
+                    root, install / "bin" / "nagent", "user", "conv"
+                )
+            finally:
+                os.chdir(previous_cwd)
+
+        self.assertLess(text.index("INSTALL-MARKER"), text.index("PROJECT-MARKER"))
+        self.assertLess(text.index("PROJECT-MARKER"), text.index("ROOT-MARKER"))
 
     def test_repo_context_yaml_delivers_design_rules(self):
         # The shipped context.yaml routes context/data-oriented-design.md into
@@ -2303,6 +2458,88 @@ class NagentLlmConfigTests(unittest.TestCase):
     def test_claude_code_list_models_raises_with_guidance(self):
         with self.assertRaisesRegex(RuntimeError, "does not expose a model list"):
             self.mod.list_models("claude-code")
+
+    def test_cache_prefix_blocks_split_and_filter(self):
+        message = "abcdefgh"
+        blocks = self.mod.cache_prefix_blocks(message, [5, 0, 999, 5])
+        self.assertEqual(
+            blocks,
+            [
+                {"type": "text", "text": "abcde", "cache_control": {"type": "ephemeral"}},
+                {"type": "text", "text": "fgh"},
+            ],
+        )
+        # No valid boundaries: plain string passthrough.
+        self.assertEqual(self.mod.cache_prefix_blocks(message, []), message)
+        self.assertEqual(self.mod.cache_prefix_blocks(message, [99]), message)
+        self.assertEqual(self.mod.cache_prefix_blocks(message, None), message)
+
+    def test_anthropic_cache_boundaries_split_blocks_and_count_cached_usage(self):
+        captured: dict = {}
+
+        class FakeMessages:
+            def create(self, **kwargs):
+                captured.update(kwargs)
+                usage = type(
+                    "FakeUsage",
+                    (),
+                    {
+                        "input_tokens": 7,
+                        "output_tokens": 3,
+                        "cache_read_input_tokens": 90,
+                        "cache_creation_input_tokens": 10,
+                    },
+                )()
+                block = type("FakeBlock", (), {"type": "text", "text": "anthropic ok"})()
+                return type("FakeResponse", (), {"content": [block], "usage": usage})()
+
+        fake_anthropic = unittest.mock.Mock(
+            Anthropic=lambda: unittest.mock.Mock(messages=FakeMessages())
+        )
+        message = "s" * 100
+        with unittest.mock.patch.object(self.mod, "require_package", return_value=fake_anthropic):
+            result = self.mod.generate_text_with_usage(
+                message, "anthropic", "claude-sonnet-4-6", cache_boundaries=[30, 60]
+            )
+
+        content = captured["messages"][0]["content"]
+        self.assertEqual(len(content), 3)
+        self.assertEqual(content[0]["cache_control"], {"type": "ephemeral"})
+        self.assertEqual(content[1]["cache_control"], {"type": "ephemeral"})
+        self.assertNotIn("cache_control", content[2])
+        self.assertEqual("".join(block["text"] for block in content), message)
+        self.assertEqual(result.text, "anthropic ok")
+        # input = uncached 7 + cache read 90 + cache write 10
+        self.assertEqual(result.input_tokens, 107)
+        self.assertEqual(result.output_tokens, 3)
+
+    def test_llm_text_forwards_cache_prefix_chars(self):
+        mod = load_nagent_llm_text_module()
+        captured: dict = {}
+
+        def fake_generate(message, provider, model, cache_boundaries=None):
+            captured["cache_boundaries"] = cache_boundaries
+            return unittest.mock.Mock(text="ok", input_tokens=1, output_tokens=1)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            prompt = Path(tmp) / "prompt.txt"
+            prompt.write_text("hello", encoding="utf-8")
+            argv = [
+                "nagent-llm-text",
+                "--file",
+                str(prompt),
+                "--cache-prefix-chars",
+                "10",
+                "--cache-prefix-chars",
+                "20",
+            ]
+            with unittest.mock.patch.object(mod.sys, "argv", argv), \
+                unittest.mock.patch.object(mod, "resolve_from_args", return_value=("anthropic", "m")), \
+                unittest.mock.patch.object(mod, "generate_text_with_usage", fake_generate), \
+                unittest.mock.patch.object(mod.sys, "stdout", io.StringIO()):
+                mod.main()
+
+        self.assertEqual(captured["cache_boundaries"], [10, 20])
 
     def test_gemini_provider_alias_resolves_to_google(self):
         with tempfile.TemporaryDirectory() as tmp:

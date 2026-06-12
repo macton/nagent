@@ -34,6 +34,17 @@ def main() -> None:
         action="store_true",
         help="Print structured JSON output instead of plain text.",
     )
+    parser.add_argument(
+        "--cache-prefix-chars",
+        type=int,
+        action="append",
+        default=[],
+        metavar="N",
+        help=(
+            "Character offset ending a stable message prefix; may be repeated. "
+            "Providers that cache on block boundaries reuse the marked prefixes."
+        ),
+    )
     add_llm_arguments(parser)
     args = parser.parse_args()
 
@@ -46,7 +57,9 @@ def main() -> None:
     message = path.read_text(encoding="utf-8")
 
     try:
-        result = generate_text_with_usage(message, provider, model)
+        result = generate_text_with_usage(
+            message, provider, model, cache_boundaries=args.cache_prefix_chars
+        )
     except Exception as exc:
         print(f"Error: {exc}", file=sys.stderr)
         sys.exit(1)
