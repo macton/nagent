@@ -41,7 +41,7 @@ input must be saveable, maintainable, organizable, and editable.
 
 LLMs are temporary. Processes are temporary. Sub-conversations are temporary.
 Context windows are temporary. The durable part of the system is explicit
-data: conversations, per-file conversations, root and install context files,
+data: conversations, per-file conversations, install/project/root context files,
 repository history summaries, historical coupling tables, artifact
 neighborhoods, file summaries, split indexes, patch artifacts, and the
 harvested knowledge store. The loop exists to transform those artifacts.
@@ -253,12 +253,19 @@ nagent-llm-text --file question.txt
 ```
 
 **Teach the model an output format.** The startup prompt lists the only tags
-the model may emit; the tag list and usage rules live inside
-`<initial_context>`, so refreshed context carries the current protocol with
-it. The protocol is XML-ish, not XML: tag bodies are raw text and the first
-matching close tag ends a body. Tokenization lives in the shared parser
-`bin/helpers/nagent_tags.py`; `parse_response()` validates tag shapes and is
-strict — recognized tags and whitespace, nothing else. Include the tag table:
+the model may emit, with per-tag guidance inline; the tag list and rules live
+inside `<initial_context>`, so refreshed context carries the current protocol
+with it. The context states the protocol rules explicitly: tag bodies are raw
+text (no escaping; the first matching close tag ends a body), nothing outside
+tags, and — the loop contract — action results come back appended as
+`<nagent-*-result>` blocks before the model is called again, so it must never
+fabricate results, and an error result is data that should change the
+approach. The context is ordered stable-to-volatile (role and protocol first,
+instance facts and environment last) so request prefixes stay byte-identical
+across conversations of the same mode. Tokenization lives in the shared
+parser `bin/helpers/nagent_tags.py`; `parse_response()` validates tag shapes
+and is strict — recognized tags and whitespace, nothing else. Include the tag
+table:
 
 - `<nagent-response>...</nagent-response>`
 - `<nagent-read path="..."/>`
@@ -292,7 +299,10 @@ Code path: `main()` → `run_agent_loop()` → `call_llm()` → `parse_response(
 `MAX_FORMAT_RETRIES`); provider errors append too. Failures become data, not
 hidden control flow. Reads of unreadable files come back as error result tags
 for the same reason. Token/status accounting at a high level (`TokenStats`,
-recursive rollup from children). Controlled writes in main mode: structured
+recursive rollup from children; cached prompt tokens fold back into input
+counts). The loop passes stable prefix boundaries to `nagent-llm-text`
+(`--cache-prefix-chars`) so providers that cache on block boundaries reuse
+the shared context each turn. Controlled writes in main mode: structured
 writes go to temp directories only; explain that this is convention, not a
 sandbox, and that shell runs with the user's permissions.
 
@@ -329,10 +339,13 @@ ordinary files — open, trim, rewrite, diff, copy, version, script.
 
 User-owned prompt-side inputs: root context (`~/.nagent/context.yaml` or
 `context.md`, recursive expansion), install context (a `context.yaml` or
-`context.md` in the nagent folder itself, injected before root context — this
-repository ships one pointing at `context/data-oriented-design.md`), and the
-prompts under `prompts/` (compaction, harvest), resolved root-first so a copy
-under the nagent root overrides the shipped copy.
+`context.md` in the nagent folder itself — this repository ships one pointing
+at `context/data-oriented-design.md`), project context (the same files at the
+git toplevel of the working directory, so per-project instructions travel
+with the repo; deduplicated when the project is the install or root
+directory), and the prompts under `prompts/` (compaction, harvest), resolved
+root-first so a copy under the nagent root overrides the shipped copy.
+Injection order is install → project → root.
 
 ## Part IV sections
 
@@ -406,7 +419,17 @@ index. Summaries via `nagent-file-summarize` (split-summarize over 64KB).
 Conversation-side: `--compact`, the bounded knowledge digest, and disposable
 sub-conversations as context isolation — parent keeps coordination, child
 keeps noisy exploration, parent receives a distilled result. Delegation is
-context management before it is parallelism. Diagram:
+context management before it is parallelism.
+
+The initial context directs the model to exploit conversations as data, not
+just spawn them: reuse a *named worker* (`conversation-file="name"` continues
+that conversation with its accumulated context — a specialist that gets
+cheaper to call), resume a saved conversation (`conversation-name`), *author*
+a worker's context by writing a curated briefing under /tmp and spawning a
+child on it, and hand off to a fresh sub-conversation with a distilled brief
+when its own conversation has become mostly stale tool output — the safe
+self-compaction. It is also told the conversation persists and the user may
+edit it between runs: the current file is the source of truth. Diagram:
 
 ```text
 large source file -> split index + segment files -> bounded edits -> patch artifact -> updated source file
@@ -477,7 +500,7 @@ Verify the README explicitly explains all of these:
 - [ ] durable explicit state
 - [ ] editable conversations; direct conversation-file editing
 - [ ] conversation maintenance commands incl. branch and compact
-- [ ] user-owned prompt inputs: root context, install context, prompts/
+- [ ] user-owned prompt inputs: root, install, and project context; prompts/
 - [ ] artifact-local memory; per-file conversations; stable file ids
 - [ ] bounded write authority per mode (temp-only vs per-file)
 - [ ] repository history as data; commit summaries; file summaries; editors
@@ -487,6 +510,10 @@ Verify the README explicitly explains all of these:
 - [ ] large-file split/index/patch; natural splitters; hash validation
 - [ ] disposable workers; sub-conversation isolation as context management
 - [ ] visible protocol; shared tag parser; parser retries as visible state
+- [ ] protocol rules in context: raw bodies, loop contract (results appended,
+      never fabricate), errors as data; stable-to-volatile context ordering
+- [ ] conversations-as-data direction: named workers, authored briefings,
+      handoff when noisy, user may edit between runs
 - [ ] result wrappers as conversation data
 - [ ] tool discovery through executable descriptions
 - [ ] provider abstraction incl. claude-code via Claude Code login

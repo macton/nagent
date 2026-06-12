@@ -25,10 +25,10 @@ matters, it needs to be saveable, maintainable, organizable, and editable.
 
 The LLM is temporary. The process is temporary. Sub-conversations are
 temporary. Context windows are temporary. What survives is explicit data:
-conversations, per-file conversations, root and install context files,
-repository history summaries, historical coupling tables, file summaries,
-split indexes, patch artifacts, and a harvested knowledge store you can open
-in an editor.
+conversations, per-file conversations, install, project, and root context
+files, repository history summaries, historical coupling tables, file
+summaries, split indexes, patch artifacts, and a harvested knowledge store
+you can open in an editor.
 
 A text file, an LLM, structured tags, and a loop are how this repo implements
 that idea. They are not the idea.
@@ -112,16 +112,22 @@ The startup prompt lists the only tags the model may emit. The parser is
 strict: recognized tags and whitespace. Nothing else.
 
 **Implementation** — `build_initial_context()` in `bin/nagent` assembles the
-runtime context: instance facts, environment, git remotes, discovered tool
-descriptions, context-management rules, write rules, large-file guidance, the
-structured tag protocol, install and root context, the knowledge digest, role
-instructions. The tag list and usage rules live inside `<initial_context>`,
+runtime context: role instructions and the structured tag protocol first,
+then context-management and write rules, discovered tool descriptions,
+install, project, and root context, the knowledge digest — and instance facts and
+environment last. The ordering is stable-to-volatile on purpose: request
+prefixes stay byte-identical across conversations of the same mode. The tag
+list carries its usage guidance inline and lives inside `<initial_context>`,
 so refreshed context carries the current protocol with it.
 
-The protocol is XML-ish, not XML: tag bodies are raw text — shell commands
-with `&&`, file contents, prompts — with no entity escaping, and the first
-matching close tag ends a body. A strict XML parser would reject valid
-output, so tokenization lives in a small explicit parser,
+The context also states the protocol rules outright, because they are the
+failure modes that matter: tag bodies are raw text (no escaping; the first
+matching close tag ends a body — the protocol is XML-ish, not XML); nothing
+outside tags; and the loop contract — action results come back appended as
+`<nagent-*-result>` blocks before the model is called again, so never
+fabricate results, and an error result is data that should change the
+approach, not provoke an identical retry. A strict XML parser would reject
+valid output, so tokenization lives in a small explicit parser,
 `bin/helpers/nagent_tags.py`, and `parse_response()` validates tag shapes on
 top of it.
 
@@ -189,6 +195,13 @@ plainly: this is a convention-based reference implementation, not a sandbox.
 input/output tokens. Child `--json` output rolls up into the parent's totals,
 including `--edit-conversation` and `--compact` children. No provider usage?
 Estimate from character count.
+
+The loop also exploits the stable-to-volatile context ordering: each call
+passes the conversation's stable prefix boundaries (`--cache-prefix-chars`)
+to `nagent-llm-text`, and providers that cache on block boundaries (anthropic)
+reuse the shared context instead of re-reading it every turn. Cached tokens
+are folded back into the reported input counts, so accounting still means
+"tokens sent".
 
 **Example**
 
@@ -332,11 +345,16 @@ The prompt-side inputs are yours too. Root context: `load_root_context()`
 reads `~/.nagent/context.yaml` or `context.md`; YAML can be a list or
 `{ "paths": [...] }`; nested `context.yaml` files expand recursively. Install
 context works the same way from the nagent folder itself (the parent of
-`bin/`) and is injected before root context, so per-root context can override
-what ships with the checkout — this repository ships `context.yaml` pointing
-at `context/data-oriented-design.md`, the operating rules every conversation
-starts with. The compaction and harvest prompts under `prompts/` resolve
-root-first: put your own copy under `~/.nagent/prompts/` and it wins.
+`bin/`) — this repository ships `context.yaml` pointing at
+`context/data-oriented-design.md`, the operating rules every conversation
+starts with. Project context: when nagent runs inside a git repository, a
+`context.yaml`/`context.md` at that repository's toplevel is included as
+well — per-project instructions that travel with the repo. Injection order is
+install → project → root, so the more personal context can override the more
+general; when the project toplevel *is* the install or root directory (e.g.
+running nagent from its own checkout), the file is included once, not twice.
+The compaction and harvest prompts under `prompts/` resolve root-first: put
+your own copy under `~/.nagent/prompts/` and it wins.
 
 **Example**
 
@@ -490,7 +508,7 @@ The whole system is one transformation:
 ```text
 repository history
         +
-install + root context
+install + project + root context
         +
 conversation
         +
@@ -603,6 +621,21 @@ editable guidance; the knowledge digest is byte-capped before injection; and
 file — the parent keeps coordination, the child keeps the noise, and only the
 distilled result returns as a `<nagent-conversation-result>` with its token
 totals rolled up. Delegation is context management before it is parallelism.
+
+The initial context directs the model to exploit conversations as data, not
+just spawn them. Reuse a named worker: `conversation-file="name"` continues
+that conversation with its accumulated context — a specialist (a test runner,
+a schema navigator) that gets cheaper and better-grounded each call. Resume
+saved work: `conversation-name` starts a child from a conversation the user
+saved. Author a worker's context: the model's write boundary includes temp
+directories, so it can write a curated briefing file and spawn a child on it —
+controlling exactly what the worker knows instead of re-narrating context
+into a prompt. And hand off when noisy: when its own conversation is mostly
+stale tool output, distill goal, state, and decisions into a fresh
+sub-conversation and delegate the rest — compaction semantics through the one
+mechanism the model already has, without racing the live file. The model is
+also told the conversation persists and the user may edit it between runs:
+the current file is the source of truth.
 
 | Long-lived agent abstractions  | Disposable workers               |
 | ------------------------------ | -------------------------------- |
