@@ -228,6 +228,37 @@ def scan_root(root: Path) -> list[Artifact]:
                 continue
             artifacts.append(Artifact(split_dir, "split-dir", "live", "split current", size))
 
+    # Finished campaigns are harvest sources: their conversations are dead
+    # working state whose knowledge should be distilled before reclaim. The
+    # plan files (index.yaml, item.yaml) stay — they are the record.
+    try:
+        import nagent_campaign_lib as campaign_lib
+    except ImportError:
+        campaign_lib = None
+    if campaign_lib is not None:
+        for campaign in campaign_lib.list_campaigns(root):
+            try:
+                index = campaign_lib.load_index(campaign)
+            except Exception:
+                continue
+            if index.get("status") != "done":
+                continue
+            conversation_files = sorted(campaign.glob("items/*/conversation")) + sorted(
+                path for path in (campaign / "conversations").glob("*") if path.is_file()
+            )
+            for path in conversation_files:
+                if path.is_file():
+                    artifacts.append(
+                        Artifact(
+                            path,
+                            "conversation",
+                            "harvest",
+                            f"finished campaign {campaign.name}",
+                            path.stat().st_size,
+                            path.name,
+                        )
+                    )
+
     return artifacts
 
 
@@ -756,4 +787,190 @@ def run_gc(
     report["pruned_index_entries"] = pruned_entries
     report["ledger_path"] = str(ledger_path(root))
     report["digest_path"] = str(digest) if digest else None
+    return report
+
+
+# --- distill passes: merge and graduate (issues/0003-distill-passes.md) ----
+
+MERGE_PROMPT_NAME = "knowledge-merge.md"
+GRADUATE_PROMPT_NAME = "knowledge-graduate.md"
+
+MERGEABLE_FILES = ("facts.md", "decisions.md", "questions.md", "playbooks.md", "tasks.md")
+
+
+def _mergeable_paths(root: Path) -> list[Path]:
+    knowledge = knowledge_dir(root)
+    return [knowledge / name for name in MERGEABLE_FILES if (knowledge / name).is_file()]
+
+
+def run_merge(root: Path, *, apply: bool = False, generate=None, progress=None) -> dict:
+    """Dedup/merge/compress each knowledge category file via one LLM rewrite
+    per file. The previous content is kept as {file}.pre-merge; the digest
+    regenerates afterward so user edits and merges propagate identically."""
+
+    def emit(message: str) -> None:
+        if progress is not None:
+            progress(message)
+
+    candidates = []
+    for path in _mergeable_paths(root):
+        content = path.read_text(encoding="utf-8")
+        bullets = content.count("\n- ") + (1 if content.startswith("- ") else 0)
+        candidates.append(
+            {
+                "path": str(path),
+                "bullets": bullets,
+                "bytes": len(content),
+                "estimated_input_tokens": (len(content) + 3) // 4,
+            }
+        )
+
+    report = {
+        "apply": apply,
+        "candidates": candidates,
+        "merged": [],
+        "failures": [],
+        "digest_path": None,
+    }
+    if not apply:
+        return report
+
+    template_path = resolve_prompt_path(root, MERGE_PROMPT_NAME)
+    template = template_path.read_text(encoding="utf-8").strip() if template_path.is_file() else (
+        "Rewrite this knowledge file: deduplicate and merge items, keep every "
+        "distinct fact and all provenance markers, return only the file content."
+    )
+
+    for candidate in candidates:
+        path = Path(candidate["path"])
+        original = path.read_text(encoding="utf-8")
+        if candidate["bullets"] == 0:
+            continue
+        prompt = f"{template}\n\nFile: {path.name}\n\n{original}"
+        try:
+            merged = generate(prompt)
+        except Exception as exc:
+            report["failures"].append(f"{path.name}: {exc}")
+            emit(f"merge failed: {path.name}: {exc}")
+            continue
+        merged = (merged or "").strip()
+        if not merged or "- " not in merged:
+            report["failures"].append(f"{path.name}: merge result had no items; kept original")
+            emit(f"merge rejected (no items): {path.name}")
+            continue
+        path.with_name(path.name + ".pre-merge").write_text(original, encoding="utf-8")
+        path.write_text(merged + "\n", encoding="utf-8")
+        report["merged"].append(path.name)
+        emit(f"merged: {path.name} ({candidate['bytes']} -> {len(merged)} bytes)")
+
+    digest = regenerate_digest(root)
+    report["digest_path"] = str(digest) if digest else None
+    return report
+
+
+def _finished_campaign_artifacts(root: Path) -> list[dict]:
+    """Graduation candidates from finished campaigns: their bin/ and prompts/
+    files, already proven by use."""
+    try:
+        import nagent_campaign_lib as campaign_lib
+    except ImportError:
+        return []
+    staged: list[dict] = []
+    for campaign in campaign_lib.list_campaigns(root):
+        try:
+            index = campaign_lib.load_index(campaign)
+        except Exception:
+            continue
+        if index.get("status") != "done":
+            continue
+        for kind, sub in (("tool", "bin"), ("prompt", "prompts")):
+            directory = campaign / sub
+            if not directory.is_dir():
+                continue
+            for path in sorted(directory.iterdir()):
+                if path.is_file():
+                    staged.append(
+                        {"kind": kind, "name": path.name, "source": str(path), "campaign": campaign.name}
+                    )
+    return staged
+
+
+def _draft_target(root: Path, kind: str, name: str) -> Path:
+    safe = name.strip().replace("/", "-") or "draft"
+    if kind == "prompt":
+        if not safe.endswith(".md"):
+            safe += ".md"
+        return root / "prompts" / (safe + ".draft")
+    return root / "bin" / (safe + ".draft")
+
+
+def run_graduate(root: Path, *, apply: bool = False, generate=None, progress=None) -> dict:
+    """Draft reusable artifacts: playbooks -> tools/prompts via the LLM, and
+    finished campaigns' bin/ and prompts/ staged directly. Drafts are written
+    as non-executable {name}.draft files — invisible to tool discovery until
+    the user reviews, renames, and (for tools) marks them executable."""
+
+    def emit(message: str) -> None:
+        if progress is not None:
+            progress(message)
+
+    playbooks = knowledge_dir(root) / "playbooks.md"
+    playbook_content = playbooks.read_text(encoding="utf-8") if playbooks.is_file() else ""
+    campaign_candidates = _finished_campaign_artifacts(root)
+
+    report = {
+        "apply": apply,
+        "playbook_bullets": playbook_content.count("\n- "),
+        "estimated_input_tokens": (len(playbook_content) + 3) // 4 if playbook_content else 0,
+        "campaign_candidates": campaign_candidates,
+        "drafts": [],
+        "skipped_existing": [],
+        "failures": [],
+    }
+    if not apply:
+        return report
+
+    def write_draft(kind: str, name: str, content: str, source: str) -> None:
+        target = _draft_target(root, kind, name)
+        if target.exists() or target.with_name(target.name[: -len(".draft")]).exists():
+            report["skipped_existing"].append(str(target))
+            emit(f"draft skipped (exists): {target.name}")
+            return
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(content, encoding="utf-8")
+        report["drafts"].append({"kind": kind, "path": str(target), "source": source})
+        emit(f"draft: {target} (from {source})")
+
+    if playbook_content.strip() and generate is not None:
+        template_path = resolve_prompt_path(root, GRADUATE_PROMPT_NAME)
+        template = template_path.read_text(encoding="utf-8").strip() if template_path.is_file() else (
+            'Identify reusable playbooks and return only JSON: {"drafts": '
+            '[{"kind": "tool|prompt", "name": "...", "description": "...", "content": "..."}]}.'
+        )
+        prompt = f"{template}\n\n{playbook_content}"
+        try:
+            response = generate(prompt)
+            stripped = response.strip()
+            fence = JSON_FENCE.search(stripped)
+            if fence:
+                stripped = fence.group(1).strip()
+            payload = json.loads(stripped)
+            drafts = payload.get("drafts") if isinstance(payload, dict) else None
+        except Exception as exc:
+            report["failures"].append(f"playbooks: {exc}")
+            drafts = None
+        for draft in drafts or []:
+            if not isinstance(draft, dict):
+                continue
+            kind = draft.get("kind")
+            name = str(draft.get("name") or "").strip()
+            content = str(draft.get("content") or "")
+            if kind not in ("tool", "prompt") or not name or not content.strip():
+                continue
+            write_draft(kind, name, content, "playbooks.md")
+
+    for candidate in campaign_candidates:
+        content = Path(candidate["source"]).read_text(encoding="utf-8")
+        write_draft(candidate["kind"], candidate["name"], content, candidate["source"])
+
     return report

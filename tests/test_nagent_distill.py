@@ -621,5 +621,205 @@ class GcCliTests(unittest.TestCase):
         self.assertIn("root not found", result.stderr)
 
 
+class MergePassTests(unittest.TestCase):
+    def _seed_duplicates(self, root):
+        gc.merge_harvest(
+            root,
+            "conv-a",
+            {"facts": ["the loader caches results", "the loader caches results"]},
+            "2026-01-01",
+        )
+        gc.merge_harvest(root, "conv-b", {"facts": ["the loader caches results"]}, "2026-02-01")
+
+    def test_merge_rewrites_file_with_backup_and_digest(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self._seed_duplicates(root)
+            facts = gc.knowledge_dir(root) / "facts.md"
+            original = facts.read_text(encoding="utf-8")
+            captured = {}
+
+            def fake_generate(prompt):
+                captured["prompt"] = prompt
+                return (
+                    "# Facts\n\n- the loader caches results "
+                    "[from: conv-a, 2026-01-01] [from: conv-b, 2026-02-01]"
+                )
+
+            report = gc.run_merge(root, apply=True, generate=fake_generate)
+
+            self.assertIn("facts.md", report["merged"])
+            self.assertIn(original.strip(), captured["prompt"])
+            merged = facts.read_text(encoding="utf-8")
+            self.assertEqual(merged.count("the loader caches results"), 1)
+            self.assertIn("[from: conv-a, 2026-01-01]", merged)
+            backup = facts.with_name("facts.md.pre-merge")
+            self.assertEqual(backup.read_text(encoding="utf-8"), original)
+            digest = gc.digest_path(root).read_text(encoding="utf-8")
+            self.assertEqual(digest.count("the loader caches results"), 1)
+
+    def test_merge_rejects_empty_result_and_keeps_original(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self._seed_duplicates(root)
+            facts = gc.knowledge_dir(root) / "facts.md"
+            original = facts.read_text(encoding="utf-8")
+
+            report = gc.run_merge(root, apply=True, generate=lambda prompt: "")
+
+            self.assertTrue(report["failures"])
+            self.assertEqual(facts.read_text(encoding="utf-8"), original)
+
+    def test_merge_dry_run_reports_candidates_and_mutates_nothing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self._seed_duplicates(root)
+            facts = gc.knowledge_dir(root) / "facts.md"
+            original = facts.read_text(encoding="utf-8")
+
+            report = gc.run_merge(root, apply=False, generate=None)
+
+            self.assertFalse(report["apply"])
+            names = [Path(c["path"]).name for c in report["candidates"]]
+            self.assertIn("facts.md", names)
+            self.assertGreater(report["candidates"][0]["estimated_input_tokens"], 0)
+            self.assertEqual(facts.read_text(encoding="utf-8"), original)
+            self.assertEqual(report["merged"], [])
+
+
+class GraduatePassTests(unittest.TestCase):
+    def _seed_playbooks(self, root):
+        gc.merge_harvest(
+            root,
+            "conv",
+            {"playbooks": [{"name": "redeploy", "steps": "make build && make push"}]},
+            "2026-01-01",
+        )
+
+    def _seed_finished_campaign(self, root, with_tool=True):
+        campaign = root / "campaigns" / "done-campaign"
+        (campaign / "bin").mkdir(parents=True)
+        (campaign / "items" / "0001-x").mkdir(parents=True)
+        (campaign / "index.yaml").write_text(
+            "name: Done Campaign\nstatus: done\nitems:\n- id: 0001-x\n  status: done\n",
+            encoding="utf-8",
+        )
+        if with_tool:
+            (campaign / "bin" / "proven-tool").write_text(
+                "#!/bin/sh\necho proven\n", encoding="utf-8"
+            )
+        (campaign / "items" / "0001-x" / "conversation").write_text(
+            "worker history", encoding="utf-8"
+        )
+        return campaign
+
+    def test_graduate_drafts_tool_and_prompt_non_executable(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self._seed_playbooks(root)
+
+            def fake_generate(prompt):
+                self.assertIn("redeploy", prompt)
+                return json.dumps(
+                    {
+                        "drafts": [
+                            {
+                                "kind": "tool",
+                                "name": "redeploy",
+                                "description": "rebuild and push",
+                                "content": "#!/bin/sh\nmake build && make push\n",
+                            },
+                            {
+                                "kind": "prompt",
+                                "name": "deploy-guidance",
+                                "description": "how deploys work",
+                                "content": "# Deploys\nAlways build first.\n",
+                            },
+                        ]
+                    }
+                )
+
+            report = gc.run_graduate(root, apply=True, generate=fake_generate)
+
+            tool_draft = root / "bin" / "redeploy.draft"
+            prompt_draft = root / "prompts" / "deploy-guidance.md.draft"
+            self.assertTrue(tool_draft.is_file())
+            self.assertTrue(prompt_draft.is_file())
+            # Drafts are not executable: invisible to tool discovery.
+            self.assertFalse(tool_draft.stat().st_mode & 0o111)
+            self.assertEqual(len(report["drafts"]), 2)
+
+            # Re-running skips existing drafts.
+            report = gc.run_graduate(root, apply=True, generate=fake_generate)
+            self.assertEqual(report["drafts"], [])
+            self.assertEqual(len(report["skipped_existing"]), 2)
+
+    def test_graduate_stages_finished_campaign_tools(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self._seed_finished_campaign(root)
+
+            report = gc.run_graduate(root, apply=True, generate=None)
+
+            staged = root / "bin" / "proven-tool.draft"
+            self.assertTrue(staged.is_file())
+            self.assertIn("echo proven", staged.read_text(encoding="utf-8"))
+            self.assertEqual(report["campaign_candidates"][0]["campaign"], "done-campaign")
+
+    def test_graduate_dry_run_lists_candidates(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self._seed_playbooks(root)
+            self._seed_finished_campaign(root)
+
+            report = gc.run_graduate(root, apply=False, generate=None)
+
+            self.assertFalse(report["apply"])
+            self.assertEqual(report["playbook_bullets"], 1)
+            self.assertEqual(len(report["campaign_candidates"]), 1)
+            self.assertEqual(report["drafts"], [])
+            self.assertFalse((root / "bin").exists())
+
+    def test_scan_root_harvests_finished_campaign_conversations(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "conversations").mkdir(parents=True)
+            campaign = self._seed_finished_campaign(root, with_tool=False)
+            active = root / "campaigns" / "active-campaign"
+            (active / "items" / "0001-y").mkdir(parents=True)
+            (active / "index.yaml").write_text(
+                "name: Active\nstatus: active\nitems:\n- id: 0001-y\n  status: todo\n",
+                encoding="utf-8",
+            )
+            (active / "items" / "0001-y" / "conversation").write_text("live", encoding="utf-8")
+
+            artifacts = gc.scan_root(root)
+            classes = {str(a.path): (a.klass, a.reason) for a in artifacts}
+
+            done_conv = str(campaign / "items" / "0001-x" / "conversation")
+            self.assertIn(done_conv, classes)
+            self.assertEqual(classes[done_conv][0], "harvest")
+            self.assertIn("finished campaign", classes[done_conv][1])
+            active_conv = str(active / "items" / "0001-y" / "conversation")
+            self.assertNotIn(active_conv, classes)
+
+    def test_cli_merge_and_graduate_dry_runs_need_no_credentials(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self._seed_playbooks(root)
+
+            result = subprocess.run(
+                [str(NAGENT_DISTILL), "--root", str(root), "--merge", "--graduate"],
+                capture_output=True,
+                text=True,
+                env={"PATH": "/usr/bin:/bin"},
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("merge candidate:", result.stdout)
+            self.assertIn("graduate candidates:", result.stdout)
+            self.assertIn("dry run; pass --apply", result.stdout)
+
+
 if __name__ == "__main__":
     unittest.main()

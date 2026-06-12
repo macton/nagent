@@ -9,7 +9,7 @@ HELPERS_DIR = Path(__file__).resolve().parent / "helpers"
 sys.path.insert(0, str(HELPERS_DIR))
 from nagent_cli import WaitSpinner, emit_json, exit_on_description, resolve_default_root
 from nagent_llm import add_llm_arguments, generate_text, resolve_from_args
-from nagent_distill_lib import run_gc
+from nagent_distill_lib import knowledge_dir, run_gc, run_graduate, run_merge
 
 
 def wait_spinner(message: str) -> WaitSpinner:
@@ -108,6 +108,23 @@ def main() -> int:
         help="Cap the conversation bytes sent to the LLM this run; the rest is deferred.",
     )
     parser.add_argument(
+        "--merge",
+        action="store_true",
+        help=(
+            "Dedup/merge/compress the knowledge category files (one LLM "
+            "rewrite per file) instead of the classify/harvest pass."
+        ),
+    )
+    parser.add_argument(
+        "--graduate",
+        action="store_true",
+        help=(
+            "Draft reusable artifacts: playbooks become .draft tools/prompts "
+            "under the root; finished campaigns' bin/ and prompts/ are staged. "
+            "Nothing executable lands without your review."
+        ),
+    )
+    parser.add_argument(
         "--json",
         action="store_true",
         help="Print the full report as JSON instead of plain text.",
@@ -123,6 +140,65 @@ def main() -> int:
     harvest = not args.no_harvest
     provider = model = None
     config_path = args.config.expanduser() if args.config else None
+
+    # --merge / --graduate are distinct passes: when either is given, run
+    # only those (dry-run by default, like everything else here).
+    if args.merge or args.graduate:
+        needs_llm = args.apply and (
+            args.merge
+            or (args.graduate and (knowledge_dir(root) / "playbooks.md").is_file())
+        )
+        generate = None
+        if needs_llm:
+            provider, model = resolve_from_args(args)
+
+            def generate(prompt):  # noqa: F811 — deliberate closure
+                return generate_text(prompt, provider, model)
+
+        failures: list[str] = []
+        reports = {}
+        if args.merge:
+            reports["merge"] = run_merge(
+                root, apply=args.apply, generate=generate,
+                progress=print_progress if args.apply else None,
+            )
+            failures += reports["merge"]["failures"]
+        if args.graduate:
+            reports["graduate"] = run_graduate(
+                root, apply=args.apply, generate=generate,
+                progress=print_progress if args.apply else None,
+            )
+            failures += reports["graduate"]["failures"]
+
+        if args.json:
+            emit_json(reports)
+        else:
+            merge_report = reports.get("merge")
+            if merge_report:
+                for candidate in merge_report["candidates"]:
+                    print(
+                        f"merge candidate: {candidate['path']} "
+                        f"({candidate['bullets']} items, ~{candidate['estimated_input_tokens']} input tokens)"
+                    )
+                if merge_report["merged"]:
+                    print(f"merged: {', '.join(merge_report['merged'])}")
+            graduate_report = reports.get("graduate")
+            if graduate_report:
+                print(
+                    f"graduate candidates: {graduate_report['playbook_bullets']} playbook item(s) "
+                    f"(~{graduate_report['estimated_input_tokens']} input tokens), "
+                    f"{len(graduate_report['campaign_candidates'])} finished-campaign artifact(s)"
+                )
+                for draft in graduate_report["drafts"]:
+                    print(f"draft: {draft['path']} (from {draft['source']}) — review, rename, chmod +x")
+                for skipped in graduate_report["skipped_existing"]:
+                    print(f"skipped (exists): {skipped}")
+            if not args.apply:
+                print("dry run; pass --apply to execute")
+            for failure in failures:
+                print(f"failed: {failure}", file=sys.stderr)
+        return 1 if failures else 0
+
     if args.apply and harvest:
         provider, model = resolve_from_args(args)
 
