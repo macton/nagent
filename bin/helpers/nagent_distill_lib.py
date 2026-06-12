@@ -587,6 +587,73 @@ def _prune_file_index_entries(conversations: Path) -> int:
     return pruned
 
 
+def _summary_backfill_candidates(conversations: Path) -> list[tuple[Path, dict]]:
+    """Saved-index entries whose summary is missing or merely extracted —
+    the on-demand LLM upgrade nagent's instant saves defer to maintenance."""
+    candidates: list[tuple[Path, dict]] = []
+    for index_file in conversations.glob("index-saved-conversations-*.json"):
+        loaded = _load_index_json(index_file)
+        if loaded is None or not isinstance(loaded.get("conversations"), list):
+            continue
+        for entry in loaded["conversations"]:
+            if not isinstance(entry, dict):
+                continue
+            if entry.get("summary_source") == "llm" and entry.get("summary"):
+                continue
+            path = Path(str(entry.get("path", "")))
+            if path.is_file():
+                candidates.append((index_file, entry))
+    return candidates
+
+
+def _backfill_saved_summaries(conversations: Path, generate, emit) -> tuple[list[str], list[str]]:
+    """Upgrade non-LLM index summaries in place. Returns (updated, failures)."""
+    updated: list[str] = []
+    failures: list[str] = []
+    by_index: dict[Path, dict] = {}
+    for index_file, entry in _summary_backfill_candidates(conversations):
+        loaded = by_index.get(index_file)
+        if loaded is None:
+            loaded = _load_index_json(index_file)
+            by_index[index_file] = loaded
+        # Re-find the live entry in the loaded payload.
+        live = next(
+            (e for e in loaded.get("conversations", []) if e.get("path") == entry.get("path")),
+            None,
+        )
+        if live is None:
+            continue
+        path = Path(str(live["path"]))
+        try:
+            content = path.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError) as exc:
+            failures.append(f"summary backfill {live.get('name')}: {exc}")
+            continue
+        if len(content) > SUMMARIZE_THRESHOLD_BYTES:
+            content = "(earlier content truncated)\n" + content[-SUMMARIZE_THRESHOLD_BYTES:]
+        prompt = (
+            "Summarize this saved nagent conversation in 50 words or fewer, for a "
+            "browse index: what was asked, what was decided or produced. Return "
+            f"only the summary text.\n\n{content}"
+        )
+        try:
+            summary = " ".join(generate(prompt).split())
+        except Exception as exc:
+            failures.append(f"summary backfill {live.get('name')}: {exc}")
+            emit(f"summary backfill failed: {live.get('name')}: {exc}")
+            continue
+        if not summary:
+            failures.append(f"summary backfill {live.get('name')}: empty summary")
+            continue
+        live["summary"] = summary
+        live["summary_source"] = "llm"
+        updated.append(str(live.get("name")))
+        emit(f"summary backfilled: {live.get('name')}")
+    for index_file, loaded in by_index.items():
+        index_file.write_text(json.dumps(loaded, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    return updated, failures
+
+
 def _prune_saved_index_entries(conversations: Path) -> int:
     """Drop saved-conversation index entries whose saved copy no longer exists."""
     pruned = 0
@@ -642,6 +709,12 @@ def run_gc(
         totals[artifact.klass] = totals.get(artifact.klass, 0) + 1
 
     harvest_bytes = sum(a.size_bytes for a in harvest_candidates)
+    conversations_dir_path = root / "conversations"
+    summary_candidates = (
+        len(_summary_backfill_candidates(conversations_dir_path))
+        if conversations_dir_path.is_dir()
+        else 0
+    )
     report = {
         "root": str(root),
         "apply": apply,
@@ -651,6 +724,7 @@ def run_gc(
         "harvest_candidate_bytes": harvest_bytes,
         "estimated_harvest_input_tokens": harvest_bytes // 4,
         "prune_candidate_bytes": sum(a.size_bytes for a in prune_candidates),
+        "summary_backfill_candidates": summary_candidates,
     }
     if not apply:
         return report
@@ -777,6 +851,15 @@ def run_gc(
         pruned_entries += _prune_file_index_entries(conversations)
         pruned_entries += _prune_saved_index_entries(conversations)
 
+    # Saves are instant and carry extracted summaries; the LLM upgrade is
+    # maintenance work, so it happens here, with the rest of the maintenance.
+    summaries_backfilled: list[str] = []
+    if harvest and generate is not None and conversations.is_dir():
+        summaries_backfilled, backfill_failures = _backfill_saved_summaries(
+            conversations, generate, emit
+        )
+        failures.extend({"path": "saved-index", "error": failure} for failure in backfill_failures)
+
     save_ledger(root, ledger)
     digest = regenerate_digest(root)
 
@@ -785,6 +868,7 @@ def run_gc(
     report["failures"] = failures
     report["deferred"] = deferred
     report["pruned_index_entries"] = pruned_entries
+    report["summaries_backfilled"] = summaries_backfilled
     report["ledger_path"] = str(ledger_path(root))
     report["digest_path"] = str(digest) if digest else None
     return report

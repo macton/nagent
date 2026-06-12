@@ -366,7 +366,10 @@ continuation point, and mutable artifact. Use this line or equivalent:
 
 **The conversation does not own its memory. The user does.**
 
-Explicit maintenance: `--save-conversation` (with summarized index),
+Explicit maintenance: `--save-conversation` (instant — a file copy with a
+deterministically extracted index summary: checkpoint Intent line, else the
+first user prompt; `--summarize-conversation` upgrades an entry with an LLM
+summary on demand),
 `--load-conversation`, `--branch-conversation`, `--summarize`,
 `--edit-conversation`, `--compact` (rewrites the conversation against the
 user-editable compaction prompt). Implicit maintenance: conversations are

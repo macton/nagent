@@ -1837,6 +1837,50 @@ def save_conversation(conversation_file: Path, target: Path) -> Path:
     return target
 
 
+SUMMARY_EXTRACT_MAX_CHARS = 120
+
+
+def extract_conversation_summary(
+    conversation_file: Path,
+    source_conversation: Path | None = None,
+) -> str:
+    """Deterministic, zero-LLM browse summary for the saved index.
+
+    Preference order: the checkpoint's first Intent line (the summary the
+    safety net already paid for), else the first user prompt truncated —
+    the user's own words describing the task. Empty when neither exists."""
+    check = checkpoint_path(source_conversation or conversation_file)
+    if check.is_file():
+        try:
+            lines = check.read_text(encoding="utf-8").splitlines()
+        except OSError:
+            lines = []
+        in_intent = False
+        for line in lines:
+            stripped = line.strip()
+            if stripped == "## Intent":
+                in_intent = True
+                continue
+            if in_intent:
+                if stripped.startswith("##"):
+                    break
+                if stripped:
+                    return stripped.lstrip("- ").strip()
+
+    try:
+        content = conversation_file.read_text(encoding="utf-8")
+    except OSError:
+        return ""
+    block = extract_block(content, "user-prompt")
+    if block is None:
+        return ""
+    inner = block[len("<user-prompt>") : -len("</user-prompt>")]
+    prompt = " ".join(inner.split())
+    if len(prompt) > SUMMARY_EXTRACT_MAX_CHARS:
+        prompt = prompt[: SUMMARY_EXTRACT_MAX_CHARS].rstrip() + "..."
+    return prompt
+
+
 def summarize_saved_conversation(
     conversation_file: Path,
     provider: str | None,
@@ -1903,6 +1947,7 @@ def update_saved_conversations_index(
     name: str,
     saved_path: Path,
     summary: str,
+    summary_source: str = "llm",
 ) -> Path:
     index_path = saved_conversations_index_path(root, pid)
     payload = load_saved_conversations_index(root, pid)
@@ -1911,6 +1956,7 @@ def update_saved_conversations_index(
         "name": name,
         "path": saved_path_text,
         "summary": summary,
+        "summary_source": summary_source,
     }
     conversations = [
         existing for existing in payload["conversations"]
@@ -2464,6 +2510,14 @@ def main() -> int:
         help="Print an LLM-generated summary of the loaded conversation, then exit.",
     )
     parser.add_argument(
+        "--summarize-conversation",
+        metavar="NAME",
+        help=(
+            "Generate an LLM summary for a saved conversation and upgrade its "
+            "index entry (saves themselves are instant and use an extracted summary)."
+        ),
+    )
+    parser.add_argument(
         "--edit-conversation",
         action="store_true",
         help=(
@@ -2588,6 +2642,38 @@ def main() -> int:
             json_mode=args.json,
             print_status=user_direct_mode,
         )
+
+    if args.summarize_conversation is not None:
+        source = resolve_saved_conversation_reference(root, pid, args.summarize_conversation)
+        if not source.is_file():
+            print(f"Error: conversation not found: {source}", file=sys.stderr)
+            return 1
+        try:
+            summary = summarize_saved_conversation(source, args.provider, args.model, args.config)
+        except RuntimeError as exc:
+            print(f"Error: {exc}", file=sys.stderr)
+            return 1
+        index_path = update_saved_conversations_index(
+            root,
+            pid,
+            args.summarize_conversation,
+            source,
+            summary,
+            summary_source="llm",
+        )
+        if args.json:
+            emit_json(
+                {
+                    "name": args.summarize_conversation,
+                    "path": str(source.resolve()),
+                    "summary": summary,
+                    "index_path": str(index_path.resolve()),
+                }
+            )
+        else:
+            print(summary)
+            print(f"saved_conversations_index:{index_path}")
+        return 0
 
     # Every path past this point can write under the root; a newly created
     # root gets its scaffold (.gitignore for regenerable artifacts).
@@ -2716,21 +2802,18 @@ def main() -> int:
         except FileNotFoundError as exc:
             print(f"Error: {exc}", file=sys.stderr)
             return 1
-        # Saving is a file copy; the summary is best-effort metadata. A
-        # provider or credential failure must not leave the saved copy
-        # missing from the index.
-        try:
-            summary = summarize_saved_conversation(saved, args.provider, args.model, args.config)
-        except RuntimeError as exc:
-            error_line = str(exc).strip().splitlines()[0] if str(exc).strip() else "unknown error"
-            summary = f"(summary unavailable: {error_line})"
-            print(f"Warning: conversation summary unavailable: {error_line}", file=sys.stderr)
+        # Saving is a file copy and stays instant: the index summary is
+        # extracted deterministically (checkpoint Intent line, else the
+        # first user prompt). Upgrade on demand with --summarize-conversation
+        # or let nagent-distill backfill it.
+        summary = extract_conversation_summary(saved, conversation_file)
         index_path = update_saved_conversations_index(
             root,
             pid,
             args.save_conversation,
             saved,
             summary,
+            summary_source="extracted",
         )
         print_save_conversation_result(
             conversation_file,

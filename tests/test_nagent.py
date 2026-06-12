@@ -1237,18 +1237,23 @@ class ActionTests(unittest.TestCase):
         self.assertEqual(payload["conversations"][0]["path"], str(saved.resolve()))
         self.assertEqual(payload["conversations"][0]["summary"], "updated summary")
 
-    def test_main_save_conversation_summarizes_and_indexes_saved_copy(self):
+    def test_main_save_conversation_is_instant_with_extracted_summary(self):
+        # Saving is a file copy: no LLM call, no credentials. The index
+        # summary is extracted deterministically from the first user prompt.
         mod = load_nagent_module()
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             current = root / "conversations" / "current"
             current.parent.mkdir(parents=True)
-            current.write_text("current history", encoding="utf-8")
-            captured: dict[str, Path] = {}
+            current.write_text(
+                "<initial_context>\nrules\n</initial_context>\n"
+                "<user-prompt>\nMigrate the config loader to the new format\n</user-prompt>\n"
+                "<agent-response>\nworking\n</agent-response>\n",
+                encoding="utf-8",
+            )
 
-            def fake_summarize(path, provider, model, config_path):
-                captured["summarized_path"] = path
-                return "short summary"
+            def llm_must_not_run(*args, **kwargs):
+                raise AssertionError("save must not call the LLM")
 
             argv = [
                 "nagent",
@@ -1263,7 +1268,7 @@ class ActionTests(unittest.TestCase):
             ]
             with unittest.mock.patch.object(mod.sys, "argv", argv), \
                 unittest.mock.patch.object(mod.sys, "stdout", io.StringIO()) as stdout, \
-                unittest.mock.patch.object(mod, "summarize_saved_conversation", fake_summarize):
+                unittest.mock.patch.object(mod, "summarize_saved_conversation", llm_must_not_run):
                 code = mod.main()
 
             saved = root / "conversations" / "saved"
@@ -1271,59 +1276,80 @@ class ActionTests(unittest.TestCase):
             payload = json.loads(index.read_text(encoding="utf-8"))
 
             self.assertEqual(code, 0)
-            self.assertEqual(saved.read_text(encoding="utf-8"), "current history")
-            self.assertEqual(captured["summarized_path"], saved)
-            self.assertEqual(payload["conversations"][0]["path"], str(saved.resolve()))
-            self.assertEqual(payload["conversations"][0]["summary"], "short summary")
-            self.assertEqual(
-                stdout.getvalue().strip().splitlines(),
-                [
-                    f"saved:{saved}",
-                    f"saved_conversations_index:{index}",
-                    f"conversation:{current}",
-                ],
-            )
+            entry = payload["conversations"][0]
+            self.assertEqual(entry["path"], str(saved.resolve()))
+            self.assertEqual(entry["summary"], "Migrate the config loader to the new format")
+            self.assertEqual(entry["summary_source"], "extracted")
+            self.assertIn(f"saved:{saved}", stdout.getvalue())
 
-    def test_main_save_conversation_indexes_saved_copy_when_summary_fails(self):
-        # Saving is a file copy; a provider/credential failure in the summary
-        # step must not leave the saved copy missing from the index.
+    def test_extract_conversation_summary_prefers_checkpoint_intent(self):
+        mod = load_nagent_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            conversation = Path(tmp) / "conv"
+            conversation.write_text(
+                "<user-prompt>\nthe original ask\n</user-prompt>\n", encoding="utf-8"
+            )
+            checkpoint = mod.checkpoint_path(conversation)
+            checkpoint.write_text(
+                "# Checkpoint: conv\nupdated: 2026-06-12T00:00:00+00:00\n"
+                "conversation_chars: 10\n\n## Intent\n- replace the loader end to end\n"
+                "## Next action\n- run tests\n",
+                encoding="utf-8",
+            )
+            summary = mod.extract_conversation_summary(conversation)
+            self.assertEqual(summary, "replace the loader end to end")
+
+    def test_extract_conversation_summary_falls_back_and_truncates(self):
+        mod = load_nagent_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            conversation = Path(tmp) / "conv"
+            long_prompt = "word " * 60
+            conversation.write_text(
+                f"<user-prompt>\n{long_prompt}\n</user-prompt>\n", encoding="utf-8"
+            )
+            summary = mod.extract_conversation_summary(conversation)
+            self.assertTrue(summary.endswith("..."))
+            self.assertLessEqual(len(summary), mod.SUMMARY_EXTRACT_MAX_CHARS + 3)
+
+            bare = Path(tmp) / "bare"
+            bare.write_text("no prompt block here", encoding="utf-8")
+            self.assertEqual(mod.extract_conversation_summary(bare), "")
+
+    def test_main_summarize_conversation_upgrades_index_entry(self):
         mod = load_nagent_module()
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            current = root / "conversations" / "current"
-            current.parent.mkdir(parents=True)
-            current.write_text("current history", encoding="utf-8")
+            saved = root / "conversations" / "saved"
+            saved.parent.mkdir(parents=True)
+            saved.write_text("saved history", encoding="utf-8")
+            mod.update_saved_conversations_index(
+                root, "4242", "saved", saved, "the original ask", summary_source="extracted"
+            )
 
-            def failing_summarize(path, provider, model, config_path):
-                raise RuntimeError("Error: missing credentials for provider 'openai'.")
+            def fake_summarize(path, provider, model, config_path):
+                self.assertEqual(path, saved)
+                return "a proper llm summary"
 
             argv = [
                 "nagent",
                 "--root",
                 str(root),
-                "--conversation",
-                "current",
                 "--pid",
                 "4242",
-                "--save-conversation",
+                "--summarize-conversation",
                 "saved",
             ]
-            stderr = io.StringIO()
             with unittest.mock.patch.object(mod.sys, "argv", argv), \
-                unittest.mock.patch.object(mod.sys, "stdout", io.StringIO()), \
-                unittest.mock.patch.object(mod.sys, "stderr", stderr), \
-                unittest.mock.patch.object(mod, "summarize_saved_conversation", failing_summarize):
+                unittest.mock.patch.object(mod.sys, "stdout", io.StringIO()) as stdout, \
+                unittest.mock.patch.object(mod, "summarize_saved_conversation", fake_summarize):
                 code = mod.main()
 
-            saved = root / "conversations" / "saved"
-            index = root / "conversations" / "index-saved-conversations-4242.json"
-            payload = json.loads(index.read_text(encoding="utf-8"))
-
             self.assertEqual(code, 0)
-            self.assertEqual(saved.read_text(encoding="utf-8"), "current history")
-            self.assertEqual(len(payload["conversations"]), 1)
-            self.assertIn("summary unavailable", payload["conversations"][0]["summary"])
-            self.assertIn("summary unavailable", stderr.getvalue())
+            self.assertIn("a proper llm summary", stdout.getvalue())
+            index = root / "conversations" / "index-saved-conversations-4242.json"
+            entry = json.loads(index.read_text(encoding="utf-8"))["conversations"][0]
+            self.assertEqual(entry["summary"], "a proper llm summary")
+            self.assertEqual(entry["summary_source"], "llm")
 
     def test_main_fresh_conversation_builds_initial_context_once(self):
         # A fresh conversation (the path every delegated sub-conversation

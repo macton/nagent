@@ -621,6 +621,69 @@ class GcCliTests(unittest.TestCase):
         self.assertIn("root not found", result.stderr)
 
 
+class SummaryBackfillTests(unittest.TestCase):
+    def _seed_index(self, root, summary_source="extracted", summary="the original ask"):
+        conversations = root / "conversations"
+        conversations.mkdir(parents=True, exist_ok=True)
+        saved = conversations / "saved-copy"
+        saved.write_text("<user-prompt>\nthe ask\n</user-prompt>\nlots of work\n", encoding="utf-8")
+        index = conversations / "index-saved-conversations-1.json"
+        entry = {"name": "saved-copy", "path": str(saved.resolve()), "summary": summary}
+        if summary_source is not None:
+            entry["summary_source"] = summary_source
+        index.write_text(json.dumps({"conversations": [entry]}), encoding="utf-8")
+        return index
+
+    def test_apply_backfills_extracted_summary(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            index = self._seed_index(root)
+            captured = {}
+
+            def fake_generate(prompt, *args):
+                captured["prompt"] = prompt
+                return "what was asked and what was produced"
+
+            report = gc.run_gc(
+                root, apply=True, provider="openai", model="m", generate=fake_generate
+            )
+
+            self.assertEqual(report["summaries_backfilled"], ["saved-copy"])
+            self.assertIn("the ask", captured["prompt"])
+            entry = json.loads(index.read_text(encoding="utf-8"))["conversations"][0]
+            self.assertEqual(entry["summary"], "what was asked and what was produced")
+            self.assertEqual(entry["summary_source"], "llm")
+
+    def test_llm_summaries_are_not_redone(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            index = self._seed_index(root, summary_source="llm", summary="already good")
+
+            def must_not_run(prompt, *args):
+                raise AssertionError("llm summaries must not be regenerated")
+
+            report = gc.run_gc(
+                root, apply=True, provider="openai", model="m", generate=must_not_run
+            )
+
+            self.assertEqual(report["summaries_backfilled"], [])
+            entry = json.loads(index.read_text(encoding="utf-8"))["conversations"][0]
+            self.assertEqual(entry["summary"], "already good")
+
+    def test_dry_run_reports_candidates_and_no_harvest_skips(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            index = self._seed_index(root)
+
+            report = gc.run_gc(root, apply=False)
+            self.assertEqual(report["summary_backfill_candidates"], 1)
+
+            report = gc.run_gc(root, apply=True, harvest=False)
+            self.assertEqual(report["summaries_backfilled"], [])
+            entry = json.loads(index.read_text(encoding="utf-8"))["conversations"][0]
+            self.assertEqual(entry["summary"], "the original ask")
+
+
 class MergePassTests(unittest.TestCase):
     def _seed_duplicates(self, root):
         gc.merge_harvest(

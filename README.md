@@ -323,10 +323,14 @@ Memory goes stale; therefore editing history is maintenance, not corruption.
 
 **Implementation** — Explicit maintenance commands:
 
-- `--save-conversation NAME` copies the conversation and records it, with an
-  LLM-generated summary, in a saved-conversations index. If the summary
-  fails, the save still completes — the index gets a visible
-  "(summary unavailable)" marker instead of losing the entry.
+- `--save-conversation NAME` is instant: a file copy plus an index entry.
+  The index summary is extracted deterministically, zero LLM — the
+  checkpoint's Intent line when one exists (already paid for), else the
+  first user prompt truncated: your own words describing the task. The save
+  name you chose is the rest of the metadata.
+- `--summarize-conversation NAME` upgrades one index entry with a proper
+  LLM summary, on demand — pay for the good version only when you want it.
+  `nagent-distill --apply` backfills the rest as maintenance.
 - `--load-conversation` / `--branch-conversation` archive the current file
   and copy a saved or named conversation into place.
 - `--summarize` prints an LLM summary of the loaded conversation.
@@ -454,6 +458,10 @@ or prompts under the root, and a finished campaign's `bin/` and `prompts/`
 are staged the same way. Drafts are deliberately not executable — invisible
 to tool discovery until you review, rename, and `chmod +x`. Knowledge
 becomes capability, gated by review. Nothing lands silently.
+
+Distill also backfills the saved-conversations index: entries whose summary
+is missing or merely extracted get a proper LLM summary during `--apply` —
+instant saves defer that cost to the maintenance pass, where it is visible.
 
 Dry run is the default everywhere, with the estimated cost in tokens printed
 before anyone pays it.
@@ -972,6 +980,7 @@ nagent --list-models --json
 nagent --list-conversations
 nagent --clear
 nagent --save-conversation saved-copy
+nagent --summarize-conversation saved-copy
 nagent --load-conversation saved-copy
 nagent --branch-conversation saved-copy
 nagent --summarize

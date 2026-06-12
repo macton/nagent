@@ -55,6 +55,8 @@ def print_report(report: dict) -> None:
         f"(~{report['estimated_harvest_input_tokens']} input tokens), "
         f"prune candidates: {format_size(report['prune_candidate_bytes'])}"
     )
+    if report.get("summary_backfill_candidates"):
+        print(f"saved-index summaries to backfill: {report['summary_backfill_candidates']}")
 
     if not report["apply"]:
         print("dry run; pass --apply to harvest and reclaim")
@@ -66,6 +68,8 @@ def print_report(report: dict) -> None:
     print(f"harvested items: {item_summary or 'none'}")
     if report.get("pruned_index_entries"):
         print(f"pruned index entries: {report['pruned_index_entries']}")
+    if report.get("summaries_backfilled"):
+        print(f"summaries backfilled: {', '.join(report['summaries_backfilled'])}")
     if report.get("deferred"):
         print(f"deferred (over --max-harvest-bytes): {report['deferred']}")
     for failure in report.get("failures", []):
