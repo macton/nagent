@@ -1,4 +1,7 @@
 {
   "provider": "openai",
-  "model": "gpt-5.5"
+  "model": "gpt-5.5",
+  "checkpoint_interval_minutes": 60,
+  "checkpoint_max_new_kb": 256,
+  "rebuild_at_kb": 384
 }

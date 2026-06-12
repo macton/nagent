@@ -650,6 +650,23 @@ file — the parent keeps coordination, the child keeps the noise, and only the
 distilled result returns as a `<nagent-conversation-result>` with its token
 totals rolled up. Delegation is context management before it is parallelism.
 
+A safety net catches the conversation that outgrows its window anyway.
+Checkpoints: a separate one-call writer (not the working model — asking a
+mid-task model to also keep the log degrades both jobs) maintains
+`{conversation}.checkpoint.md`, a fixed-schema, user-editable working-state
+file. The cadence is wall-clock with a burst guard, computed from data on
+disk — the checkpoint records its own timestamp and the conversation size:
+fire after `checkpoint_interval_minutes` (default 60) when the conversation
+has grown, or immediately after `checkpoint_max_new_kb` (default 256) of
+new content regardless of time, because a five-minute log-reading burst is
+exactly when a stale checkpoint is worthless. An idle hour costs nothing.
+Rebuild: past `rebuild_at_kb` (default 384) the loop runs a synchronous
+checkpoint (failure widens the raw tail instead of blocking), archives the
+conversation, and assembles a fresh window — initial context + checkpoint +
+recent tail — deterministically, no LLM rewrite. A long task becomes an
+inspectable chain of window files linked by checkpoints, and the archives
+feed `nagent-distill`. Three config numbers, all verifiable with `ls -l`.
+
 The initial context directs the model to exploit conversations as data, not
 just spawn them. Reuse a named worker: `conversation-file="name"` continues
 that conversation with its accumulated context — a specialist (a test runner,

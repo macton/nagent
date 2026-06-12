@@ -12,12 +12,21 @@ import sys
 import tempfile
 import uuid
 from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Literal
 
 HELPERS_DIR = Path(__file__).resolve().parent / "helpers"
 sys.path.insert(0, str(HELPERS_DIR))
-from nagent_llm import PROVIDERS, generate_text, list_models, require_credentials, resolve_provider, resolve_settings
+from nagent_llm import (
+    PROVIDERS,
+    generate_text,
+    list_models,
+    load_config,
+    require_credentials,
+    resolve_provider,
+    resolve_settings,
+)
 from nagent_cli import (
     WaitSpinner,
     collect_bin_tool_descriptions,
@@ -772,6 +781,7 @@ Conversations are data (create, reuse, hand off):
 - Resume saved work: conversation-name="{{saved-name}}" starts the child from a conversation the user saved with --save-conversation.
 - Author a worker's context: write a curated briefing to a temp file with <nagent-write>, then spawn <nagent-conversation conversation-file="/tmp/...">. Include only what the worker needs: goal, constraints, paths, known facts.
 - Hand off when noisy: if this conversation is mostly stale tool output, distill goal/state/decisions into a sub-conversation prompt, delegate the rest, and tell your caller about the handoff. Never rewrite your own conversation file while running.
+- High-stakes decision? Spawn 2-3 workers on the same authored briefing plus a judge worker to compare results; spend those tokens only when the decision warrants it.
 - This conversation persists across invocations, and the user may edit it between runs. The current file is the source of truth.
 
 Campaigns (long-horizon plans as data; drive with nagent-campaign via <nagent-shell>):
@@ -1442,6 +1452,241 @@ def process_tags(
     return responses, next_prompts, should_continue
 
 
+# --- conversation safety net: checkpoints and rebuild ----------------------
+# (issues/0004-conversation-safety-net.md) Wall-clock cadence with a burst
+# guard for checkpoints; rebuild is the one size-based trigger and always
+# runs a synchronous checkpoint first. All triggers compute from data on
+# disk; sizes are characters of the conversation file (~bytes).
+
+CHECKPOINT_PROMPT_NAME = "checkpoint-conversation.md"
+CHECKPOINT_DELTA_CAP_CHARS = 128 * 1024
+REBUILD_TAIL_CHARS = 64 * 1024
+SAFETY_DEFAULTS = {
+    "checkpoint_interval_minutes": 60,
+    "checkpoint_max_new_kb": 256,
+    "rebuild_at_kb": 384,
+}
+
+
+def load_safety_settings(config_path: Path | None) -> dict:
+    try:
+        config = load_config(config_path)
+    except ValueError:
+        config = {}
+    settings = {}
+    for key, default in SAFETY_DEFAULTS.items():
+        try:
+            settings[key] = int(config.get(key, default))
+        except (TypeError, ValueError):
+            settings[key] = default
+    return settings
+
+
+def checkpoint_path(conversation_file: Path) -> Path:
+    return conversation_file.with_name(conversation_file.name + ".checkpoint.md")
+
+
+def parse_checkpoint_meta(path: Path) -> tuple[datetime, int] | None:
+    """(updated, conversation_chars) from a checkpoint header, or None."""
+    if not path.is_file():
+        return None
+    updated = None
+    recorded = None
+    try:
+        for line in path.read_text(encoding="utf-8").splitlines()[:6]:
+            if line.startswith("updated:"):
+                updated = datetime.fromisoformat(line.split(":", 1)[1].strip())
+            elif line.startswith("conversation_chars:"):
+                recorded = int(line.split(":", 1)[1].strip())
+    except (OSError, ValueError):
+        return None
+    if updated is None or recorded is None:
+        return None
+    if updated.tzinfo is None:
+        updated = updated.replace(tzinfo=timezone.utc)
+    return updated, recorded
+
+
+def format_checkpoint(conversation_name: str, conversation_chars: int, body: str, now: datetime) -> str:
+    return (
+        f"# Checkpoint: {conversation_name}\n"
+        f"updated: {now.isoformat()}\n"
+        f"conversation_chars: {conversation_chars}\n\n"
+        f"{body.strip()}\n"
+    )
+
+
+def checkpoint_due(
+    meta: tuple[datetime, int] | None,
+    conversation_chars: int,
+    now: datetime,
+    settings: dict,
+) -> bool:
+    interval_minutes = settings.get("checkpoint_interval_minutes", 0)
+    max_new = settings.get("checkpoint_max_new_kb", 0) * 1024
+    if interval_minutes <= 0:
+        return False
+    if meta is None:
+        # The first checkpoint earns its keep once the conversation is big
+        # enough to be worth recovering; short tasks never pay for one.
+        return max_new > 0 and conversation_chars > max_new
+    updated, recorded = meta
+    new_chars = conversation_chars - recorded
+    if new_chars <= 0:
+        return False  # nothing new: an idle hour must not buy an LLM call
+    if max_new > 0 and new_chars > max_new:
+        return True  # burst guard: time and context use are uncorrelated
+    return (now - updated) >= timedelta(minutes=interval_minutes)
+
+
+def rebuild_due(conversation_chars: int, settings: dict) -> bool:
+    rebuild_kb = settings.get("rebuild_at_kb", 0)
+    return rebuild_kb > 0 and conversation_chars > rebuild_kb * 1024
+
+
+def write_checkpoint(
+    conversation_file: Path,
+    root: Path,
+    llm: LlmSettings,
+    *,
+    now: datetime | None = None,
+) -> Path:
+    """One LLM call updates the checkpoint from the previous checkpoint (user
+    edits included) plus the conversation delta since it was written. The
+    deterministic header is the driver's, not the model's."""
+    now = now or datetime.now(timezone.utc)
+    content = conversation_file.read_text(encoding="utf-8")
+    path = checkpoint_path(conversation_file)
+
+    previous = ""
+    delta_start = 0
+    meta = parse_checkpoint_meta(path)
+    if meta is not None:
+        previous = path.read_text(encoding="utf-8")
+        delta_start = min(meta[1], len(content))
+    delta = content[delta_start:]
+    if len(delta) > CHECKPOINT_DELTA_CAP_CHARS:
+        delta = "(earlier activity truncated)\n" + delta[-CHECKPOINT_DELTA_CAP_CHARS:]
+
+    template_path = resolve_prompt_path(root, CHECKPOINT_PROMPT_NAME)
+    template = (
+        template_path.read_text(encoding="utf-8").strip()
+        if template_path.is_file()
+        else "Update the checkpoint body (sections starting at '## Intent') from the previous checkpoint and the new activity. Return only the body."
+    )
+    prompt = (
+        f"{template}\n\n"
+        f"Previous checkpoint (may include user edits — preserve them):\n"
+        f"{previous or '(none)'}\n\n"
+        f"Conversation activity since the previous checkpoint:\n{delta}"
+    )
+    body = generate_text(prompt, llm.provider, llm.model).strip()
+    if not body.startswith("##"):
+        raise RuntimeError("checkpoint writer returned no sections")
+    path.write_text(format_checkpoint(conversation_file.name, len(content), body, now), encoding="utf-8")
+    return path
+
+
+def rebuild_conversation(
+    conversation_file: Path,
+    root: Path,
+    llm: LlmSettings,
+    *,
+    now: datetime | None = None,
+) -> Path | None:
+    """Archive the conversation and start a fresh window: initial context +
+    checkpoint + recent raw tail. Deterministic assembly; the only LLM call
+    is the synchronous checkpoint, and its failure widens the tail instead
+    of blocking the rebuild."""
+    now = now or datetime.now(timezone.utc)
+    content = conversation_file.read_text(encoding="utf-8")
+    span = find_block_span(content, INITIAL_CONTEXT_BLOCK)
+    if span is None or span[0] != 0:
+        return None  # no context prefix: not a conversation we can rebuild safely
+
+    tail_chars = REBUILD_TAIL_CHARS
+    try:
+        write_checkpoint(conversation_file, root, llm, now=now)
+    except Exception as exc:
+        print(f"rebuild: synchronous checkpoint failed ({exc}); widening raw tail", file=sys.stderr)
+        tail_chars *= 4
+
+    check_file = checkpoint_path(conversation_file)
+    checkpoint_text = check_file.read_text(encoding="utf-8").strip() if check_file.is_file() else ""
+
+    initial_context = content[span[0] : span[1]]
+    body = content[span[1] :]
+    tail = body[-tail_chars:]
+    newline_at = tail.find("\n")
+    if len(tail) < len(body) and newline_at != -1:
+        tail = tail[newline_at + 1 :]  # start the tail on a whole line
+
+    archived = archive_conversation(conversation_file)
+    parts = [initial_context, ""]
+    checkpoint_note = ""
+    if checkpoint_text:
+        parts += ["{checkpoint}", checkpoint_text, "{/checkpoint}", ""]
+        checkpoint_note = (
+            " The {checkpoint} block above is the distilled working state;"
+            " below is the most recent raw activity."
+        )
+    else:
+        checkpoint_note = " No checkpoint was available; below is a wider span of recent raw activity."
+    parts += [
+        (
+            f"<system>Conversation rebuilt at {now.isoformat()}: full history archived at "
+            f"{archived}.{checkpoint_note}</system>"
+        ),
+        "",
+        tail.strip("\n"),
+        "",
+    ]
+    conversation_file.write_text("\n".join(parts), encoding="utf-8")
+
+    # Reset the checkpoint's recorded size to the fresh window, or growth
+    # arithmetic would be wrong until the new file outgrew the old one.
+    if check_file.is_file() and checkpoint_text:
+        meta = parse_checkpoint_meta(check_file)
+        if meta is not None:
+            header_end = checkpoint_text.find("\n\n")
+            body_text = checkpoint_text[header_end + 2 :] if header_end != -1 else checkpoint_text
+            check_file.write_text(
+                format_checkpoint(
+                    conversation_file.name,
+                    len(conversation_file.read_text(encoding="utf-8")),
+                    body_text,
+                    now,
+                ),
+                encoding="utf-8",
+            )
+    return archived
+
+
+def run_safety_net(
+    conversation_file: Path,
+    root: Path,
+    llm: LlmSettings,
+    settings: dict,
+    *,
+    now: datetime | None = None,
+) -> None:
+    now = now or datetime.now(timezone.utc)
+    try:
+        conversation_chars = len(conversation_file.read_text(encoding="utf-8"))
+    except OSError:
+        return
+    if rebuild_due(conversation_chars, settings):
+        rebuild_conversation(conversation_file, root, llm, now=now)
+        return
+    meta = parse_checkpoint_meta(checkpoint_path(conversation_file))
+    if checkpoint_due(meta, conversation_chars, now, settings):
+        try:
+            write_checkpoint(conversation_file, root, llm, now=now)
+        except Exception as exc:
+            # Checkpointing is a safety net, never a blocker.
+            print(f"checkpoint failed: {exc}", file=sys.stderr)
+
+
 def run_agent_loop(
     conversation_file: Path,
     root: Path,
@@ -1454,6 +1699,7 @@ def run_agent_loop(
     json_mode: bool = False,
     token_stats: TokenStats | None = None,
     initial_read_paths: list[str] | None = None,
+    safety_settings: dict | None = None,
 ) -> tuple[int, list[str]]:
     nagent_path = Path(__file__).resolve()
     user_responses: list[str] = []
@@ -1466,6 +1712,8 @@ def run_agent_loop(
         append_to_conversation(conversation_file, f"<user-prompt>\n{initial_prompt}\n</user-prompt>")
 
     while True:
+        if safety_settings is not None:
+            run_safety_net(conversation_file, root, llm, safety_settings)
         llm_output, error = None, None
         for attempt in range(MAX_FORMAT_RETRIES):
             llm_output, error = call_llm(conversation_file, llm, token_stats)
@@ -2571,6 +2819,7 @@ def main() -> int:
             json_mode=args.json,
             token_stats=token_stats,
             initial_read_paths=args.read,
+            safety_settings=load_safety_settings(args.config),
         )
     except KeyboardInterrupt:
         record_interrupt(conversation_file)

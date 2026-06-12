@@ -117,8 +117,11 @@ a worked example of the principles:
 - *Managing context and large files* — context windows are a budget. Teach
   the explicit responses: inline-read thresholds, split/index/patch for
   large files, summaries, conversation compaction, the bounded knowledge
-  digest, and sub-conversations as context isolation (the parent keeps
-  coordination; the child keeps the noise; the result comes back distilled).
+  digest, sub-conversations as context isolation (the parent keeps
+  coordination; the child keeps the noise; the result comes back distilled),
+  and the safety net — wall-clock checkpoints with a burst guard, written by
+  a separate worker, and deterministic rebuild into a chain of window files
+  when a conversation outgrows its window anyway.
 - *Per-file write conversations* — every file gets its own persistent
   conversation, keyed by stable file id, carrying its own initial context
   (history, summaries, knowledge notes) and its own bounded write authority.
@@ -245,6 +248,10 @@ Use these reductions where they belong in the arc:
 - A model will claim "done"; a claim is not a check. Therefore: gate
   completion on conditions — executable tests preferred, judged prose only
   when unavoidable. (Part VI)
+- A single conversation can outgrow its window mid-task. Therefore:
+  checkpoint working state on a wall-clock cadence with a burst guard, and
+  rebuild deterministically into a fresh window — a chain of files, each
+  auditable. (Part VI)
 - Proven playbooks stay prose that must be re-read and re-trusted every
   time. Therefore: graduate them into self-describing tools and prompts —
   knowledge becomes capability, gated by review. (Part IV)
@@ -622,6 +629,10 @@ Verify the README explicitly explains all of these:
       bounded; review gate as informed choice; conditions over claims;
       single-writer tree; per-item conversations; ambient status + direction
       in context
+- [ ] safety net: wall-clock checkpoints with burst guard (separate writer;
+      user edits survive); synchronous checkpoint before deterministic
+      rebuild; window chains; three ls-verifiable config numbers; best-of-N
+      as context direction
 - [ ] result wrappers as conversation data
 - [ ] tool discovery through executable descriptions
 - [ ] provider abstraction incl. claude-code via Claude Code login
