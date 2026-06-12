@@ -245,6 +245,9 @@ Use these reductions where they belong in the arc:
 - A model will claim "done"; a claim is not a check. Therefore: gate
   completion on conditions — executable tests preferred, judged prose only
   when unavoidable. (Part VI)
+- Proven playbooks stay prose that must be re-read and re-trusted every
+  time. Therefore: graduate them into self-describing tools and prompts —
+  knowledge becomes capability, gated by review. (Part IV)
 - Dead conversations accumulate, and deleting them loses what was learned.
   Therefore: harvest knowledge into editable category files, gate deletion on
   the harvest, and inject a bounded digest back into context. (Part IV)
@@ -605,8 +608,9 @@ Verify the README explicitly explains all of these:
 - [ ] bounded write authority per mode (temp-only vs per-file)
 - [ ] repository history as data; commit summaries; file summaries; editors
 - [ ] historical coupling; co-edited files; artifact neighborhoods
-- [ ] knowledge harvest: gc classification, ledger gate, category files,
-      provenance, digest injection, per-file notes, dry-run cost estimate
+- [ ] knowledge harvest: distill classification, ledger gate, category
+      files, provenance, digest injection, per-file notes, dry-run cost
+      estimate; merge and graduate passes (drafts, nothing silent)
 - [ ] large-file split/index/patch; natural splitters; hash validation
 - [ ] disposable workers; sub-conversation isolation as context management
 - [ ] visible protocol; shared tag parser; parser retries as visible state

@@ -471,12 +471,25 @@ conversation's `<initial_context>` as a `{knowledge}` block. Delete
 Dry run is the default and prints the classification table plus the estimated
 harvest cost in tokens before anyone pays it.
 
+Two more distillation passes keep the store healthy. `--merge` rewrites each
+category file — dedup, merge, compress, provenance preserved — keeping the
+previous content as `{file}.pre-merge`; the digest regenerates from the
+result, so a merge propagates exactly like a hand edit. `--graduate` drafts
+reusable artifacts: proven playbooks become `.draft` tools or prompts under
+the root, and a finished campaign's `bin/` and `prompts/` are staged the same
+way. Drafts are deliberately not executable — invisible to tool discovery
+until you review, rename, and `chmod +x`. Nothing lands silently. Finished
+campaigns' conversations also classify as harvest sources, so a completed
+plan's working state feeds the knowledge store before reclaim.
+
 **Example**
 
 ```bash
 nagent-distill                        # dry run: classify, estimate cost
 nagent-distill --apply                # harvest into {root}/knowledge/, reclaim
 nagent-distill --apply --no-harvest   # reclaim only, no LLM pass
+nagent-distill --merge --apply        # dedup/compress the knowledge files
+nagent-distill --graduate --apply     # draft proven playbooks as tools/prompts
 ```
 
 **Build your own:** never delete an artifact you have not distilled, and
@@ -900,6 +913,8 @@ nagent-file-summarize --file src/big.py --json
 nagent-distill                        # dry run: classify artifacts, estimate harvest cost
 nagent-distill --apply                # harvest knowledge into {root}/knowledge/, reclaim space
 nagent-distill --apply --no-harvest   # reclaim only, no LLM pass
+nagent-distill --merge --apply        # dedup/compress the knowledge files
+nagent-distill --graduate --apply     # draft proven playbooks as tools/prompts
 
 nagent-campaign new "Migrate config" --goal "Replace the loader."
 nagent-campaign add migrate-config "Inventory call sites"
