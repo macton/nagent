@@ -1,0 +1,320 @@
+#!/usr/bin/python3
+
+import argparse
+import sys
+from pathlib import Path
+
+HELPERS_DIR = Path(__file__).resolve().parent / "helpers"
+sys.path.insert(0, str(HELPERS_DIR))
+from nagent_cli import emit_json, ensure_root_scaffold, exit_on_description, resolve_default_root
+from nagent_llm import add_llm_arguments, generate_text, resolve_from_args
+import nagent_campaign_lib as campaign_lib
+
+NAGENT_CAMPAIGN_DESCRIPTION = """\
+Operate campaigns: long-horizon plans stored as data under {root}/campaigns/.
+A campaign is a hand-editable index.yaml tree of todo items with per-item
+conversations. Use it when work is large, multi-step, or must outlive one
+conversation. Subcommands: new, list, status, add, review, confirm, and
+update (one deterministic pass: merge worker results, check completion
+conditions, gate decomposition proposals behind review, dispatch unblocked
+items to sub-conversations). update --dry-run previews without mutating."""
+
+
+def cmd_new(args, root: Path) -> int:
+    ensure_root_scaffold(root)
+    description = args.goal or ""
+    if description == "-":
+        description = sys.stdin.read()
+    try:
+        campaign = campaign_lib.new_campaign(root, args.name, description)
+    except FileExistsError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
+    print(f"campaign:{campaign}")
+    print(f"index:{campaign_lib.index_path(campaign)}")
+    return 0
+
+
+def cmd_list(args, root: Path) -> int:
+    campaigns = campaign_lib.list_campaigns(root)
+    if args.json:
+        payload = []
+        for campaign in campaigns:
+            index = campaign_lib.load_index(campaign)
+            payload.append(
+                {
+                    "slug": campaign.name,
+                    "name": index.get("name"),
+                    "status": index.get("status"),
+                    "counts": campaign_lib.status_counts(index),
+                }
+            )
+        emit_json({"campaigns": payload})
+        return 0
+    for line in campaign_lib.campaign_status_lines(root):
+        print(line)
+    if not campaigns:
+        print("no campaigns")
+    return 0
+
+
+def _render_tree(nodes, indent: int = 0) -> None:
+    for node in nodes:
+        blocked = f" blocked_by={','.join(node['blocked_by'])}" if node.get("blocked_by") else ""
+        print(f"{'  ' * indent}- {node.get('id')} [{node.get('status', 'todo')}]{blocked}")
+        _render_tree(node.get("items") or [], indent + 1)
+
+
+def cmd_status(args, root: Path) -> int:
+    campaign = campaign_lib.campaign_dir(root, args.slug)
+    if not campaign_lib.index_path(campaign).is_file():
+        print(f"Error: campaign not found: {args.slug}", file=sys.stderr)
+        return 1
+    index = campaign_lib.load_index(campaign)
+    if args.json:
+        emit_json(
+            {
+                "slug": args.slug,
+                "name": index.get("name"),
+                "status": index.get("status"),
+                "counts": campaign_lib.status_counts(index),
+                "items": index.get("items"),
+                "pending_proposals": [
+                    {"parent": p["parent"], "scope": p["scope"]}
+                    for p in campaign_lib.pending_proposals(campaign, index)
+                ],
+            }
+        )
+        return 0
+    print(f"{index.get('name')} [{index.get('status')}]")
+    if index.get("description"):
+        print(index["description"].strip())
+    print()
+    _render_tree(index.get("items") or [])
+    pending = campaign_lib.pending_proposals(campaign, index)
+    if pending:
+        print("\npending proposals (review with: nagent-campaign review):")
+        for proposal in pending:
+            scope = proposal["scope"]
+            target = proposal["parent"] or "(campaign)"
+            print(
+                f"- {target}: +{scope['items_added']} items, depth {scope['resulting_depth']}, "
+                f"~{scope['estimated_tokens']} tokens to dispatch"
+            )
+    questions = campaign_lib.questions_path(campaign)
+    if questions.is_file():
+        open_ids = [
+            node["id"]
+            for node, _d, _s in campaign_lib.walk_items(index.get("items", []))
+            if node.get("status") == "question"
+        ]
+        if open_ids:
+            print(f"\nopen questions ({', '.join(open_ids)}): answer in {questions}")
+    return 0
+
+
+def cmd_add(args, root: Path) -> int:
+    campaign = campaign_lib.campaign_dir(root, args.slug)
+    if not campaign_lib.index_path(campaign).is_file():
+        print(f"Error: campaign not found: {args.slug}", file=sys.stderr)
+        return 1
+    try:
+        item_id = campaign_lib.add_item(
+            campaign, args.description, parent=args.parent, blocked_by=args.blocked_by
+        )
+    except KeyError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
+    print(f"item:{item_id}")
+    return 0
+
+
+def cmd_review(args, root: Path) -> int:
+    campaign = campaign_lib.campaign_dir(root, args.slug)
+    if not campaign_lib.index_path(campaign).is_file():
+        print(f"Error: campaign not found: {args.slug}", file=sys.stderr)
+        return 1
+    index = campaign_lib.load_index(campaign)
+    pending = campaign_lib.pending_proposals(campaign, index)
+    if not pending:
+        print("no pending proposals")
+        return 0
+    for proposal in pending:
+        target = proposal["parent"] or "(campaign)"
+        scope = proposal["scope"]
+        print(
+            f"proposal for {target}: +{scope['items_added']} items, "
+            f"depth {scope['resulting_depth']} ({proposal['path']})"
+        )
+        for item, depth in campaign_lib._walk_proposed_with_depth(proposal["items"]):
+            print(f"{'  ' * depth}- {item.get('description', '')}")
+        print()
+    print("edit the proposal file to adjust, then: nagent-campaign confirm " + args.slug)
+    return 0
+
+
+def cmd_confirm(args, root: Path) -> int:
+    campaign = campaign_lib.campaign_dir(root, args.slug)
+    if not campaign_lib.index_path(campaign).is_file():
+        print(f"Error: campaign not found: {args.slug}", file=sys.stderr)
+        return 1
+    index = campaign_lib.load_index(campaign)
+    pending = campaign_lib.pending_proposals(campaign, index)
+    if args.item is not None:
+        pending = [p for p in pending if (p["parent"] or "(campaign)") == args.item or p["parent"] == args.item]
+    if not pending:
+        print("no matching pending proposals")
+        return 1
+    for proposal in pending:
+        new_ids = campaign_lib.confirm_proposal(campaign, index, proposal)
+        print(f"confirmed {proposal['parent'] or '(campaign)'}: {', '.join(new_ids)}")
+    return 0
+
+
+def cmd_update(args, root: Path) -> int:
+    campaign = campaign_lib.campaign_dir(root, args.slug)
+    if not campaign_lib.index_path(campaign).is_file():
+        print(f"Error: campaign not found: {args.slug}", file=sys.stderr)
+        return 1
+
+    generate = None
+    llm_args: list[str] = []
+    if not args.dry_run:
+        provider, model = resolve_from_args(args)
+        llm_args = ["--provider", provider, "--model", model]
+        if args.config:
+            llm_args += ["--config", str(args.config)]
+
+        def generate(prompt):  # noqa: F811 — deliberate closure
+            return generate_text(prompt, provider, model)
+
+        def judge(condition, campaign_path, item_id):
+            verdict_prompt = (
+                "Judge whether this completion condition is satisfied for the "
+                f"campaign at {campaign_path}"
+                + (f", item {item_id}" if item_id else "")
+                + f'. Condition: {condition}\nReturn only JSON: {{"pass": true|false, "reason": "..."}}'
+            )
+            import json as _json
+
+            response = generate(verdict_prompt)
+            stripped = response.strip()
+            fence = campaign_lib.JSON_FENCE.search(stripped)
+            if fence:
+                stripped = fence.group(1).strip()
+            try:
+                payload = _json.loads(stripped)
+            except _json.JSONDecodeError:
+                return {"pass": False, "reason": "judge returned invalid JSON"}
+            return payload if isinstance(payload, dict) else {"pass": False, "reason": "bad verdict"}
+
+    else:
+        judge = None
+
+    report = campaign_lib.run_update(
+        root,
+        args.slug,
+        dry_run=args.dry_run,
+        max_dispatch=args.max_dispatch,
+        generate=generate,
+        judge=judge,
+        llm_args=llm_args,
+    )
+
+    if args.json:
+        emit_json(report.as_dict())
+    else:
+        prefix = "would " if report.dry_run else ""
+        if report.merged:
+            print(f"{prefix}merge: {', '.join(report.merged)}")
+        if report.answered:
+            print(f"{prefix}unblock (answered): {', '.join(report.answered)}")
+        if report.checked:
+            print(f"{prefix}check conditions: {', '.join(report.checked)}")
+        if report.completed:
+            print(f"completed: {', '.join(report.completed)}")
+        if report.auto_confirmed:
+            print(f"auto-confirmed proposals: {', '.join(report.auto_confirmed)}")
+        for proposal in report.pending_review:
+            scope = proposal["scope"]
+            print(
+                f"pending review ({proposal['parent'] or '(campaign)'}): "
+                f"+{scope['items_added']} items, depth {scope['resulting_depth']} — "
+                f"nagent-campaign review {report.campaign}"
+            )
+        if report.dispatched:
+            print(f"{prefix}dispatch: {', '.join(report.dispatched)}")
+        for failure in report.failures:
+            print(f"failed: {failure}", file=sys.stderr)
+        counts = ", ".join(f"{k}:{v}" for k, v in sorted(report.status_counts.items()))
+        print(f"campaign {report.campaign} [{report.campaign_status}] {counts or 'no items'}")
+        if report.questions_open:
+            print(f"open questions: {report.questions_open} (answer in questions.md, then update)")
+    return 1 if report.failures else 0
+
+
+def main() -> int:
+    exit_on_description(NAGENT_CAMPAIGN_DESCRIPTION)
+
+    parser = argparse.ArgumentParser(description="Operate campaigns: plans as data.")
+    parser.add_argument(
+        "--root",
+        help=(
+            "nagent root directory (default: {git-toplevel}/.nagent inside "
+            "a git repo, else ~/.nagent)."
+        ),
+    )
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    p_new = subparsers.add_parser("new", help="Create a campaign skeleton.")
+    p_new.add_argument("name")
+    # Not "--description": that word is reserved by tool discovery
+    # (exit_on_description matches it anywhere in argv).
+    p_new.add_argument("--goal", help="Campaign goal text; '-' reads stdin.")
+
+    p_list = subparsers.add_parser("list", help="List campaigns.")
+    p_list.add_argument("--json", action="store_true")
+
+    p_status = subparsers.add_parser("status", help="Show a campaign's tree and pending work.")
+    p_status.add_argument("slug")
+    p_status.add_argument("--json", action="store_true")
+
+    p_add = subparsers.add_parser("add", help="Add a todo item.")
+    p_add.add_argument("slug")
+    p_add.add_argument("description")
+    p_add.add_argument("--parent", help="Parent item id.")
+    p_add.add_argument("--blocked-by", action="append", default=[], metavar="ID")
+
+    p_review = subparsers.add_parser("review", help="Show pending decomposition proposals.")
+    p_review.add_argument("slug")
+
+    p_confirm = subparsers.add_parser("confirm", help="Accept pending proposal(s).")
+    p_confirm.add_argument("slug")
+    p_confirm.add_argument("--item", help="Confirm only the proposal under this item id.")
+
+    p_update = subparsers.add_parser(
+        "update", help="One driver pass: merge, check, propose, review-gate, dispatch."
+    )
+    p_update.add_argument("slug")
+    p_update.add_argument("--dry-run", action="store_true", help="Preview; mutate nothing.")
+    p_update.add_argument("--max-dispatch", type=int, metavar="N")
+    p_update.add_argument("--json", action="store_true")
+    add_llm_arguments(p_update)
+
+    args = parser.parse_args()
+    root = resolve_default_root(args.root)
+
+    handlers = {
+        "new": cmd_new,
+        "list": cmd_list,
+        "status": cmd_status,
+        "add": cmd_add,
+        "review": cmd_review,
+        "confirm": cmd_confirm,
+        "update": cmd_update,
+    }
+    return handlers[args.command](args, root)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -3,3 +3,4 @@ anthropic>=0.40.0
 google-genai>=1.0.0
 cursor-sdk>=0.1.0
 claude-agent-sdk>=0.1.0
+pyyaml>=5.4

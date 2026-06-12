@@ -244,6 +244,7 @@ it. Nothing else to register.
 | `nagent-file-patch`     | Merge segments, write patch, validate hashes.     |
 | `nagent-file-summarize` | Summarize inline or via split summaries.          |
 | `nagent-distill`             | Harvest knowledge from dead artifacts, reclaim.   |
+| `nagent-campaign`       | Operate campaigns: plans as data, driven in passes. |
 
 **Example**
 
@@ -899,6 +900,13 @@ nagent-file-summarize --file src/big.py --json
 nagent-distill                        # dry run: classify artifacts, estimate harvest cost
 nagent-distill --apply                # harvest knowledge into {root}/knowledge/, reclaim space
 nagent-distill --apply --no-harvest   # reclaim only, no LLM pass
+
+nagent-campaign new "Migrate config" --goal "Replace the loader."
+nagent-campaign add migrate-config "Inventory call sites"
+nagent-campaign update migrate-config --dry-run   # preview one driver pass
+nagent-campaign update migrate-config             # merge, check, gate, dispatch
+nagent-campaign review migrate-config             # inspect pending proposals
+nagent-campaign confirm migrate-config            # accept the plan change
 ```
 
 `--help` for flags. `--description` for what a tool contributes to startup

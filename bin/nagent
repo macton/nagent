@@ -40,6 +40,7 @@ from nagent_file_edit_lib import (
 from nagent_file_patch_lib import apply_segment_patches
 from nagent_file_split_lib import slugify
 from nagent_distill_lib import digest_path, file_knowledge_path, knowledge_item_counts, root_size_bytes
+from nagent_campaign_lib import campaign_status_lines
 from nagent_tags import (
     TagParseError,
     extract_block,
@@ -626,6 +627,7 @@ def build_initial_context(
     model: str | None = None,
     config_path: Path | None = None,
     previous_initial_context: str | None = None,
+    campaign_item_dir: Path | None = None,
 ) -> str:
     parent = parent_conversation or "none"
     if invocation == "user":
@@ -641,8 +643,36 @@ def build_initial_context(
 
     git_context = git_repo_context()
     git_section = f"\n{git_context}" if git_context else ""
-    tools_section = collect_bin_tool_descriptions(tool_search_dirs(process_path.parent, root))
+    tool_dirs = tool_search_dirs(process_path.parent, root)
+    if campaign_item_dir is not None:
+        # Campaign-scoped tools shadow everything for that campaign's workers.
+        tool_dirs = tool_dirs + [campaign_item_dir.parent.parent / "bin"]
+    tools_section = collect_bin_tool_descriptions(tool_dirs)
     tools_block = f"\n{tools_section}\n" if tools_section else ""
+
+    campaign_worker_block = ""
+    if campaign_item_dir is not None:
+        campaign_worker_block = """
+Campaign item worker (this session):
+- You are scoped to the item briefed in <user-prompt>; work only inside its boundaries.
+- End your final <nagent-response> with only the JSON result object described in the briefing.
+- Never edit the campaign's index.yaml, item.yaml files, questions.md, or another item's directory — the driver merges; you produce data. Campaign files are hand-edited by the user: keep entries terse, add no fields, never reformat what you did not change.
+- If the item is too big, propose decomposition rather than grinding; if you need a human decision, raise a question rather than guessing.
+"""
+
+    campaign_instance_block = (
+        f"\n- campaign item: {campaign_item_dir}" if campaign_item_dir is not None else ""
+    )
+    campaign_lines = campaign_status_lines(root)
+    campaign_status_block = ""
+    if campaign_lines:
+        campaign_status_block = (
+            "\nActive campaigns (plans as data under "
+            + str(root / "campaigns")
+            + "; details: nagent-campaign status {slug}):\n"
+            + "\n".join(campaign_lines)
+            + "\n"
+        )
     # Layered context, least personal first: install (ships with the nagent
     # folder), user (~/.nagent), project (git toplevel of cwd), root (the
     # resolved root, e.g. the project's .nagent). More specific layers come
@@ -744,12 +774,17 @@ Conversations are data (create, reuse, hand off):
 - Hand off when noisy: if this conversation is mostly stale tool output, distill goal/state/decisions into a sub-conversation prompt, delegate the rest, and tell your caller about the handoff. Never rewrite your own conversation file while running.
 - This conversation persists across invocations, and the user may edit it between runs. The current file is the source of truth.
 
-{file_edit_rules(file_edit_path)}
-{tools_block}{context_layers_block}{knowledge_block}{file_edit_detail_block}
+Campaigns (long-horizon plans as data; drive with nagent-campaign via <nagent-shell>):
+- When the request is large, multi-step, or will outlive this conversation, create a campaign (nagent-campaign new) and decompose into it instead of holding the plan in your head — the plan must survive you.
+- Use nagent-campaign update --dry-run first when cost is unclear. Never edit a campaign's index.yaml or item files directly from this conversation; drive changes through the CLI.
+- Asked about ongoing work? Check nagent-campaign status before answering from memory.
+
+{file_edit_rules(file_edit_path)}{campaign_worker_block}
+{tools_block}{context_layers_block}{campaign_status_block}{knowledge_block}{file_edit_detail_block}
 Instance:
 - invocation: {invocation}
 - conversation: {conversation_name}
-- parent conversation: {parent}{file_edit_block}
+- parent conversation: {parent}{file_edit_block}{campaign_instance_block}
 
 Environment:
 - nagent root: {root}
@@ -793,6 +828,7 @@ def refresh_initial_context(
     provider: str | None = None,
     model: str | None = None,
     config_path: Path | None = None,
+    campaign_item_dir: Path | None = None,
 ) -> None:
     content = conversation_file.read_text(encoding="utf-8")
     previous_initial_context = extract_block(content, INITIAL_CONTEXT_BLOCK)
@@ -808,6 +844,7 @@ def refresh_initial_context(
         model,
         config_path,
         previous_initial_context,
+        campaign_item_dir,
     )
     if previous_initial_context is not None:
         # Verbatim splice: replace_first_block has no escape semantics, so
@@ -2211,6 +2248,16 @@ def main() -> int:
         help="Edit a specific file using its per-file conversation (see nagent-file-edit).",
     )
     parser.add_argument(
+        "--campaign-item",
+        type=Path,
+        metavar="ITEM_DIR",
+        help=(
+            "Run as a campaign item worker scoped to this item directory "
+            "(see nagent-campaign); adds the worker contract and the "
+            "campaign's bin/ to the context."
+        ),
+    )
+    parser.add_argument(
         "prompt",
         nargs="*",
         help="Prompt text. Use trailing '-' to read stdin until EOF.",
@@ -2222,6 +2269,9 @@ def main() -> int:
     pid = args.pid or default_pid()
     file_edit_path: Path | None = None
     file_edit_id: str | None = None
+    campaign_item_dir: Path | None = (
+        args.campaign_item.expanduser().resolve() if args.campaign_item is not None else None
+    )
 
     if args.file_edit is not None:
         ensure_root_scaffold(root)  # resolving a file-edit writes the index
@@ -2232,6 +2282,8 @@ def main() -> int:
         except FileNotFoundError as exc:
             print(f"Error: {exc}", file=sys.stderr)
             return 1
+    elif campaign_item_dir is not None and args.conversation is None:
+        conversation_name = str(campaign_item_dir / "conversation")
     else:
         conversation_name = args.conversation or default_conversation_name(pid)
     conversation_file = resolve_conversation(root, conversation_name)
@@ -2485,6 +2537,7 @@ def main() -> int:
                 provider,
                 model,
                 args.config,
+                campaign_item_dir=campaign_item_dir,
             )
             + "\n",
             encoding="utf-8",
@@ -2502,6 +2555,7 @@ def main() -> int:
             provider,
             model,
             args.config,
+            campaign_item_dir=campaign_item_dir,
         )
 
     token_stats = TokenStats()

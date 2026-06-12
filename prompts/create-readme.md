@@ -1,7 +1,8 @@
 # Prep
 
 Read bin/nagent.
-Run --description on every executable in bin/ (this includes nagent-distill).
+Run --description on every executable in bin/ (this includes nagent-distill
+and nagent-campaign).
 Read the helper modules under bin/helpers/ — including nagent_tags.py and
 nagent_distill_lib.py — and the tests when more detail is needed.
 Read context.yaml and context/ at the repository root.
@@ -105,7 +106,7 @@ from temporary execution; optimize the shape, availability, and maintenance
 of the data. Connect each principle back to a mechanism the reader has
 already seen.
 
-**Part VI — The data structures that fall out.** Three applied chapters, each
+**Part VI — The data structures that fall out.** Four applied chapters, each
 a worked example of the principles:
 
 - *Artifact neighborhoods* — a file lives among related artifacts: its
@@ -124,6 +125,12 @@ a worked example of the principles:
   Teach why uniqueness matters: artifact-local memory accumulates where the
   work recurs, the main conversation stays small, and write boundaries
   attach to the artifact rather than to a session.
+- *Campaigns: plans as operable artifacts* — the model's sense of what to do
+  next is the last hidden state; the campaign makes the plan a hand-editable
+  tree the user owns and the driver deterministic code that advances it.
+  Teach the relocation of non-determinism into bounded judgments, the review
+  gate as informed choice instead of caps, and completion conditions instead
+  of completion claims.
 
 **Part VII — Compare to frameworks.** *Teach: what this approach trades
 against framework-style systems.* Not "frameworks bad." The point is data
@@ -232,6 +239,12 @@ Use these reductions where they belong in the arc:
 - Project memory trapped in a personal dotdir cannot travel or be shared.
   Therefore: default the root into the repository, and keep personal rules
   in a user layer that applies everywhere. (Parts III, IV)
+- A multi-step plan lives in the model's head: re-decided every turn,
+  invisible, degrading as context grows. Therefore: make the plan an
+  operable artifact and the driver deterministic code over it. (Part VI)
+- A model will claim "done"; a claim is not a check. Therefore: gate
+  completion on conditions — executable tests preferred, judged prose only
+  when unavoidable. (Part VI)
 - Dead conversations accumulate, and deleting them loses what was learned.
   Therefore: harvest knowledge into editable category files, gate deletion on
   the harvest, and inject a bounded digest back into context. (Part IV)
@@ -474,6 +487,56 @@ commands and a small `by_file_id` JSON sample. The value: memory accumulates
 where work recurs; the main conversation stays small; the write boundary is a
 property of the artifact, not of a session.
 
+**Campaigns: plans as operable artifacts.** Open with the claim: after
+everything else became a file, the model's sense of what to do next is the
+last hidden state — re-decided every turn, invisible, degrading as context
+grows. A campaign makes the plan a first-class artifact and the driver a
+deterministic transform over it. Be precise about what is extracted: the
+model's non-determinism is not removed, it is *relocated and bounded* —
+selection, blocking, sequencing, and completion mechanics become code
+reading a tree; the model is scoped to narrow judgments (decompose this
+item, execute this item, judge this condition), each with a curated
+context. The determinism boundary is exactly the schema.
+
+Implementation to cover: `{root}/campaigns/{slug}/` with a hand-editable
+`index.yaml` spine (tree of item ids, statuses, `blocked_by` edges, review
+thresholds, dispatch budget) and per-item `items/{id}/item.yaml` detail plus
+a per-item conversation — artifact-local memory where the artifact is a unit
+of work, continuable across dispatches. The one-pass driver
+(`nagent-campaign update`): merge worker results, route answered questions,
+check completion conditions, gate decomposition proposals, dispatch
+unblocked todo leaves, then exit — no resident process; looping is the
+user's composition. Teach the four invariants as design decisions:
+
+- One pass, then exit — no scheduler growing inside the tool.
+- One writer for the tree — workers return structured results
+  (`result.json` in their own item dir); only the driver mutates the plan.
+  LLMs produce data; code mutates artifacts.
+- Plan changes pass a *review gate*, not a cap — large projects must not be
+  inhibited; the user makes an informed choice. Proposals park with their
+  scope (items added, depth, estimated cost); within-threshold changes
+  auto-confirm; a new campaign's initial decomposition always waits. The
+  user edits the proposal file directly and confirms.
+- The schema is the whole schema — if the YAML needs a manual, the
+  "interface is the editor" property is lost.
+
+Completion is conditions, not claims: executable `test:` scripts in the
+campaign's `tests/` (deterministic, preferred) and `judge:` prose only when
+unavoidable; a premature "done" bounces back to `todo` by mechanism, not
+exhortation. Open questions are first-class blockers: workers raise them,
+they land in `questions.md`, the user answers by editing the file, the next
+update routes the answer into the item's briefing. The initial context
+directs the model to create campaigns for work that outlives a conversation,
+injects an ambient status block for active campaigns, and gives dispatched
+workers the contract in a dedicated `--campaign-item` mode; campaign-scoped
+`bin/` joins tool discovery for that campaign's workers.
+
+Include an `index.yaml` example (a small tree with one blocked item) and a
+command sequence: `new` → `add` → `update --dry-run` → `update` → `review`
+→ `confirm`. End **Build your own:** with the transferable pattern —
+plan-as-artifact plus a dumb driver beats plan-as-program; if your
+orchestrator needs a runtime, your plan has stopped being data.
+
 ## Part VII section
 
 **How this differs from frameworks.** Do not market against frameworks. Use
@@ -521,7 +584,10 @@ table including `claude-code` (default model `default`, no credential env
 var — uses the local Claude Code login), the common command list including
 `--status`, `--list-models`, `--list-conversations`,
 `--branch-conversation`, `--compact`, `nagent-distill`
-dry-run/apply/no-harvest, and the unittest invocation.
+dry-run/apply/no-harvest, the `nagent-campaign` subcommands
+(new/add/status/review/confirm/update --dry-run), and the unittest
+invocation.
+
 
 ---
 
@@ -548,6 +614,10 @@ Verify the README explicitly explains all of these:
       never fabricate), errors as data; stable-to-volatile context ordering
 - [ ] conversations-as-data direction: named workers, authored briefings,
       handoff when noisy, user may edit between runs
+- [ ] campaigns: plans as operable artifacts; non-determinism relocated and
+      bounded; review gate as informed choice; conditions over claims;
+      single-writer tree; per-item conversations; ambient status + direction
+      in context
 - [ ] result wrappers as conversation data
 - [ ] tool discovery through executable descriptions
 - [ ] provider abstraction incl. claude-code via Claude Code login
