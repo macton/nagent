@@ -14,8 +14,13 @@ from nagent_tags import (
     parse_tag_document,
     remove_first_block,
     replace_first_block,
+    scan_tag_document,
+    serialize_nodes,
     unwrap_whole_element,
 )
+
+KNOWN = frozenset({"keep"})
+UNWRAP = frozenset({"frame"})
 
 
 class ParseElementTests(unittest.TestCase):
@@ -92,6 +97,73 @@ class ParseDocumentTests(unittest.TestCase):
         with self.assertRaises(TagParseError) as ctx:
             parse_tag_document("<a>1</a> oops <b>2</b>")
         self.assertEqual(ctx.exception.offset, 9)
+
+
+class ScanDocumentTests(unittest.TestCase):
+    def test_keeps_known_ignores_unknown_and_prose(self):
+        nodes, ignored = scan_tag_document(
+            "prose <other>x</other> <keep>do</keep> trailing", KNOWN, UNWRAP
+        )
+        self.assertEqual([n.name for n in nodes], ["keep"])
+        self.assertEqual(nodes[0].content, "do")
+        reasons = [s.reason for s in ignored]
+        self.assertIn("non-tag text", reasons)
+        self.assertIn("unknown tag <other>", reasons)
+
+    def test_malformed_unknown_tag_is_skipped_to_next(self):
+        # "<bad Oops, ..." parses as a bad attribute; skip it, keep the next tag.
+        nodes, ignored = scan_tag_document("<bad Oops, words.\n<keep>go</keep>", KNOWN, UNWRAP)
+        self.assertEqual([n.name for n in nodes], ["keep"])
+        self.assertEqual(ignored[0].reason, "malformed <bad>")
+
+    def test_malformed_known_tag_raises(self):
+        with self.assertRaises(TagParseError):
+            scan_tag_document("<keep>unclosed", KNOWN, UNWRAP)
+
+    def test_eof_capture_recovers_unclosed_named_tag(self):
+        nodes, ignored = scan_tag_document(
+            "<keep>body running to the end", KNOWN, UNWRAP, frozenset({"keep"})
+        )
+        self.assertEqual([n.name for n in nodes], ["keep"])
+        self.assertEqual(nodes[0].content, "body running to the end")
+        self.assertEqual(ignored, [])
+        # A malformed *open* tag still raises even with capture enabled.
+        with self.assertRaises(TagParseError):
+            scan_tag_document('<keep bad=x>body', KNOWN, UNWRAP, frozenset({"keep"}))
+
+    def test_eof_capture_only_applies_to_named_tags(self):
+        # "keep" is not in the eof-capture set here, so an unclosed one raises.
+        with self.assertRaises(TagParseError):
+            scan_tag_document("<keep>unclosed", KNOWN, UNWRAP, frozenset({"other"}))
+
+    def test_unwraps_wrapper_and_recurses(self):
+        nodes, ignored = scan_tag_document(
+            "<frame>\n<keep>inner</keep>\n</frame>", KNOWN, UNWRAP
+        )
+        self.assertEqual([n.name for n in nodes], ["keep"])
+        self.assertEqual(ignored, [])
+
+    def test_stray_close_tag_is_text(self):
+        nodes, ignored = scan_tag_document("</keep> <keep>ok</keep>", KNOWN, UNWRAP)
+        self.assertEqual([n.name for n in nodes], ["keep"])
+        self.assertEqual(ignored[0].reason, "non-tag text")
+
+
+class SerializeNodesTests(unittest.TestCase):
+    def test_drops_junk_keeps_valid_tags(self):
+        nodes, _ = scan_tag_document(
+            'prose <other>x</other> <keep>do</keep> <self a="1" />', KNOWN, UNWRAP
+        )
+        # <self .../> is unknown here, so only <keep> survives.
+        self.assertEqual(serialize_nodes(nodes), "<keep>do</keep>")
+
+    def test_eof_captured_tag_serializes_closed(self):
+        nodes, _ = scan_tag_document("<keep>unclosed body", KNOWN, UNWRAP, frozenset({"keep"}))
+        self.assertEqual(serialize_nodes(nodes), "<keep>unclosed body</keep>")
+
+    def test_self_closing_and_attrs_roundtrip(self):
+        node = parse_element('<thing path="/tmp/x" />')
+        self.assertEqual(serialize_nodes([node]), '<thing path="/tmp/x" />')
 
 
 class BlockHelperTests(unittest.TestCase):

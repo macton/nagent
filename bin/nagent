@@ -54,7 +54,8 @@ from nagent_tags import (
     TagParseError,
     extract_block,
     find_block_span,
-    parse_tag_document,
+    scan_tag_document,
+    serialize_nodes,
     remove_first_block,
     replace_first_block,
     unwrap_whole_element,
@@ -100,6 +101,18 @@ _spinner_enabled = True
 # <nagent-response>.  These are internal protocol details and should not be
 # printed to the human user.
 USER_VISIBLE_WRAPPER_NAMES = ("nagent-response", "agent-response")
+
+# parse_response tolerates non-protocol content: it executes the valid tags it
+# finds and records the rest as "ignored". Echoed log frames (<agent-response>)
+# are unwrapped so a real tag nested inside one is still recovered; <nagent-*>
+# wrappers are real tags and stay in KNOWN_TAG_NAMES, never unwrapped.
+KNOWN_TAG_NAMES = frozenset(TAG_KINDS)
+UNWRAP_WRAPPER_NAMES = frozenset(USER_VISIBLE_WRAPPER_NAMES) - KNOWN_TAG_NAMES
+# <nagent-response> is a terminal, text-only sink: when an LLM emits it as the
+# final tag but forgets the close, the body simply runs to EOF. Capture it
+# instead of discarding a finished turn. NOT extended to write/shell, whose
+# unclosed bodies could carry trailing content that must never be run.
+EOF_CAPTURE_TAG_NAMES = frozenset({"nagent-response"})
 
 MARKDOWN_FENCE_PATTERN = re.compile(r"\A\s*```[^\n`]*\n(.*?)\n```\s*\Z", re.DOTALL)
 INITIAL_CONTEXT_BLOCK = "initial_context"
@@ -760,8 +773,9 @@ Respond only with one or more of these structured tags (no other text):
 
 Protocol rules:
 - Tag bodies are raw text. Do not escape characters. Never emit a literal close tag (e.g. </nagent-shell>) inside a body; the first matching close tag ends the body.
-- Emit nothing outside tags. The parser rejects prose, unknown tags, and unknown attributes; an invalid turn comes back with a correction request.
+- Emit nothing outside tags. Prose, unknown tags, and reasoning leaks (e.g. <thought>) are ignored and take no action — the turn proceeds on whatever valid tags it contains, or asks you to retry if there are none. A misshapen nagent tag (wrong attributes, missing body or close) comes back with a correction request.
 - After your action tags run, each result is appended to this conversation as a <nagent-*-result> block and you are called again. Never fabricate results; act on the appended ones.
+- After each of your turns nagent appends a self-closing <nagent-turn-status utc="..." turn="N" tokens_in_total="..." tokens_out_total="..." /> line (driver output, not something you emit). To measure the wall-clock and token cost of any span — e.g. testing one hypothesis — diff the totals and UTC times of the status lines that bracket it.
 - Multiple tags in one turn run in order.
 - A result with an error status is data: change your approach instead of retrying the identical action.
 
@@ -898,50 +912,58 @@ def default_conversation_name(pid: str) -> str:
     return f"latest-{hostname}-{pid}"
 
 
-def parse_response(text: str) -> tuple[list[NagentTag] | None, str | None]:
+def parse_response(text: str) -> tuple[list[NagentTag], list[str], str | None]:
+    """Extract the valid protocol tags from one LLM turn.
+
+    Returns ``(tags, ignored, error)``:
+
+    - ``tags`` — valid <nagent-*> tags, in order (may be empty).
+    - ``ignored`` — short notes for non-protocol content that was tolerated and
+      skipped: prose, reasoning leaks (e.g. <thought>), unknown tags. The caller
+      surfaces these to the model but still acts on ``tags``.
+    - ``error`` — set only when a *known* nagent tag is present but malformed or
+      misshapen (wrong attributes, missing body/close). That is a clear mistake
+      to correct, not silent junk; ``tags``/``ignored`` are empty then.
+    """
     try:
-        nodes = parse_tag_document(text)
+        nodes, ignored_spans = scan_tag_document(
+            text, KNOWN_TAG_NAMES, UNWRAP_WRAPPER_NAMES, EOF_CAPTURE_TAG_NAMES
+        )
     except TagParseError as exc:
         snippet = text[exc.offset : exc.offset + 80].replace("\n", "\\n")
-        return None, f"Unexpected content at offset {exc.offset}: {exc.message} near {snippet!r}"
-
-    if not nodes:
-        return None, "Response contains no nagent tags."
+        return [], [], f"Unexpected content at offset {exc.offset}: {exc.message} near {snippet!r}"
 
     tags: list[NagentTag] = []
     for node in nodes:
-        kind = TAG_KINDS.get(node.name)
-        if kind is None:
-            snippet = text[node.start : node.start + 80].replace("\n", "\\n")
-            return None, f"Unexpected content at offset {node.start}: unsupported tag near {snippet!r}"
+        kind = TAG_KINDS[node.name]  # the scanner only returns known tag names
 
         if kind in ("response", "shell", "next"):
             if node.self_closing:
-                return None, f"<{node.name}> requires a body, not a self-closing tag"
+                return [], [], f"<{node.name}> requires a body, not a self-closing tag"
             if node.attrs:
-                return None, f"<{node.name}> does not take attributes"
+                return [], [], f"<{node.name}> does not take attributes"
             tags.append(NagentTag(kind=kind, content=node.content))
         elif kind in ("read", "file_read", "file_patch"):
             attr = "index" if kind == "file_patch" else "path"
             if not node.self_closing:
-                return None, f'<{node.name}> must be self-closing: <{node.name} {attr}="..." />'
+                return [], [], f'<{node.name}> must be self-closing: <{node.name} {attr}="..." />'
             if set(node.attrs) != {attr}:
-                return None, f'<{node.name}> requires exactly one {attr}="..." attribute'
+                return [], [], f'<{node.name}> requires exactly one {attr}="..." attribute'
             tags.append(NagentTag(kind=kind, content="", path=node.attrs[attr]))
         elif kind == "write":
             if node.self_closing:
-                return None, "<nagent-write> requires file content between open and close tags"
+                return [], [], "<nagent-write> requires file content between open and close tags"
             if set(node.attrs) != {"path"}:
-                return None, '<nagent-write> requires exactly one path="..." attribute'
+                return [], [], '<nagent-write> requires exactly one path="..." attribute'
             tags.append(NagentTag(kind=kind, content=node.content, path=node.attrs["path"]))
         else:  # conversation
             if node.self_closing:
-                return None, "<nagent-conversation> requires a prompt body"
+                return [], [], "<nagent-conversation> requires a prompt body"
             for attr_name in node.attrs:
                 if attr_name not in ("conversation-file", "conversation-name"):
-                    return None, f"Unsupported <nagent-conversation> attribute: {attr_name}"
+                    return [], [], f"Unsupported <nagent-conversation> attribute: {attr_name}"
             if "conversation-file" in node.attrs and "conversation-name" in node.attrs:
-                return None, (
+                return [], [], (
                     "<nagent-conversation> supports only one of conversation-file "
                     "or conversation-name"
                 )
@@ -954,7 +976,28 @@ def parse_response(text: str) -> tuple[list[NagentTag] | None, str | None]:
                 )
             )
 
-    return tags, None
+    ignored = [_ignored_note(span) for span in ignored_spans]
+    return tags, ignored, None
+
+
+def _ignored_note(span) -> str:
+    """One short, single-line label for an ignored span."""
+    snippet = " ".join(span.text.split())[:60]
+    return f'{span.reason}: "{snippet}"' if snippet else span.reason
+
+
+def ignored_correction(ignored: list[str]) -> str:
+    """The <system> note shown when a turn contained non-protocol content.
+
+    Deliberately does NOT quote the offending tags: the raw output is preserved
+    in a sidecar, and echoing the bad pattern back into the conversation only
+    biases the model toward repeating it.
+    """
+    count = len(ignored)
+    return (
+        f"nagent ignored {count} non-protocol item{'' if count == 1 else 's'} in your "
+        "previous turn; respond only with valid nagent tags."
+    )
 
 
 
@@ -998,6 +1041,67 @@ def append_to_conversation(conversation_file: Path, text: str) -> None:
 
 def record_interrupt(conversation_file: Path) -> None:
     append_to_conversation(conversation_file, INTERRUPTED_MESSAGE)
+
+
+def turn_status_block(token_stats: TokenStats, now: datetime, *, invalid_ref: str | None = None) -> str:
+    """A driver-emitted status line appended after each turn.
+
+    Carries the wall-clock UTC time and cumulative token counts so the model
+    can diff two of these to measure the real cost — wall-clock (including its
+    own deliberation, which shell `date` cannot see) and tokens — of any span,
+    e.g. testing one optimization hypothesis. Not a protocol tag: it is only
+    written by nagent, never parsed from model output.
+
+    When the turn contained non-protocol content that nagent stripped, invalid_ref
+    is the sidecar guid that holds the raw output, so a debugger can reconstruct
+    exactly what the model emitted.
+    """
+    invalid = f' invalid="{invalid_ref}"' if invalid_ref else ""
+    return (
+        "<nagent-turn-status "
+        f'utc="{now.strftime("%Y-%m-%dT%H:%M:%SZ")}" '
+        f'turn="{token_stats.turn_count}" '
+        f'tokens_in_total="{token_stats.recursive_input_tokens}" '
+        f'tokens_out_total="{token_stats.recursive_output_tokens}"{invalid} />'
+    )
+
+
+def invalid_sidecar_path(conversation_file: Path, guid: str) -> Path:
+    return conversation_file.parent / f"{conversation_file.name}.invalid.{guid}"
+
+
+def write_invalid_sidecar(
+    conversation_file: Path,
+    raw_output: str,
+    ignored: list[str],
+    turn: int,
+    now: datetime,
+) -> str:
+    """Persist a turn's raw output verbatim (it contained non-protocol content)
+    beside the conversation as {name}.invalid.{guid}, and return the guid.
+
+    The conversation keeps only the cleaned turn so the stripped content cannot
+    bias later generations; this sidecar is the full record, linked from that
+    turn's <nagent-turn-status invalid="{guid}" />.
+    """
+    guid = str(uuid.uuid4())
+    header = (
+        "# nagent invalid-output sidecar\n"
+        f"# conversation: {conversation_file.name}\n"
+        f"# turn: {turn}\n"
+        f"# utc: {now.strftime('%Y-%m-%dT%H:%M:%SZ')}\n"
+        f"# stripped: {'; '.join(ignored)}\n"
+        "# --- raw model output below ---\n"
+    )
+    invalid_sidecar_path(conversation_file, guid).write_text(header + raw_output, encoding="utf-8")
+    return guid
+
+
+def cleaned_response_text(text: str) -> str:
+    """The turn with non-protocol content removed: only its valid tags, in
+    order, re-serialized well-formed. The raw text is kept in a sidecar."""
+    nodes, _ = scan_tag_document(text, KNOWN_TAG_NAMES, UNWRAP_WRAPPER_NAMES, EOF_CAPTURE_TAG_NAMES)
+    return serialize_nodes(nodes)
 
 
 def estimate_token_count(text: str) -> int:
@@ -1677,12 +1781,16 @@ def run_safety_net(
     except OSError:
         return
     if rebuild_due(conversation_chars, settings):
-        rebuild_conversation(conversation_file, root, llm, now=now)
+        # The rebuild's synchronous checkpoint is an LLM call; show a spinner so
+        # a large conversation doesn't look frozen on startup.
+        with wait_spinner(f"Rebuilding conversation ({conversation_chars // 1024} KB)"):
+            rebuild_conversation(conversation_file, root, llm, now=now)
         return
     meta = parse_checkpoint_meta(checkpoint_path(conversation_file))
     if checkpoint_due(meta, conversation_chars, now, settings):
         try:
-            write_checkpoint(conversation_file, root, llm, now=now)
+            with wait_spinner("Checkpointing conversation"):
+                write_checkpoint(conversation_file, root, llm, now=now)
         except Exception as exc:
             # Checkpointing is a safety net, never a blocker.
             print(f"checkpoint failed: {exc}", file=sys.stderr)
@@ -1716,6 +1824,7 @@ def run_agent_loop(
         if safety_settings is not None:
             run_safety_net(conversation_file, root, llm, safety_settings)
         llm_output, error = None, None
+        tags, ignored = [], []
         for attempt in range(MAX_FORMAT_RETRIES):
             llm_output, error = call_llm(conversation_file, llm, token_stats)
             if error is not None:
@@ -1726,15 +1835,25 @@ def run_agent_loop(
                 )
                 continue
 
-            tags, parse_error = parse_response(llm_output)
-            if tags is not None:
+            tags, ignored, parse_error = parse_response(llm_output)
+            if parse_error is not None:
+                # A known tag was malformed: ask the model to fix it and retry.
+                append_to_conversation(
+                    conversation_file,
+                    f"<agent-response>\n{llm_output}\n</agent-response>\n"
+                    f"<system>Invalid nagent response format: {parse_error}. "
+                    f"Respond only with valid nagent tags.</system>",
+                )
+                continue
+            if tags:
                 break
 
+            # No actionable tag. If we tolerated junk, say what we ignored;
+            # otherwise the turn was empty. Either way, retry.
+            note = ignored_correction(ignored) if ignored else "Response contains no nagent tags."
             append_to_conversation(
                 conversation_file,
-                f"<agent-response>\n{llm_output}\n</agent-response>\n"
-                f"<system>Invalid nagent response format: {parse_error}. "
-                f"Respond only with valid nagent tags.</system>",
+                f"<agent-response>\n{llm_output}\n</agent-response>\n<system>{note}</system>",
             )
         else:
             if error is not None:
@@ -1751,7 +1870,23 @@ def run_agent_loop(
                 print(message)
             return 1, user_responses
 
-        append_to_conversation(conversation_file, f"<agent-response>\n{llm_output}\n</agent-response>")
+        now = datetime.now(timezone.utc)
+        invalid_ref = None
+        body = llm_output
+        if ignored:
+            # Keep the conversation (the next generation's input) free of the
+            # rejected content so it can't bias the model; preserve the raw
+            # output in a sidecar for debugging, linked from the status line.
+            invalid_ref = write_invalid_sidecar(
+                conversation_file, llm_output, ignored, token_stats.turn_count, now
+            )
+            body = cleaned_response_text(llm_output)
+        append_to_conversation(conversation_file, f"<agent-response>\n{body}\n</agent-response>")
+        if ignored:
+            append_to_conversation(conversation_file, f"<system>{ignored_correction(ignored)}</system>")
+        append_to_conversation(
+            conversation_file, turn_status_block(token_stats, now, invalid_ref=invalid_ref)
+        )
 
         responses, next_prompts, should_continue = process_tags(
             tags,

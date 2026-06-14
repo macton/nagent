@@ -399,8 +399,9 @@ class ParseResponseTests(unittest.TestCase):
             '<nagent-conversation conversation-file="existing-conv">continue file</nagent-conversation>\n'
             '<nagent-conversation conversation-name="saved-conv">continue saved</nagent-conversation>'
         )
-        tags, err = self.mod.parse_response(text)
+        tags, ignored, err = self.mod.parse_response(text)
         self.assertIsNone(err)
+        self.assertEqual(ignored, [])
         self.assertEqual(
             [t.kind for t in tags],
             [
@@ -426,22 +427,22 @@ class ParseResponseTests(unittest.TestCase):
         self.assertEqual(tags[7].conversation_name, "saved-conv")
 
     def test_conversation_tag_rejects_unsupported_options(self):
-        tags, err = self.mod.parse_response(
+        tags, ignored, err = self.mod.parse_response(
             '<nagent-conversation unknown="conv">delegate</nagent-conversation>'
         )
-        self.assertIsNone(tags)
+        self.assertEqual(tags, [])
         self.assertIn("Unsupported <nagent-conversation> attribute", err)
 
-        tags, err = self.mod.parse_response(
+        tags, ignored, err = self.mod.parse_response(
             '<nagent-conversation conversation-file="conv" conversation-name="saved">'
             "delegate</nagent-conversation>"
         )
-        self.assertIsNone(tags)
+        self.assertEqual(tags, [])
         self.assertIn("supports only one", err)
 
     def test_write_tag_carries_raw_content(self):
         body = 'line1\nif a < b && c: print("&")\nline3\n'
-        tags, err = self.mod.parse_response(
+        tags, ignored, err = self.mod.parse_response(
             f'<nagent-write path="/tmp/out.py">{body}</nagent-write>'
         )
         self.assertIsNone(err)
@@ -450,33 +451,117 @@ class ParseResponseTests(unittest.TestCase):
         self.assertEqual(tags[0].content, body)
 
     def test_read_tag_requires_exactly_path_attribute(self):
-        tags, err = self.mod.parse_response("<nagent-read />")
-        self.assertIsNone(tags)
+        # A *known* tag with a bad shape is a hard error (clear intent, fixable),
+        # not silently ignored.
+        tags, ignored, err = self.mod.parse_response("<nagent-read />")
+        self.assertEqual(tags, [])
         self.assertIn('requires exactly one path="..."', err)
 
-        tags, err = self.mod.parse_response('<nagent-read path="/tmp/f" extra="x" />')
-        self.assertIsNone(tags)
+        tags, ignored, err = self.mod.parse_response('<nagent-read path="/tmp/f" extra="x" />')
+        self.assertEqual(tags, [])
         self.assertIn('requires exactly one path="..."', err)
 
     def test_shell_tag_rejects_attributes(self):
-        tags, err = self.mod.parse_response('<nagent-shell mode="x">ls</nagent-shell>')
-        self.assertIsNone(tags)
+        tags, ignored, err = self.mod.parse_response('<nagent-shell mode="x">ls</nagent-shell>')
+        self.assertEqual(tags, [])
         self.assertIn("does not take attributes", err)
 
-    def test_unclosed_tag_is_an_error(self):
-        tags, err = self.mod.parse_response("<nagent-shell>ls")
-        self.assertIsNone(tags)
-        self.assertIn("missing </nagent-shell>", err)
+    def test_unclosed_known_tag_is_an_error(self):
+        # write/shell stay strict: an unclosed body could carry content that
+        # must never run, so it is a hard error, not an EOF capture.
+        for text in ("<nagent-shell>ls", '<nagent-write path="/tmp/f">data'):
+            tags, ignored, err = self.mod.parse_response(text)
+            self.assertEqual(tags, [], text)
+            self.assertIn("missing </nagent-", err, text)
 
-    def test_invalid_leading_text(self):
-        tags, err = self.mod.parse_response("oops <nagent-response>Hi</nagent-response>")
-        self.assertIsNone(tags)
-        self.assertIn("Unexpected content", err)
+    def test_unclosed_trailing_response_is_captured_to_eof(self):
+        # Observed Gemini failure: a leaked <thought> plus a final
+        # <nagent-response> the model never closed. The thought is ignored and
+        # the response body is recovered instead of discarding a finished turn.
+        text = (
+            "<thought\nEverything is done. Reporting now."
+            "<nagent-response>All 181 tests pass; 95x speedup."
+        )
+        tags, ignored, err = self.mod.parse_response(text)
+        self.assertIsNone(err)
+        self.assertEqual([t.kind for t in tags], ["response"])
+        self.assertEqual(tags[0].content, "All 181 tests pass; 95x speedup.")
 
-    def test_empty_response(self):
-        tags, err = self.mod.parse_response("   ")
-        self.assertIsNone(tags)
-        self.assertIn("no nagent tags", err)
+    def test_closed_response_still_parses_normally(self):
+        tags, ignored, err = self.mod.parse_response(
+            "<nagent-response>done</nagent-response>"
+        )
+        self.assertIsNone(err)
+        self.assertEqual(tags[0].content, "done")
+
+    def test_leading_prose_is_ignored_not_rejected(self):
+        tags, ignored, err = self.mod.parse_response(
+            "oops <nagent-response>Hi</nagent-response>"
+        )
+        self.assertIsNone(err)
+        self.assertEqual([t.kind for t in tags], ["response"])
+        self.assertEqual(tags[0].content, "Hi")
+        self.assertTrue(any("oops" in note for note in ignored))
+
+    def test_reasoning_leak_is_ignored_with_valid_tag(self):
+        # Gemini's failure mode: a <thought> preamble (well-formed or malformed)
+        # alongside a real action tag. The action runs; the thought is ignored.
+        for thought in (
+            "<thought>Okay, let's think.</thought>",
+            "<thought Okay, let's think.",  # malformed: looks like a bad attribute
+        ):
+            tags, ignored, err = self.mod.parse_response(
+                f"{thought}\n<nagent-shell>ls</nagent-shell>"
+            )
+            self.assertIsNone(err, thought)
+            self.assertEqual([t.kind for t in tags], ["shell"], thought)
+            self.assertTrue(ignored, thought)
+
+    def test_trailing_prose_after_valid_tag_is_ignored(self):
+        tags, ignored, err = self.mod.parse_response(
+            "<nagent-shell>find .</nagent-shell> Standard input linter is used."
+        )
+        self.assertIsNone(err)
+        self.assertEqual([t.kind for t in tags], ["shell"])
+        self.assertTrue(any("Standard input linter" in note for note in ignored))
+
+    def test_echoed_agent_response_wrapper_is_unwrapped(self):
+        tags, ignored, err = self.mod.parse_response(
+            "<agent-response>\n<nagent-conversation>do it</nagent-conversation>\n</agent-response>"
+        )
+        self.assertIsNone(err)
+        self.assertEqual([t.kind for t in tags], ["conversation"])
+        self.assertEqual(tags[0].content, "do it")
+        self.assertEqual(ignored, [])
+
+    def test_pure_reasoning_yields_no_tags(self):
+        tags, ignored, err = self.mod.parse_response("<thought>just thinking</thought>")
+        self.assertIsNone(err)
+        self.assertEqual(tags, [])
+        self.assertTrue(ignored)
+
+    def test_empty_response_has_no_tags_and_no_error(self):
+        tags, ignored, err = self.mod.parse_response("   ")
+        self.assertIsNone(err)
+        self.assertEqual(tags, [])
+        self.assertEqual(ignored, [])
+
+    def test_cleaned_response_strips_junk_and_closes_eof_capture(self):
+        # leaked <thought> + a real shell tag -> only the shell survives.
+        self.assertEqual(
+            self.mod.cleaned_response_text("<thought\nthinking.<nagent-shell>ls</nagent-shell>"),
+            "<nagent-shell>ls</nagent-shell>",
+        )
+        # leaked <thought> + an unclosed final response -> response, closed.
+        self.assertEqual(
+            self.mod.cleaned_response_text("<thought\ndone.<nagent-response>answer"),
+            "<nagent-response>answer</nagent-response>",
+        )
+
+    def test_ignored_correction_does_not_echo_the_offending_tag(self):
+        note = self.mod.ignored_correction(['malformed <thought>: "<thought ..."'])
+        self.assertNotIn("thought", note)
+        self.assertIn("non-protocol", note)
 
 
 class ActionTests(unittest.TestCase):

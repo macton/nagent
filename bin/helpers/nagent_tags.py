@@ -40,8 +40,14 @@ class TagNode:
     end: int  # offset just past the element
 
 
-def parse_element(text: str, pos: int = 0) -> TagNode:
-    """Parse one element starting exactly at text[pos]."""
+def parse_element(text: str, pos: int = 0, *, capture_to_eof_if_unclosed: bool = False) -> TagNode:
+    """Parse one element starting exactly at text[pos].
+
+    With capture_to_eof_if_unclosed, a well-formed open tag whose close tag is
+    missing captures the rest of the text as its body (end = len(text)) instead
+    of raising. Used only for a trailing <nagent-response> an LLM left unclosed;
+    a malformed *open* tag still raises.
+    """
     start = pos
     length = len(text)
     if pos >= length or text[pos] != "<":
@@ -97,6 +103,10 @@ def parse_element(text: str, pos: int = 0) -> TagNode:
     close_tag = f"</{name}>"
     close_at = text.find(close_tag, pos)
     if close_at == -1:
+        if capture_to_eof_if_unclosed:
+            return TagNode(
+                name=name, attrs=attrs, content=text[pos:], self_closing=False, start=start, end=len(text)
+            )
         raise TagParseError(f"missing {close_tag}", start)
     return TagNode(
         name=name,
@@ -121,6 +131,118 @@ def parse_tag_document(text: str) -> list[TagNode]:
         nodes.append(node)
         pos = node.end
     return nodes
+
+
+@dataclass
+class IgnoredSpan:
+    reason: str  # short label, e.g. "unknown tag <thought>"
+    text: str  # the raw skipped text, for a snippet in the correction note
+    start: int  # offset of the skipped text in its (sub-)document
+
+
+def _read_tag_name(text: str, pos: int) -> str | None:
+    """If text[pos:] opens a tag ('<' + a name), return the name; else None.
+
+    A stray close tag ('</...') or a bare '<' followed by non-name characters
+    is not a tag opening and returns None, so the caller treats it as text.
+    """
+    length = len(text)
+    if pos >= length or text[pos] != "<":
+        return None
+    i = pos + 1
+    if i >= length or text[i] not in NAME_START_CHARS:
+        return None
+    name_start = i
+    while i < length and text[i] in NAME_CHARS:
+        i += 1
+    return text[name_start:i]
+
+
+def scan_tag_document(
+    text: str,
+    known_names: frozenset[str],
+    unwrap_names: frozenset[str],
+    eof_capture_names: frozenset[str] = frozenset(),
+) -> tuple[list[TagNode], list[IgnoredSpan]]:
+    """Lenient counterpart to parse_tag_document.
+
+    Collects well-formed elements whose name is in ``known_names``, recurses
+    into ``unwrap_names`` wrappers (echoed log frames), and records everything
+    else — prose, reasoning leaks like <thought>, unknown or malformed tags —
+    as IgnoredSpans instead of failing. The strict ``parse_tag_document`` still
+    exists for callers that want all-or-nothing.
+
+    Raises TagParseError only when a *known* tag is present but malformed: that
+    is a clear protocol mistake the caller should surface for correction, not
+    silently drop. Unknown/malformed-unknown content is skipped to the next
+    '<' (or end of document).
+    """
+    nodes: list[TagNode] = []
+    ignored: list[IgnoredSpan] = []
+    pos = 0
+    length = len(text)
+    while pos < length:
+        if text[pos].isspace():
+            pos += 1
+            continue
+
+        name = _read_tag_name(text, pos)
+        if name is None:
+            # Non-tag text (prose, a stray close tag). Skip to the next '<'.
+            nxt = text.find("<", pos + 1)
+            end = length if nxt == -1 else nxt
+            ignored.append(IgnoredSpan("non-tag text", text[pos:end], pos))
+            pos = end
+            continue
+
+        if name in known_names:
+            # A known protocol tag: parse strictly. A malformed one propagates
+            # as a hard error so the loop asks the model to fix it — except a
+            # tag in eof_capture_names left unclosed, which captures to EOF.
+            node = parse_element(text, pos, capture_to_eof_if_unclosed=(name in eof_capture_names))
+            nodes.append(node)
+            pos = node.end
+            continue
+
+        # Unknown tag name. Try to parse it as a well-formed element so we can
+        # skip the whole thing (and, for wrappers, recurse into its body).
+        try:
+            node = parse_element(text, pos)
+        except TagParseError:
+            nxt = text.find("<", pos + 1)
+            end = length if nxt == -1 else nxt
+            ignored.append(IgnoredSpan(f"malformed <{name}>", text[pos:end], pos))
+            pos = end
+            continue
+
+        if name in unwrap_names:
+            inner_nodes, inner_ignored = scan_tag_document(
+                node.content, known_names, unwrap_names, eof_capture_names
+            )
+            nodes.extend(inner_nodes)
+            ignored.extend(inner_ignored)
+        else:
+            ignored.append(IgnoredSpan(f"unknown tag <{name}>", text[node.start : node.end], node.start))
+        pos = node.end
+
+    return nodes, ignored
+
+
+def serialize_node(node: TagNode) -> str:
+    """Re-serialize one parsed element to canonical, well-formed text."""
+    attrs = "".join(f' {name}="{value}"' for name, value in node.attrs.items())
+    if node.self_closing:
+        return f"<{node.name}{attrs} />"
+    return f"<{node.name}{attrs}>{node.content}</{node.name}>"
+
+
+def serialize_nodes(nodes: list[TagNode]) -> str:
+    """Canonical re-serialization of parsed nodes, one per line.
+
+    Used to store a cleaned turn: only the valid tags survive, junk is gone, and
+    a tag the model left unclosed (EOF-captured) comes back out well-formed.
+    """
+    return "\n".join(serialize_node(node) for node in nodes)
 
 
 def find_block_span(text: str, name: str) -> tuple[int, int] | None:

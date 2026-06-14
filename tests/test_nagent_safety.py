@@ -180,6 +180,39 @@ class SafetyNetTests(unittest.TestCase):
 
             self.assertIn("checkpoint failed", stderr.getvalue())
 
+    def test_safety_net_llm_work_runs_under_a_spinner(self):
+        # A large conversation triggers an LLM call (rebuild or checkpoint) at
+        # the top of the loop, before the main call_llm spinner. Without its own
+        # spinner the run looks frozen on startup, so both paths must show one.
+        def fake_generate(prompt, provider, model):
+            return "## Intent\n- ok\n## Next action\n- go"
+
+        # Rebuild path: size over rebuild_at_kb.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "conversations").mkdir()
+            conversation = root / "conversations" / "conv"
+            context = "<initial_context>\nrules\n</initial_context>\n"
+            conversation.write_text(context + "x" * (400 * 1024), encoding="utf-8")
+            spinner = unittest.mock.MagicMock()
+            with unittest.mock.patch.object(self.mod, "generate_text", fake_generate), \
+                unittest.mock.patch.object(self.mod, "wait_spinner", spinner):
+                self.mod.run_safety_net(conversation, root, self._llm(), SETTINGS, now=NOW)
+            messages = [c.args[0] for c in spinner.call_args_list]
+            self.assertTrue(any("Rebuilding" in m for m in messages), messages)
+
+        # Checkpoint path: rebuild disabled, burst over checkpoint_max_new_kb.
+        with tempfile.TemporaryDirectory() as tmp:
+            conversation = Path(tmp) / "conv"
+            conversation.write_text("y" * (300 * 1024), encoding="utf-8")
+            settings = dict(SETTINGS, rebuild_at_kb=0)
+            spinner = unittest.mock.MagicMock()
+            with unittest.mock.patch.object(self.mod, "generate_text", fake_generate), \
+                unittest.mock.patch.object(self.mod, "wait_spinner", spinner):
+                self.mod.run_safety_net(conversation, Path(tmp), self._llm(), settings, now=NOW)
+            messages = [c.args[0] for c in spinner.call_args_list]
+            self.assertTrue(any("Checkpointing" in m for m in messages), messages)
+
     def test_rebuild_archives_and_assembles_fresh_window(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -282,6 +315,57 @@ class SafetyNetTests(unittest.TestCase):
             self.assertEqual(code, 0)
             self.assertEqual(responses, ["ok"])
             self.assertEqual(len(calls), 1)
+            # Each turn records a driver status line with time and token totals.
+            self.assertIn("<nagent-turn-status ", conversation.read_text(encoding="utf-8"))
+
+    def test_turn_status_block_carries_utc_and_token_totals(self):
+        stats = self.mod.TokenStats()
+        stats.add_llm_turn(input_tokens=120, output_tokens=30)
+        stats.add_llm_turn(input_tokens=200, output_tokens=45)
+        block = self.mod.turn_status_block(stats, NOW)
+        self.assertEqual(
+            block,
+            '<nagent-turn-status utc="2026-06-12T12:00:00Z" turn="2" '
+            'tokens_in_total="320" tokens_out_total="75" />',
+        )
+
+    def test_invalid_content_is_stripped_to_a_sidecar(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "conversations").mkdir()
+            conversation = root / "conversations" / "conv"
+            conversation.write_text(
+                "<initial_context>\nrules\n</initial_context>\n", encoding="utf-8"
+            )
+
+            def fake_run(cmd, **kwargs):
+                # A leaked <thought> alongside the real final response.
+                payload = {
+                    "response": "<thought\nEverything done. Reporting.<nagent-response>all good</nagent-response>",
+                    "input_tokens": 5,
+                    "output_tokens": 5,
+                }
+                return unittest.mock.Mock(returncode=0, stdout=json.dumps(payload), stderr="")
+
+            with unittest.mock.patch.object(self.mod.subprocess, "run", fake_run), \
+                unittest.mock.patch.object(self.mod, "run_safety_net", lambda *a, **k: None):
+                code, responses = self.mod.run_agent_loop(
+                    conversation, root, self._llm(), "go", "4242", safety_settings=SETTINGS
+                )
+
+            self.assertEqual(code, 0)
+            self.assertEqual(responses, ["all good"])
+            convo = conversation.read_text(encoding="utf-8")
+            # The conversation is clean: no leaked tag, only the valid response.
+            self.assertNotIn("<thought", convo)
+            self.assertIn("<nagent-response>all good</nagent-response>", convo)
+            # The status line links to a sidecar holding the raw output.
+            self.assertIn('invalid="', convo)
+            sidecars = list((root / "conversations").glob("conv.invalid.*"))
+            self.assertEqual(len(sidecars), 1)
+            raw = sidecars[0].read_text(encoding="utf-8")
+            self.assertIn("<thought", raw)  # the rejected content is reconstructable
+            self.assertIn("all good", raw)
 
     def test_best_of_n_direction_in_initial_context(self):
         with tempfile.TemporaryDirectory() as tmp:
