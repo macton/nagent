@@ -221,7 +221,7 @@ def large_file_guidance() -> str:
 - Merge edits back with <nagent-file-patch index="{{index-path}}"/>."""
 
 
-def file_edit_rules(file_edit_path: Path | None) -> str:
+def file_edit_rules(file_edit_path: Path | None, scratch_dir: Path | None = None) -> str:
     if file_edit_path is not None:
         return f"""File editing (this session):
 - You may use <nagent-write> on this file: {file_edit_path}
@@ -231,8 +231,12 @@ def file_edit_rules(file_edit_path: Path | None) -> str:
 {large_file_guidance()}"""
 
     return f"""File editing:
-- Do not use shell commands to write files outside temp directories (/tmp, /var/tmp, or $TMPDIR).
-- To edit project files, use nagent-file-edit; <nagent-write> is allowed only under temp directories.
+- <nagent-write> may write only inside your scratch directory: {scratch_dir}
+  (each nagent instance has its own, so concurrent instances never collide). Put briefings,
+  generated sources, and other scratch files there — a write anywhere else is rejected.
+- To create or edit files elsewhere (project files), use nagent-file-edit.
+- Prefer <nagent-write>/nagent-file-edit over shell redirection for writes; if you must write via
+  shell, keep it inside {scratch_dir} so you do not collide with other instances.
 {large_file_guidance()}"""
 
 
@@ -652,6 +656,7 @@ def build_initial_context(
     campaign_item_dir: Path | None = None,
 ) -> str:
     parent = parent_conversation or "none"
+    scratch_dir = conversation_scratch_dir(conversation_name)
     if invocation == "user":
         role_instructions = """User invocation:
 - A human started this nagent instance from the command line.
@@ -793,7 +798,7 @@ Context management (every nagent conversation, including sub-conversations):
 Conversations are data (create, reuse, hand off):
 - Reuse a worker: <nagent-conversation conversation-file="{{name}}"> continues that conversation with its accumulated context. Name workers you will call again (e.g. "test-runner"); use a fresh unnamed sub-conversation when isolation matters more than memory.
 - Resume saved work: conversation-name="{{saved-name}}" starts the child from a conversation the user saved with --save-conversation.
-- Author a worker's context: write a curated briefing to a temp file with <nagent-write>, then spawn <nagent-conversation conversation-file="/tmp/...">. Include only what the worker needs: goal, constraints, paths, known facts.
+- Author a worker's context: write a curated briefing into your scratch dir with <nagent-write> (e.g. {scratch_dir}/briefing.md), then spawn <nagent-conversation conversation-file="{scratch_dir}/briefing.md">. Include only what the worker needs: goal, constraints, paths, known facts.
 - Hand off when noisy: if this conversation is mostly stale tool output, distill goal/state/decisions into a sub-conversation prompt, delegate the rest, and tell your caller about the handoff. Never rewrite your own conversation file while running.
 - High-stakes decision? Spawn 2-3 workers on the same authored briefing plus a judge worker to compare results; spend those tokens only when the decision warrants it.
 - This conversation persists across invocations, and the user may edit it between runs. The current file is the source of truth.
@@ -803,7 +808,7 @@ Campaigns (long-horizon plans as data; drive with nagent-campaign via <nagent-sh
 - Use nagent-campaign update --dry-run first when cost is unclear. Never edit a campaign's index.yaml or item files directly from this conversation; drive changes through the CLI.
 - Asked about ongoing work? Check nagent-campaign status before answering from memory.
 
-{file_edit_rules(file_edit_path)}{campaign_worker_block}
+{file_edit_rules(file_edit_path, scratch_dir)}{campaign_worker_block}
 {tools_block}{context_layers_block}{campaign_status_block}{knowledge_block}{file_edit_detail_block}
 Instance:
 - invocation: {invocation}
@@ -1314,15 +1319,25 @@ def tmp_roots() -> list[Path]:
     return roots
 
 
-def is_tmp_path(path: Path) -> bool:
+def conversation_scratch_dir(conversation_name: str) -> Path:
+    """The per-conversation scratch directory under the temp root.
+
+    Each nagent instance gets its own directory keyed by conversation name, so
+    concurrent instances writing scratch files never collide in a shared /tmp.
+    Keying on the name (not a per-process guid) keeps it stable across resumes
+    and predictable, so the model can find files it wrote on an earlier turn.
+    """
+    return tmp_roots()[0] / f"nagent-{conversation_name}"
+
+
+def is_within(path: Path, directory: Path) -> bool:
+    """True if path resolves to a location strictly inside directory."""
     try:
-        resolved = path.resolve()
+        resolved = path.expanduser().resolve()
+        base = directory.resolve()
     except OSError:
         return False
-    for root in tmp_roots():
-        if resolved == root or root in resolved.parents:
-            return True
-    return False
+    return base in resolved.parents
 
 
 def validate_write_path(
@@ -1330,6 +1345,7 @@ def validate_write_path(
     file_edit_path: Path | None,
     root: Path | None = None,
     file_edit_id: str | None = None,
+    scratch_dir: Path | None = None,
 ) -> str | None:
     file_path = Path(path)
     if file_edit_path is not None:
@@ -1356,12 +1372,13 @@ def validate_write_path(
             f"write not allowed: only {file_edit_path} or its split segments "
             "may be edited in this session"
         )
-    try:
-        if is_tmp_path(file_path.expanduser()):
-            return None
-    except OSError:
-        pass
-    return "write not allowed: use nagent-file-edit to edit files outside temp directories"
+    if scratch_dir is not None and is_within(file_path, scratch_dir):
+        return None
+    target = scratch_dir if scratch_dir is not None else "the conversation scratch directory"
+    return (
+        f"write not allowed: <nagent-write> may only write under {target}; "
+        "use nagent-file-edit to edit files elsewhere"
+    )
 
 
 def execute_write(
@@ -1370,8 +1387,9 @@ def execute_write(
     file_edit_path: Path | None = None,
     root: Path | None = None,
     file_edit_id: str | None = None,
+    scratch_dir: Path | None = None,
 ) -> str:
-    error = validate_write_path(path, file_edit_path, root, file_edit_id)
+    error = validate_write_path(path, file_edit_path, root, file_edit_id, scratch_dir)
     if error is not None:
         return f'<nagent-write-result path="{path}" status="error">{error}</nagent-write-result>'
 
@@ -1513,6 +1531,7 @@ def process_tags(
     responses: list[str] = []
     next_prompts: list[str] = []
     should_continue = False
+    scratch_dir = conversation_scratch_dir(conversation_file.name)
 
     for tag in tags:
         if tag.kind == "response":
@@ -1529,7 +1548,7 @@ def process_tags(
         elif tag.kind == "write":
             append_to_conversation(
                 conversation_file,
-                execute_write(tag.path or "", tag.content, file_edit_path, root, file_edit_id),
+                execute_write(tag.path or "", tag.content, file_edit_path, root, file_edit_id, scratch_dir),
             )
             should_continue = True
         elif tag.kind == "shell":
@@ -1813,6 +1832,11 @@ def run_agent_loop(
     nagent_path = Path(__file__).resolve()
     user_responses: list[str] = []
     token_stats = token_stats or TokenStats()
+
+    if file_edit_path is None:
+        # Make this instance's scratch dir exist up front so the model can write
+        # to it (via <nagent-write>) or reference it from shell on the first turn.
+        conversation_scratch_dir(conversation_file.name).mkdir(parents=True, exist_ok=True)
 
     for read_path in initial_read_paths or []:
         append_to_conversation(conversation_file, execute_read(read_path))

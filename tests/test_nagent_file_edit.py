@@ -117,8 +117,8 @@ class FileEditNagentTests(unittest.TestCase):
             "user",
             "conv",
         )
-        self.assertIn("Do not use shell commands to write files outside temp directories", text)
-        self.assertIn("/tmp, /var/tmp, or $TMPDIR", text)
+        self.assertIn("may write only inside your scratch directory", text)
+        self.assertIn("nagent-conv/briefing.md", text)  # scratch path interpolated for "conv"
         self.assertIn("nagent-file-edit", text)
         self.assertIn("nagent-file-read", text)
 
@@ -136,7 +136,7 @@ class FileEditNagentTests(unittest.TestCase):
         self.assertIn("segment files from a split of this file", text)
         self.assertIn("nagent-file-patch", text)
         context = text.split("</initial_context>", 1)[0]
-        self.assertNotIn("Do not use shell commands to write files outside temp directories", context)
+        self.assertNotIn("may write only inside your scratch directory", context)
 
     def test_file_edit_context_includes_git_history_and_summary(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -383,25 +383,33 @@ class FileEditNagentTests(unittest.TestCase):
         finally:
             path.unlink(missing_ok=True)
 
-    def test_is_tmp_path_accepts_tmpdir(self):
+    def test_conversation_scratch_dir_is_per_conversation_under_tmpdir(self):
         with tempfile.TemporaryDirectory() as tmp:
-            nested = Path(tmp) / "nested" / "file.txt"
-            nested.parent.mkdir(parents=True)
-            nested.write_text("ok", encoding="utf-8")
             with unittest.mock.patch.dict(os.environ, {"TMPDIR": tmp}, clear=False):
-                self.assertTrue(self.mod.is_tmp_path(nested))
+                a = self.mod.conversation_scratch_dir("conv-a")
+                b = self.mod.conversation_scratch_dir("conv-b")
+                self.assertEqual(a, Path(tmp).resolve() / "nagent-conv-a")
+                self.assertNotEqual(a, b)  # concurrent instances do not collide
 
     def test_execute_write_blocks_project_path(self):
         result = self.mod.execute_write("/etc/passwd", "nope")
         self.assertIn("nagent-file-edit", result)
         self.assertIn('status="error"', result)
 
-    def test_execute_write_allows_tmp_path(self):
-        with tempfile.TemporaryDirectory(dir="/tmp") as tmp:
-            target = Path(tmp) / "scratch.txt"
-            result = self.mod.execute_write(str(target), "tmp ok")
-            self.assertIn('status="ok"', result)
+    def test_execute_write_allows_only_inside_scratch_dir(self):
+        with tempfile.TemporaryDirectory(dir="/tmp") as scratch, \
+            tempfile.TemporaryDirectory(dir="/tmp") as other:
+            scratch_dir = Path(scratch)
+            # Inside the scratch dir (including nested) is allowed.
+            target = scratch_dir / "sub" / "scratch.txt"
+            ok = self.mod.execute_write(str(target), "tmp ok", scratch_dir=scratch_dir)
+            self.assertIn('status="ok"', ok)
             self.assertEqual(target.read_text(encoding="utf-8"), "tmp ok")
+            # A sibling temp dir (another instance's territory) is rejected.
+            blocked = self.mod.execute_write(
+                str(Path(other) / "scratch.txt"), "nope", scratch_dir=scratch_dir
+            )
+            self.assertIn('status="error"', blocked)
 
     def test_execute_write_allows_renamed_file_edit_target(self):
         with tempfile.TemporaryDirectory() as tmp:

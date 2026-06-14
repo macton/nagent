@@ -581,7 +581,7 @@ class ActionTests(unittest.TestCase):
             self.assertIn("file not found", missing)
 
             target = Path(tmp) / "out" / "written.txt"
-            write_result = self.mod.execute_write(str(target), "written")
+            write_result = self.mod.execute_write(str(target), "written", scratch_dir=Path(tmp))
             self.assertIn('status="ok"', write_result)
             self.assertEqual(target.read_text(encoding="utf-8"), "written")
 
