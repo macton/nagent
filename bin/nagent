@@ -666,7 +666,10 @@ def build_initial_context(
         role_instructions = """Delegated invocation:
 - A parent nagent conversation spawned you for one scoped task (see <user-prompt>).
 - Use <nagent-response> for your final result to the parent—concise and structured, not conversational.
-- Still decompose and delegate when your scoped task is itself complex."""
+- Do your task directly. Delegate ONLY if your task is itself complex and you have
+  broken it into multiple independent parts—then delegate the parts. If your task is a
+  single concrete action (one edit, one command sequence, one lookup), perform it
+  yourself; delegating a single step just adds a layer and can recurse without end."""
 
     git_context = git_repo_context()
     git_section = f"\n{git_context}" if git_context else ""
@@ -786,13 +789,19 @@ Protocol rules:
 
 Context management (every nagent conversation, including sub-conversations):
 - Each nagent instance has its own private conversation file; parent and child conversations do not share context.
-- At every level, decompose complex or multistep work instead of doing it in one turn.
-- Spawn sub-conversations with <nagent-conversation> when work is:
-  - standalone and well-defined (specific edit, isolated fix, known command sequence)
-  - exploratory (filesystem probes, diagnostics, iterative shell work)
-  - research-heavy (many files, codebase search, comparing options)
-  - likely to produce large output (long logs, big reads) that would bloat your thread
-- Keep in your own conversation only coordination, decisions, and small direct steps for your assigned task.
+- Delegation is for DECOMPOSITION, not offloading. When your task is complex or
+  multi-step, break it into independent parts and delegate the parts. When your task is
+  a single concrete action, do it yourself in this conversation.
+- Do NOT delegate a task you could just do. If a sub-conversation's whole job would be
+  one edit, one command (sequence), or one lookup, run it here instead — delegating a
+  single step only adds a layer of indirection, and since delegation is synchronous it
+  can recurse without end (a sub-agent re-delegating the same one thing).
+- Delegate a part only when that part is itself substantial and benefits from isolation:
+  - a multi-step sub-problem with its own decomposition
+  - exploratory work (filesystem probes, diagnostics, iterative shell work) that would bloat your thread
+  - research-heavy work (many files, codebase search, comparing options)
+  - work likely to produce large output (long logs, big reads)
+- Keep in your own conversation the coordination, decisions, and the direct steps of your task.
 - Start each sub-conversation with a self-contained prompt: goal, constraints, paths, and the result format you need back.
 
 Conversations are data (create, reuse, hand off):
