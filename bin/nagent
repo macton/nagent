@@ -56,6 +56,7 @@ from nagent_tags import (
     find_block_span,
     scan_tag_document,
     serialize_nodes,
+    dedupe_nodes,
     remove_first_block,
     replace_first_block,
     unwrap_whole_element,
@@ -942,6 +943,7 @@ def parse_response(text: str) -> tuple[list[NagentTag], list[str], str | None]:
         snippet = text[exc.offset : exc.offset + 80].replace("\n", "\\n")
         return [], [], f"Unexpected content at offset {exc.offset}: {exc.message} near {snippet!r}"
 
+    nodes = dedupe_nodes(nodes)  # a stutter that repeats a tag runs it once
     tags: list[NagentTag] = []
     for node in nodes:
         kind = TAG_KINDS[node.name]  # the scanner only returns known tag names
@@ -1106,11 +1108,19 @@ def write_invalid_sidecar(
     return guid
 
 
-def cleaned_response_text(text: str) -> str:
-    """The turn with non-protocol content removed: only its valid tags, in
-    order, re-serialized well-formed. The raw text is kept in a sidecar."""
+def cleaned_response_text(text: str) -> tuple[str, int]:
+    """The turn cleaned for storage: only its valid tags, in order, with exact
+    duplicates collapsed, re-serialized well-formed.
+
+    Returns ``(cleaned_text, duplicates_removed)``. ``duplicates_removed`` counts
+    only the dropped duplicate tags (non-protocol junk never becomes a node, so
+    it is reported separately as ``ignored`` by parse_response). The matching
+    raw output is preserved in a sidecar only when junk was stripped; pure
+    duplicate removal is loss-free and needs no sidecar.
+    """
     nodes, _ = scan_tag_document(text, KNOWN_TAG_NAMES, UNWRAP_WRAPPER_NAMES, EOF_CAPTURE_TAG_NAMES)
-    return serialize_nodes(nodes)
+    deduped = dedupe_nodes(nodes)
+    return serialize_nodes(deduped), len(nodes) - len(deduped)
 
 
 def estimate_token_count(text: str) -> int:
@@ -1901,17 +1911,30 @@ def run_agent_loop(
         now = datetime.now(timezone.utc)
         invalid_ref = None
         body = llm_output
+        cleaned_body, duplicates_removed = cleaned_response_text(llm_output)
         if ignored:
             # Keep the conversation (the next generation's input) free of the
             # rejected content so it can't bias the model; preserve the raw
             # output in a sidecar for debugging, linked from the status line.
+            # The cleaned body also has duplicate tags collapsed.
             invalid_ref = write_invalid_sidecar(
                 conversation_file, llm_output, ignored, token_stats.turn_count, now
             )
-            body = cleaned_response_text(llm_output)
+            body = cleaned_body
+        elif duplicates_removed:
+            # Pure duplicate removal is loss-free; store the collapsed turn so
+            # the repetition can't become precedent. No sidecar needed.
+            body = cleaned_body
         append_to_conversation(conversation_file, f"<agent-response>\n{body}\n</agent-response>")
         if ignored:
             append_to_conversation(conversation_file, f"<system>{ignored_correction(ignored)}</system>")
+        elif duplicates_removed:
+            append_to_conversation(
+                conversation_file,
+                f"<system>nagent collapsed {duplicates_removed} duplicate tag"
+                f"{'' if duplicates_removed == 1 else 's'} in your previous turn; "
+                "emit each action once.</system>",
+            )
         append_to_conversation(
             conversation_file, turn_status_block(token_stats, now, invalid_ref=invalid_ref)
         )

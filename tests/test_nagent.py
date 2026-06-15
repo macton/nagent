@@ -548,15 +548,45 @@ class ParseResponseTests(unittest.TestCase):
 
     def test_cleaned_response_strips_junk_and_closes_eof_capture(self):
         # leaked <thought> + a real shell tag -> only the shell survives.
-        self.assertEqual(
-            self.mod.cleaned_response_text("<thought\nthinking.<nagent-shell>ls</nagent-shell>"),
-            "<nagent-shell>ls</nagent-shell>",
+        cleaned, dupes = self.mod.cleaned_response_text(
+            "<thought\nthinking.<nagent-shell>ls</nagent-shell>"
         )
+        self.assertEqual(cleaned, "<nagent-shell>ls</nagent-shell>")
+        self.assertEqual(dupes, 0)
         # leaked <thought> + an unclosed final response -> response, closed.
+        cleaned, dupes = self.mod.cleaned_response_text("<thought\ndone.<nagent-response>answer")
+        self.assertEqual(cleaned, "<nagent-response>answer</nagent-response>")
+        self.assertEqual(dupes, 0)
+
+    def test_duplicate_tags_are_collapsed(self):
+        # A stutter that emits the same read+shell+next four times runs once.
+        turn = (
+            '<nagent-read path="/tmp/f" />'
+            "<nagent-shell>ls</nagent-shell>"
+            "<nagent-next>go</nagent-next>"
+        ) * 4
+        tags, ignored, err = self.mod.parse_response(turn)
+        self.assertIsNone(err)
+        self.assertEqual([t.kind for t in tags], ["read", "shell", "next"])  # deduped
+        cleaned, dupes = self.mod.cleaned_response_text(turn)
+        self.assertEqual(dupes, 9)  # 12 tags in, 3 unique kept
         self.assertEqual(
-            self.mod.cleaned_response_text("<thought\ndone.<nagent-response>answer"),
-            "<nagent-response>answer</nagent-response>",
+            cleaned,
+            '<nagent-read path="/tmp/f" />\n<nagent-shell>ls</nagent-shell>\n<nagent-next>go</nagent-next>',
         )
+
+    def test_distinct_tags_are_not_deduped(self):
+        # Same kind, different content/attrs -> both kept.
+        tags, ignored, err = self.mod.parse_response(
+            "<nagent-next>a</nagent-next><nagent-next>b</nagent-next>"
+            '<nagent-read path="/tmp/x" /><nagent-read path="/tmp/y" />'
+        )
+        self.assertIsNone(err)
+        self.assertEqual(len(tags), 4)
+        _, dupes = self.mod.cleaned_response_text(
+            "<nagent-next>a</nagent-next><nagent-next>b</nagent-next>"
+        )
+        self.assertEqual(dupes, 0)
 
     def test_ignored_correction_does_not_echo_the_offending_tag(self):
         note = self.mod.ignored_correction(['malformed <thought>: "<thought ..."'])

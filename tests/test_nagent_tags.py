@@ -16,6 +16,7 @@ from nagent_tags import (
     replace_first_block,
     scan_tag_document,
     serialize_nodes,
+    dedupe_nodes,
     unwrap_whole_element,
 )
 
@@ -164,6 +165,21 @@ class SerializeNodesTests(unittest.TestCase):
     def test_self_closing_and_attrs_roundtrip(self):
         node = parse_element('<thing path="/tmp/x" />')
         self.assertEqual(serialize_nodes([node]), '<thing path="/tmp/x" />')
+
+
+class DedupeNodesTests(unittest.TestCase):
+    def test_collapses_exact_duplicates_keeping_first_order(self):
+        nodes, _ = scan_tag_document(
+            "<a>x</a><b>y</b><a>x</a><b>y</b><a>x</a>", frozenset({"a", "b"}), UNWRAP
+        )
+        deduped = dedupe_nodes(nodes)
+        self.assertEqual([(n.name, n.content) for n in deduped], [("a", "x"), ("b", "y")])
+
+    def test_distinct_content_or_attrs_not_deduped(self):
+        nodes, _ = scan_tag_document(
+            '<a>x</a><a>z</a><c p="1" /><c p="2" />', frozenset({"a", "c"}), UNWRAP
+        )
+        self.assertEqual(len(dedupe_nodes(nodes)), 4)
 
 
 class BlockHelperTests(unittest.TestCase):

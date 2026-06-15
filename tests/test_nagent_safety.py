@@ -367,6 +367,38 @@ class SafetyNetTests(unittest.TestCase):
             self.assertIn("<thought", raw)  # the rejected content is reconstructable
             self.assertIn("all good", raw)
 
+    def test_duplicate_tags_collapsed_in_conversation_without_sidecar(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "conversations").mkdir()
+            conversation = root / "conversations" / "conv"
+            conversation.write_text(
+                "<initial_context>\nrules\n</initial_context>\n", encoding="utf-8"
+            )
+
+            def fake_run(cmd, **kwargs):
+                # Stutter: the same final response emitted three times.
+                payload = {
+                    "response": "<nagent-response>done</nagent-response>" * 3,
+                    "input_tokens": 5,
+                    "output_tokens": 5,
+                }
+                return unittest.mock.Mock(returncode=0, stdout=json.dumps(payload), stderr="")
+
+            with unittest.mock.patch.object(self.mod.subprocess, "run", fake_run), \
+                unittest.mock.patch.object(self.mod, "run_safety_net", lambda *a, **k: None):
+                code, responses = self.mod.run_agent_loop(
+                    conversation, root, self._llm(), "go", "4242", safety_settings=SETTINGS
+                )
+
+            self.assertEqual(code, 0)
+            self.assertEqual(responses, ["done"])  # collapsed to one
+            convo = conversation.read_text(encoding="utf-8")
+            self.assertEqual(convo.count("<nagent-response>done</nagent-response>"), 1)
+            self.assertIn("collapsed 2 duplicate tags", convo)
+            # Pure dedup is loss-free: no sidecar written.
+            self.assertEqual(list((root / "conversations").glob("conv.invalid.*")), [])
+
     def test_best_of_n_direction_in_initial_context(self):
         with tempfile.TemporaryDirectory() as tmp:
             text = self.mod.build_initial_context(Path(tmp), NAGENT.resolve(), "user", "conv")

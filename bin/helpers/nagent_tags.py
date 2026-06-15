@@ -245,6 +245,26 @@ def serialize_nodes(nodes: list[TagNode]) -> str:
     return "\n".join(serialize_node(node) for node in nodes)
 
 
+def dedupe_nodes(nodes: list[TagNode]) -> list[TagNode]:
+    """Drop exact-duplicate tags within one turn, keeping the first occurrence.
+
+    A model that stutters can emit the same action (read, shell, next, ...)
+    several times in a turn; running and re-queuing each copy wastes work and,
+    once stored, becomes precedent that reinforces the repetition. Two nodes are
+    duplicates when their name, self-closing flag, attributes, and body all
+    match. Distinct tags are untouched and order is preserved.
+    """
+    seen: set = set()
+    out: list[TagNode] = []
+    for node in nodes:
+        key = (node.name, node.self_closing, tuple(sorted(node.attrs.items())), node.content)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(node)
+    return out
+
+
 def find_block_span(text: str, name: str) -> tuple[int, int] | None:
     """Span of the first literal <name>...</name> block, tags included.
 
