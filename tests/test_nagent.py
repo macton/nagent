@@ -867,6 +867,98 @@ class ActionTests(unittest.TestCase):
         self.assertLess(contents.index("second content"), contents.index("<user-prompt>"))
         self.assertIn("prompt content", contents)
 
+    def test_run_hook_block_reports_output_and_exit_code(self):
+        ok = self.mod.run_hook("echo HOOK_OK", "hook-per-run")
+        self.assertIn('<hook-per-run exit_code="0">', ok)
+        self.assertIn("HOOK_OK", ok)
+        self.assertIn("</hook-per-run>", ok)
+
+        # A failing hook surfaces its non-zero exit and stderr, not silence.
+        bad = self.mod.run_hook("echo OOPS >&2; exit 3", "hook-per-file-edit", path="x.c")
+        self.assertIn('<hook-per-file-edit exit_code="3" path="x.c">', bad)
+        self.assertIn("OOPS", bad)
+
+        # A silent hook still records that it ran.
+        quiet = self.mod.run_hook("true", "hook-per-run")
+        self.assertIn("(no output)", quiet)
+
+    def test_hook_per_run_runs_before_every_turn(self):
+        # Two turns (an action turn that continues, then a final response):
+        # the per-run hook must inject fresh status at the top of each.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            conversation = root / "conversation"
+            conversation.write_text("", encoding="utf-8")
+            call_llm = unittest.mock.Mock(
+                side_effect=[
+                    ("<nagent-shell>echo work</nagent-shell>", None),
+                    ("<nagent-response>done</nagent-response>", None),
+                ]
+            )
+            with unittest.mock.patch.object(self.mod, "call_llm", call_llm):
+                code, responses = self.mod.run_agent_loop(
+                    conversation,
+                    root,
+                    self.mod.LlmSettings(provider="openai", model="gpt-5.5"),
+                    "prompt",
+                    "4242",
+                    json_mode=True,
+                    hook_per_run="echo STATUS_MARKER",
+                )
+            contents = conversation.read_text(encoding="utf-8")
+
+        self.assertEqual(code, 0)
+        self.assertEqual(call_llm.call_count, 2)
+        self.assertEqual(contents.count('<hook-per-run exit_code="0">'), 2)
+        self.assertEqual(contents.count("STATUS_MARKER"), 2)
+        # The first hook output precedes the first agent-response (status first).
+        self.assertLess(contents.index("STATUS_MARKER"), contents.index("<agent-response>"))
+
+    def test_hook_per_file_edit_runs_after_file_patch(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            conversation = root / "conversation"
+            conversation.write_text("", encoding="utf-8")
+            tags, _ignored, err = self.mod.parse_response(
+                '<nagent-file-patch index="/tmp/nonexistent-index.json" />'
+            )
+            self.assertIsNone(err)
+            self.mod.process_tags(
+                tags,
+                conversation,
+                root,
+                None,
+                NAGENT,
+                "4242",
+                self.mod.TokenStats(),
+                None,
+                None,
+                "echo COMPILED",
+            )
+            contents = conversation.read_text(encoding="utf-8")
+
+        # The patch result is recorded, and the verify hook fires right after it.
+        self.assertIn('<hook-per-file-edit exit_code="0"', contents)
+        self.assertIn("COMPILED", contents)
+
+    def test_resolve_hooks_cli_overrides_config(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config = Path(tmp) / "config.json"
+            config.write_text(
+                json.dumps({"hook_per_run": "cfg-run", "hook_per_file_edit": ""}),
+                encoding="utf-8",
+            )
+            # Config supplies per-run; empty per-file-edit string means disabled.
+            self.assertEqual(self.mod.resolve_hooks(None, None, config), ("cfg-run", None))
+            # CLI wins over config.
+            self.assertEqual(
+                self.mod.resolve_hooks("cli-run", "cli-edit", config), ("cli-run", "cli-edit")
+            )
+            # No CLI, no config file at all -> both disabled.
+            self.assertEqual(
+                self.mod.resolve_hooks(None, None, Path(tmp) / "missing.json"), (None, None)
+            )
+
     def test_default_pid_prefers_screen_window(self):
         env = os.environ.copy()
         env.update({"STY": "screen-name", "WINDOW": "7", "BASHPID": "9999"})
