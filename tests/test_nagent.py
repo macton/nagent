@@ -1689,7 +1689,7 @@ class InitialTextTests(unittest.TestCase):
         self.assertIn("parent conversation: parent-conv", text)
         self.assertIn("Delegated invocation:", text)
         self.assertIn("parent nagent conversation spawned you", text)
-        self.assertIn("Still decompose and delegate", text)
+        self.assertIn("spawn a sub-conversation only when it buys something", text)
         self.assertIn("<nagent-conversation>{prompt}</nagent-conversation>", text)
         self.assertNotIn("<nagent-agent>", text)
         self.assertNotIn("User invocation:", text)
