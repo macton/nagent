@@ -679,6 +679,40 @@ class ActionTests(unittest.TestCase):
         self.assertIn("hello-nagent", result)
         self.assertIn("exit_code: 0", result)
 
+    def test_shell_output_precedes_next_input_in_either_order(self):
+        # A turn with both <nagent-shell> and <nagent-next> must record the
+        # shell output in the conversation BEFORE the next-prompt, so the next
+        # turn sees the output. process_tags appends shell output in place but
+        # only collects next-prompts; run_agent_loop appends <nagent-next-input>
+        # afterwards. That ordering must hold regardless of tag order, because
+        # <nagent-next> never appends in the loop.
+        def conversation_after(turn):
+            with tempfile.TemporaryDirectory() as tmp:
+                conv = Path(tmp) / "conv"
+                conv.write_text("", encoding="utf-8")
+                tags, _ignored, err = self.mod.parse_response(turn)
+                self.assertIsNone(err)
+                _resp, next_prompts, _cont = self.mod.process_tags(
+                    tags, conv, Path(tmp), None, NAGENT, "pid", self.mod.TokenStats()
+                )
+                # mirror run_agent_loop's post-process_tags next-input append
+                for prompt in next_prompts:
+                    self.mod.append_to_conversation(
+                        conv, f"<nagent-next-input>\n{prompt}\n</nagent-next-input>"
+                    )
+                return conv.read_text(encoding="utf-8")
+
+        for turn in (
+            "<nagent-shell>echo SHELL_MARKER</nagent-shell><nagent-next>go</nagent-next>",
+            "<nagent-next>go</nagent-next><nagent-shell>echo SHELL_MARKER</nagent-shell>",
+        ):
+            text = conversation_after(turn)
+            i_shell = text.find("SHELL_MARKER")
+            i_next = text.find("<nagent-next-input>")
+            self.assertNotEqual(i_shell, -1, "shell output missing")
+            self.assertNotEqual(i_next, -1, "next-input missing")
+            self.assertLess(i_shell, i_next, f"shell must precede next-input for: {turn}")
+
     def test_parse_llm_json_output_includes_tokens(self):
         parsed = self.mod.parse_llm_json_output(
             json.dumps(
