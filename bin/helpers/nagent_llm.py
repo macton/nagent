@@ -10,8 +10,12 @@ from pathlib import Path
 
 from nagent_cli import git_toplevel
 
-PROVIDERS = ("openai", "anthropic", "google", "gemini", "cursor", "claude-code")
+PROVIDERS = ("openai", "anthropic", "google", "gemini", "cursor", "claude-code", "together")
 PROVIDER_ALIASES = {"gemini": "google"}
+
+# Together exposes an OpenAI-wire-compatible API (chat completions + /v1/models),
+# so the "together" provider reuses the openai SDK pointed at this base URL.
+TOGETHER_BASE_URL = "https://api.together.ai/v1"
 
 # For the claude-code provider, "default" means Claude Code's own configured
 # model: the SDK is invoked with model=None and Claude Code decides.
@@ -23,6 +27,7 @@ DEFAULT_MODELS = {
     "google": "gemini-2.5-flash",
     "cursor": "composer-2.5",
     "claude-code": CLAUDE_CODE_DEFAULT_MODEL,
+    "together": "meta-llama/Llama-3.3-70B-Instruct-Turbo",
 }
 
 # An empty tuple means the provider manages its own credentials; claude-code
@@ -33,6 +38,40 @@ CREDENTIAL_ENV = {
     "google": ("GOOGLE_API_KEY", "GEMINI_API_KEY"),
     "cursor": ("CURSOR_API_KEY",),
     "claude-code": (),
+    "together": ("TOGETHER_API_KEY",),
+}
+
+# Maximum input context window, in tokens, for models whose limit we have
+# verified directly against the provider. nagent uses this to rebuild a
+# conversation before a request would exceed the model's window. A model that
+# is absent returns None from model_context_window() — "unknown", which falls
+# back to the byte-size rebuild threshold. Override or extend per-model in
+# config via "context_window_tokens" (no code change needed for a new model).
+#
+# Values are the maximum INPUT tokens the provider actually enforces (what the
+# rebuild trigger compares estimated request tokens against), which is not
+# always the advertised total context_length.
+#
+# Verified against the Together API on 2026-06-17:
+# - DeepSeek entries read from /v1/models; V4-Pro confirmed by a
+#   context_length_exceeded error ("maximum context length is 512000 tokens").
+# - Qwen3.7-Plus/Max advertise context_length=1000000, but an oversized request
+#   is rejected with "Range of input length should be [1, 983616]" — so the
+#   enforced input cap is 983616, with ~16384 of the 1M reserved for output.
+# Other providers' models are intentionally omitted rather than guessed; set
+# them in config via "context_window_tokens".
+MODEL_CONTEXT_WINDOWS = {
+    "deepseek-ai/DeepSeek-V4-Pro": 512000,
+    "deepseek-ai/DeepSeek-R1-0528": 163840,
+    "deepseek-ai/DeepSeek-V3.1": 131072,
+    "deepseek-ai/DeepSeek-R1-Distill-Llama-70B": 131072,
+    "deepseek-ai/DeepSeek-R1-Distill-Qwen-14B": 131072,
+    "deepseek-ai/DeepSeek-R1-Distill-Qwen-7B": 131072,
+    "deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B": 131072,
+    "deepseek-ai/deepseek-coder-33b-instruct": 16384,
+    "deepseek-ai/DeepSeek-OCR-2": 8192,
+    "Qwen/Qwen3.7-Plus": 983616,
+    "Qwen/Qwen3.7-Max": 983616,
 }
 
 PACKAGE_HINTS = {
@@ -41,6 +80,7 @@ PACKAGE_HINTS = {
     "google": "google-genai",
     "cursor": "cursor-sdk",
     "claude-code": "claude-agent-sdk",
+    "together": "openai",
 }
 
 
@@ -81,6 +121,13 @@ def load_config(config_path: Path | None = None) -> dict:
 
 def default_model(provider: str) -> str:
     return DEFAULT_MODELS[provider]
+
+
+def model_context_window(model: str) -> int | None:
+    """Verified maximum input window (tokens) for a model, or None if unknown.
+    None means the caller should fall back to its byte-size threshold rather
+    than guess a window."""
+    return MODEL_CONTEXT_WINDOWS.get(model)
 
 
 def estimate_token_count(text: str) -> int:
@@ -151,6 +198,13 @@ def require_package(provider: str):
         except ImportError:
             _missing_package(provider)
         return OpenAI
+    if provider == "together":
+        # Together is OpenAI-wire-compatible; reuse the openai SDK.
+        try:
+            from openai import OpenAI
+        except ImportError:
+            _missing_package(provider)
+        return OpenAI
     if provider == "anthropic":
         try:
             import anthropic
@@ -194,6 +248,36 @@ def _missing_package(provider: str) -> None:
     sys.exit(1)
 
 
+def _together_client():
+    OpenAI = require_package("together")
+    return OpenAI(api_key=os.environ["TOGETHER_API_KEY"], base_url=TOGETHER_BASE_URL)
+
+
+def _together_chat(client, model, messages):
+    """One Together chat completion, always streamed. Some Together models
+    (e.g. Qwen/Qwen3.7-Plus) ONLY support streaming and reject a non-streamed
+    request; streaming is universal for Together chat models, so always
+    streaming is safe for the rest too. Accumulates the delta text and returns
+    (text, usage); usage arrives in the final chunk via include_usage."""
+    parts: list[str] = []
+    usage = None
+    stream = client.chat.completions.create(
+        model=model,
+        messages=messages,
+        stream=True,
+        stream_options={"include_usage": True},
+    )
+    for chunk in stream:
+        if getattr(chunk, "usage", None):
+            usage = chunk.usage
+        for choice in getattr(chunk, "choices", None) or []:
+            delta = getattr(choice, "delta", None)
+            content = getattr(delta, "content", None) if delta is not None else None
+            if content:
+                parts.append(content)
+    return "".join(parts), usage
+
+
 def add_llm_arguments(parser) -> None:
     parser.add_argument(
         "--provider",
@@ -230,6 +314,24 @@ def list_models(provider: str) -> list[str]:
         OpenAI = require_package(provider)
         client = OpenAI()
         return sorted({model.id for model in client.models.list()})
+
+    if provider == "together":
+        # Together's /v1/models returns a bare JSON array, not OpenAI's
+        # {"data": [...]} envelope, so the openai SDK's models.list() (which
+        # expects the envelope) raises on it. Fetch and parse the array
+        # directly. The dict-with-"data" fallback covers the envelope shape.
+        import urllib.request
+
+        request = urllib.request.Request(
+            f"{TOGETHER_BASE_URL}/models",
+            headers={"Authorization": f"Bearer {os.environ['TOGETHER_API_KEY']}"},
+        )
+        with urllib.request.urlopen(request) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+        items = payload.get("data", []) if isinstance(payload, dict) else payload
+        return sorted(
+            {item["id"] for item in items if isinstance(item, dict) and item.get("id")}
+        )
 
     if provider == "anthropic":
         anthropic = require_package(provider)
@@ -277,6 +379,25 @@ def list_models(provider: str) -> list[str]:
         )
 
     raise ValueError(f"Unsupported provider: {provider}")
+
+
+def list_providers() -> list[dict]:
+    """Static catalog of supported providers: default model, credential env
+    vars (empty when the provider manages its own login), and any aliases.
+    No network or credentials needed. Iterates DEFAULT_MODELS so aliases
+    (e.g. gemini) are reported as aliases of their target, not as providers."""
+    aliases: dict[str, list[str]] = {}
+    for alias, target in PROVIDER_ALIASES.items():
+        aliases.setdefault(target, []).append(alias)
+    return [
+        {
+            "provider": name,
+            "default_model": DEFAULT_MODELS[name],
+            "credentials": list(CREDENTIAL_ENV[name]),
+            "aliases": sorted(aliases.get(name, [])),
+        }
+        for name in DEFAULT_MODELS
+    ]
 
 
 CURSOR_FAILURE_STATUSES = frozenset({"error", "cancelled", "expired"})
@@ -461,6 +582,14 @@ def generate_text_with_usage(
         response = client.models.generate_content(model=model, contents=message)
         return _result_with_usage(response.text or "", getattr(response, "usage_metadata", None), message)
 
+    if provider == "together":
+        # Together implements the chat completions API, not the OpenAI
+        # Responses API, so this path differs from the openai branch above.
+        # cache_boundaries is ignored: Together has no block-cache API.
+        client = _together_client()
+        text, usage = _together_chat(client, model, [{"role": "user", "content": message}])
+        return _result_with_usage(text, usage, message)
+
     if provider == "claude-code":
         return _claude_code_generate(message, model)
 
@@ -492,6 +621,8 @@ def generate_with_upload_usage(path: Path, prompt: str, provider: str, model: st
         return _anthropic_upload(path, prompt, model)
     if provider == "google":
         return _google_upload(path, prompt, model)
+    if provider == "together":
+        return _together_upload(path, prompt, model)
     if provider == "cursor":
         return LlmResult(text=_cursor_upload(path, prompt, model))
     if provider == "claude-code":
@@ -606,6 +737,37 @@ def _google_upload(path: Path, prompt: str, model: str) -> LlmResult:
         contents=[prompt, uploaded],
     )
     return _result_with_usage(response.text or "", getattr(response, "usage_metadata", None), prompt)
+
+
+def _together_upload(path: Path, prompt: str, model: str) -> LlmResult:
+    # Together is a remote OpenAI-compatible API with no local-file read. Its
+    # vision models accept images as a base64 data URL via chat completions;
+    # non-image documents have no equivalent, so reject them explicitly.
+    mime_type = _mime_type(path)
+    if not _is_image_mime(mime_type):
+        raise ValueError(
+            f"together provider supports image upload only; cannot upload "
+            f"{mime_type} file {path.name}."
+        )
+    import base64
+
+    data = base64.b64encode(path.read_bytes()).decode("ascii")
+    data_url = f"data:{mime_type};base64,{data}"
+    client = _together_client()
+    text, usage = _together_chat(
+        client,
+        model,
+        [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": prompt},
+                    {"type": "image_url", "image_url": {"url": data_url}},
+                ],
+            }
+        ],
+    )
+    return _result_with_usage(text, usage, prompt)
 
 
 def _cursor_upload(path: Path, prompt: str, model: str) -> str:

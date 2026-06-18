@@ -2204,6 +2204,36 @@ class CliTests(unittest.TestCase):
         self.assertEqual(result.returncode, 1)
         self.assertIn("file not found", result.stderr)
 
+    def test_list_providers_cli(self):
+        # Static catalog: no credentials, no network, no root creation.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "nagent-root"
+            result = subprocess.run(
+                [str(NAGENT), "--root", str(root), "--list-providers"],
+                capture_output=True,
+                text=True,
+                env=self.clean_env(),
+            )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("openai", result.stdout)
+        self.assertIn("together", result.stdout)
+        self.assertIn("TOGETHER_API_KEY", result.stdout)
+        self.assertIn("(alias: gemini)", result.stdout)
+        self.assertFalse(root.exists())
+
+    def test_list_providers_cli_json(self):
+        result = subprocess.run(
+            [str(NAGENT), "--list-providers", "--json"],
+            capture_output=True,
+            text=True,
+            env=self.clean_env(),
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        payload = json.loads(result.stdout)
+        names = [entry["provider"] for entry in payload["providers"]]
+        self.assertIn("together", names)
+        self.assertNotIn("gemini", names)
+
     def test_list_file_edits_cli(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -2718,6 +2748,37 @@ class LiveIntegrationTests(unittest.TestCase):
             self.assertIn("<user-prompt>", conversation.read_text(encoding="utf-8"))
 
 
+class RebuildDueTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.mod = load_nagent_module()
+
+    def test_byte_threshold_fires_when_window_unknown(self):
+        settings = {"rebuild_at_kb": 384, "context_window_tokens": 0}
+        self.assertFalse(self.mod.rebuild_due(100 * 1024, settings))
+        self.assertTrue(self.mod.rebuild_due(400 * 1024, settings))
+
+    def test_token_cap_fires_before_byte_threshold_for_small_window(self):
+        # 16384-token window x 0.85 ~= 13926 tokens ~= 55703 chars, far below
+        # the 384 KB byte ceiling — so the token cap is the binding trigger.
+        settings = {"rebuild_at_kb": 384, "context_window_tokens": 16384}
+        self.assertFalse(self.mod.rebuild_due(40_000, settings))   # ~10k tokens
+        self.assertTrue(self.mod.rebuild_due(80_000, settings))    # ~20k tokens
+
+    def test_large_window_leaves_byte_threshold_as_the_binding_trigger(self):
+        # DeepSeek-V4-Pro: 512000 tokens. 384 KB (~98k tokens) trips long
+        # before 512000 x 0.85, so the byte ceiling is what fires.
+        settings = {"rebuild_at_kb": 384, "context_window_tokens": 512000}
+        self.assertFalse(self.mod.rebuild_due(300 * 1024, settings))
+        self.assertTrue(self.mod.rebuild_due(400 * 1024, settings))
+
+    def test_unknown_window_does_not_fabricate_a_cap(self):
+        # Large conversation, unknown window, byte ceiling not yet tripped:
+        # must NOT rebuild on a guessed token cap.
+        settings = {"rebuild_at_kb": 384, "context_window_tokens": 0}
+        self.assertFalse(self.mod.rebuild_due(300_000, settings))
+
+
 class NagentLlmConfigTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -2825,6 +2886,110 @@ class NagentLlmConfigTests(unittest.TestCase):
         self.assertEqual(result.text, "ok")
         self.assertEqual(result.input_tokens, 31)
         self.assertEqual(result.output_tokens, 7)
+
+    def test_together_streams_chat_completions_and_preserves_usage(self):
+        captured = {}
+
+        def make_chunk(content=None, usage=None):
+            choices = []
+            if content is not None:
+                choices = [unittest.mock.Mock(delta=unittest.mock.Mock(content=content))]
+            return unittest.mock.Mock(choices=choices, usage=usage)
+
+        class FakeCompletions:
+            def create(self, **kwargs):
+                captured.update(kwargs)
+                usage = type("FakeUsage", (), {"prompt_tokens": 17, "completion_tokens": 4})()
+                # Stream: text deltas, then a usage-only final chunk (no choices).
+                return iter([
+                    make_chunk(content="together "),
+                    make_chunk(content="ok"),
+                    make_chunk(content=None, usage=usage),
+                ])
+
+        class FakeChat:
+            completions = FakeCompletions()
+
+        class FakeClient:
+            chat = FakeChat()
+
+        def fake_openai(**kwargs):
+            captured["client_kwargs"] = kwargs
+            return FakeClient()
+
+        with unittest.mock.patch.object(self.mod, "require_package", return_value=fake_openai), \
+            unittest.mock.patch.dict(os.environ, {"TOGETHER_API_KEY": "test-key"}, clear=False):
+            result = self.mod.generate_text_with_usage("hello together", "together", "some-model")
+
+        self.assertEqual(result.text, "together ok")
+        self.assertEqual(result.input_tokens, 17)
+        self.assertEqual(result.output_tokens, 4)
+        self.assertEqual(captured["model"], "some-model")
+        self.assertEqual(captured["messages"], [{"role": "user", "content": "hello together"}])
+        # Must stream: some Together models (e.g. Qwen3.7-Plus) reject non-streamed requests.
+        self.assertTrue(captured["stream"])
+        self.assertEqual(captured["stream_options"], {"include_usage": True})
+        self.assertEqual(captured["client_kwargs"]["base_url"], self.mod.TOGETHER_BASE_URL)
+        self.assertEqual(captured["client_kwargs"]["api_key"], "test-key")
+
+    def test_list_models_together_parses_bare_array(self):
+        # Together returns a top-level JSON array, not OpenAI's {"data": [...]}.
+        import contextlib
+        import io
+
+        payload = json.dumps(
+            [{"id": "meta-llama/Llama-3.3-70B-Instruct-Turbo"}, {"id": "deepseek-ai/DeepSeek-V3"}]
+        ).encode("utf-8")
+
+        @contextlib.contextmanager
+        def fake_urlopen(request):
+            captured["url"] = request.full_url
+            captured["auth"] = request.headers.get("Authorization")
+            yield io.BytesIO(payload)
+
+        captured = {}
+        with unittest.mock.patch("urllib.request.urlopen", fake_urlopen), \
+            unittest.mock.patch.dict(os.environ, {"TOGETHER_API_KEY": "test-key"}, clear=False):
+            models = self.mod.list_models("together")
+
+        self.assertEqual(
+            models, ["deepseek-ai/DeepSeek-V3", "meta-llama/Llama-3.3-70B-Instruct-Turbo"]
+        )
+        self.assertEqual(captured["url"], f"{self.mod.TOGETHER_BASE_URL}/models")
+        self.assertEqual(captured["auth"], "Bearer test-key")
+
+    def test_model_context_window_known_and_unknown(self):
+        # Verified against the Together API; the V4-Pro value was confirmed by
+        # a context_length_exceeded error from the provider.
+        self.assertEqual(self.mod.model_context_window("deepseek-ai/DeepSeek-V4-Pro"), 512000)
+        self.assertEqual(self.mod.model_context_window("deepseek-ai/DeepSeek-V3.1"), 131072)
+        # Qwen3.7-Plus advertises 1,000,000 total but enforces input <= 983616.
+        self.assertEqual(self.mod.model_context_window("Qwen/Qwen3.7-Plus"), 983616)
+        # Unknown -> None means "fall back to the byte threshold", not a guess.
+        self.assertIsNone(self.mod.model_context_window("some/unknown-model"))
+
+    def test_list_providers_catalog(self):
+        catalog = self.mod.list_providers()
+        names = [entry["provider"] for entry in catalog]
+        # Canonical providers only — aliases are reported under their target.
+        self.assertEqual(names, list(self.mod.DEFAULT_MODELS))
+        self.assertNotIn("gemini", names)
+        by_name = {entry["provider"]: entry for entry in catalog}
+        self.assertEqual(by_name["google"]["aliases"], ["gemini"])
+        self.assertEqual(by_name["together"]["default_model"], self.mod.DEFAULT_MODELS["together"])
+        self.assertEqual(by_name["together"]["credentials"], ["TOGETHER_API_KEY"])
+        # claude-code manages its own login: empty credential list.
+        self.assertEqual(by_name["claude-code"]["credentials"], [])
+
+    def test_together_resolves_with_default_model(self):
+        provider, model = self.mod.resolve_settings(provider="together")
+        self.assertEqual(provider, "together")
+        self.assertEqual(model, self.mod.DEFAULT_MODELS["together"])
+
+    def test_together_upload_rejects_non_image(self):
+        with tempfile.NamedTemporaryFile(suffix=".pdf") as handle:
+            with self.assertRaises(ValueError):
+                self.mod._together_upload(Path(handle.name), "summarize", "some-model")
 
     def test_gemini_usage_counts_are_preserved(self):
         class FakeModels:

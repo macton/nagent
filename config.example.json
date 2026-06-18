@@ -4,6 +4,7 @@
   "checkpoint_interval_minutes": 60,
   "checkpoint_max_new_kb": 256,
   "rebuild_at_kb": 384,
+  "context_window_tokens": 0,
   "hook_per_run": "",
   "hook_per_file_edit": ""
 }

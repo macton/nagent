@@ -90,6 +90,23 @@ label everything else:
 - **Inspect before assuming.** Read representative input files, sample actual
   values, read the actual call sites, run the code on real input when a way
   to do so exists. Do not design from the type signatures or the docs alone.
+- **Sample the data you already have — instrument the live solution.** The
+  richest data is usually already flowing through the current code; go get it.
+  Temporarily dump a representative sample of what actually moves through the
+  system: the arguments reaching a function, the values a hot variable takes,
+  what a function returns, which branch is taken, the real sizes/counts/lengths.
+  Then *analyze the sample* — histogram it, sort it, count distinct values, look
+  at the min/max/mode — and hunt for patterns. Real distributions expose what
+  the types hide: a variable that is almost always one value, an "array" that is
+  usually length 0 or 1, input that arrives already sorted or already unique, a
+  "general" path that is one specific case 98% of the time, a result that is
+  constant across a run. Each such pattern is a concrete opportunity — specialize
+  the common case, skip the dead branch, hoist the invariant, precompute the
+  constant, size the structure to what actually occurs. Sampling is also how you
+  find *new* opportunities mid-optimization, not just before starting: when a
+  pass stalls, instrument the next-hottest stage and let its real data point to
+  the next move. Add the probes, run on real input, read the output, then remove
+  them — never leave instrumentation on a timed/measured path.
 - **Label every assumption.** For each fact you need but cannot observe,
   write an explicit line — `ASSUMPTION: <fact> — affects <decision>` — in
   your plan, and prefer designs that are cheap to revisit if the assumption

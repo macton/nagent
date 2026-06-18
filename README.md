@@ -82,10 +82,11 @@ temporary function over that data.
 **Implementation** — `bin/nagent-llm-text` reads a text file, resolves
 provider and model settings, calls `generate_text_with_usage()` from
 `bin/helpers/nagent_llm.py`, and prints plain text or JSON with token usage.
-Providers: `openai`, `anthropic`, `google`, `cursor`, and `claude-code` —
-which runs the prompt through your locally installed Claude Code via the
-Claude Agent SDK and authenticates with Claude Code's own login, no API key
-in the environment.
+Providers: `openai`, `anthropic`, `google`, `cursor`, `together`, and
+`claude-code` — the last runs the prompt through your locally installed Claude
+Code via the Claude Agent SDK and authenticates with Claude Code's own login,
+no API key in the environment. `together` is OpenAI-wire-compatible and reuses
+the `openai` SDK pointed at `https://api.together.ai/v1`.
 
 `bin/nagent-llm-upload` is the sibling for artifacts that need upload APIs:
 images, PDFs, office files, code documents. It rejects `.zip`, enforces a
@@ -949,9 +950,21 @@ Config: CLI flags → `NAGENT_CONFIG` → project `.nagent/config.json` →
   "model": "gpt-5.5",
   "checkpoint_interval_minutes": 60,
   "checkpoint_max_new_kb": 256,
-  "rebuild_at_kb": 384
+  "rebuild_at_kb": 384,
+  "context_window_tokens": 0
 }
 ```
+
+The conversation is rebuilt (compacted to initial context + checkpoint + recent
+tail) when **either** trigger fires first: the byte ceiling `rebuild_at_kb`, or
+a per-model **token cap** — the estimated request reaching
+`CONTEXT_WINDOW_SAFETY_FRACTION` (0.85) of the model's context window. The
+window comes from a verified built-in table (`MODEL_CONTEXT_WINDOWS` in
+`nagent_llm.py`; e.g. `deepseek-ai/DeepSeek-V4-Pro` = 512000 tokens). For a
+model nagent doesn't know, set `context_window_tokens` in config; left at `0`
+and absent from the table, only the byte ceiling applies (no window is guessed).
+The token cap is what protects **small-window** models, where `rebuild_at_kb`
+is far too high to fire in time.
 
 | Provider      | Default model       | Credential environment variable         |
 | ------------- | ------------------- | --------------------------------------- |
@@ -960,6 +973,7 @@ Config: CLI flags → `NAGENT_CONFIG` → project `.nagent/config.json` →
 | `google`      | `gemini-2.5-flash`  | `GOOGLE_API_KEY` or `GEMINI_API_KEY`    |
 | `cursor`      | `composer-2.5`      | `CURSOR_API_KEY`                        |
 | `claude-code` | `default`           | None — uses the local Claude Code login |
+| `together`    | `meta-llama/Llama-3.3-70B-Instruct-Turbo` | `TOGETHER_API_KEY`        |
 
 The `claude-code` provider runs prompts through the locally installed Claude
 Code via the Claude Agent SDK, so authentication is whatever Claude Code is
@@ -977,6 +991,7 @@ echo "prompt from stdin" | nagent
 nagent "Use this instruction, then read stdin:" -
 nagent --status --json
 nagent --list-models --json
+nagent --list-providers
 nagent --list-conversations
 nagent --clear
 nagent --save-conversation saved-copy

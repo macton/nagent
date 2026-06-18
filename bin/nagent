@@ -22,6 +22,8 @@ from nagent_llm import (
     PROVIDERS,
     generate_text,
     list_models,
+    list_providers,
+    model_context_window,
     load_config,
     require_credentials,
     resolve_provider,
@@ -1658,10 +1660,19 @@ def process_tags(
 CHECKPOINT_PROMPT_NAME = "checkpoint-conversation.md"
 CHECKPOINT_DELTA_CAP_CHARS = 128 * 1024
 REBUILD_TAIL_CHARS = 64 * 1024
+# Rebuild once the estimated request reaches this fraction of the model's
+# window, not at the window itself: the headroom covers the model's own output
+# tokens plus the slack in the 4-chars/token estimate (real text runs ~4-5
+# chars/token, so estimate_token_count over-counts — rebuild fires early, which
+# is the safe direction for a cap).
+CONTEXT_WINDOW_SAFETY_FRACTION = 0.85
 SAFETY_DEFAULTS = {
     "checkpoint_interval_minutes": 60,
     "checkpoint_max_new_kb": 256,
     "rebuild_at_kb": 384,
+    # 0 = unknown; resolved from the model's verified window at startup, and
+    # overridable per-model in config for a model nagent doesn't know.
+    "context_window_tokens": 0,
 }
 
 
@@ -1737,8 +1748,21 @@ def checkpoint_due(
 
 
 def rebuild_due(conversation_chars: int, settings: dict) -> bool:
+    """Rebuild when EITHER trigger fires first: the absolute byte ceiling
+    (rebuild_at_kb) or the per-model token cap (estimated request tokens past
+    a safety fraction of the model's window). The token cap is what protects
+    small-window models, where the byte ceiling is far too high to fire in
+    time; the byte ceiling still bounds growth when the window is unknown or
+    very large."""
     rebuild_kb = settings.get("rebuild_at_kb", 0)
-    return rebuild_kb > 0 and conversation_chars > rebuild_kb * 1024
+    if rebuild_kb > 0 and conversation_chars > rebuild_kb * 1024:
+        return True
+    window = settings.get("context_window_tokens", 0)
+    if window > 0:
+        estimated_tokens = max(1, (conversation_chars + 3) // 4)
+        if estimated_tokens > window * CONTEXT_WINDOW_SAFETY_FRACTION:
+            return True
+    return False
 
 
 def write_checkpoint(
@@ -2721,6 +2745,11 @@ def main() -> int:
         help="List models available for the configured provider, then exit.",
     )
     parser.add_argument(
+        "--list-providers",
+        action="store_true",
+        help="List supported providers with their default model and credential env var, then exit.",
+    )
+    parser.add_argument(
         "--list-file-edits",
         action="store_true",
         help="List per-file edit conversations for the current shell pid, then exit.",
@@ -2887,6 +2916,20 @@ def main() -> int:
 
     if args.list_conversations:
         print_saved_conversations(root, pid, json_mode=args.json)
+        return 0
+
+    if args.list_providers:
+        catalog = list_providers()
+        if args.json:
+            emit_json({"providers": catalog})
+        else:
+            width = max(len(entry["provider"]) for entry in catalog)
+            for entry in catalog:
+                creds = " or ".join(entry["credentials"]) or "(self-managed login)"
+                line = f"{entry['provider'].ljust(width)}  {entry['default_model']}  {creds}"
+                if entry["aliases"]:
+                    line += f"  (alias: {', '.join(entry['aliases'])})"
+                print(line)
         return 0
 
     if args.list_models:
@@ -3111,7 +3154,7 @@ def main() -> int:
 
     if initial_prompt is None and not args.read:
         parser.error(
-            "prompt is required unless --status, --list-models, --list-file-edits, "
+            "prompt is required unless --status, --list-models, --list-providers, --list-file-edits, "
             "--list-conversations, --clear, --save-conversation, --load-conversation, "
             "--branch-conversation, --summarize, --read, or stdin prompt text is given"
         )
@@ -3167,6 +3210,11 @@ def main() -> int:
     hook_per_run, hook_per_file_edit = resolve_hooks(
         args.hook_per_run, args.hook_per_file_edit, args.config
     )
+    safety_settings = load_safety_settings(args.config)
+    if safety_settings["context_window_tokens"] <= 0:
+        # No explicit config override: use the model's verified window if known.
+        # Unknown stays 0, so the byte threshold remains the sole trigger.
+        safety_settings["context_window_tokens"] = model_context_window(llm.model) or 0
     token_stats = TokenStats()
     try:
         exit_code, responses = run_agent_loop(
@@ -3180,7 +3228,7 @@ def main() -> int:
             json_mode=args.json,
             token_stats=token_stats,
             initial_read_paths=args.read,
-            safety_settings=load_safety_settings(args.config),
+            safety_settings=safety_settings,
             hook_per_run=hook_per_run,
             hook_per_file_edit=hook_per_file_edit,
         )
