@@ -102,11 +102,18 @@ label everything else:
   "general" path that is one specific case 98% of the time, a result that is
   constant across a run. Each such pattern is a concrete opportunity — specialize
   the common case, skip the dead branch, hoist the invariant, precompute the
-  constant, size the structure to what actually occurs. Sampling is also how you
-  find *new* opportunities mid-optimization, not just before starting: when a
-  pass stalls, instrument the next-hottest stage and let its real data point to
-  the next move. Add the probes, run on real input, read the output, then remove
-  them — never leave instrumentation on a timed/measured path.
+  constant, size the structure to what actually occurs. And the pattern can be
+  bigger than a local tweak: the data's *shape* can show that a **different
+  algorithm or representation is the better-fit machine** (sorted-enough → a
+  different sort/merge; skewed → a different code; runny → a run/stream form;
+  sparse → a different container), not just that the current machine needs
+  filing. Sampling justifies *replacing* the machine, not only trimming it.
+  Sampling is also how you find *new* opportunities mid-optimization, not just
+  before starting: when a pass **stalls or plateaus**, that is the signal to
+  re-sample the hottest stage's data and ask whether a different machine fits it
+  better — not to keep filing the current one. Add the probes, run on real
+  input, read the output, then remove them — never leave instrumentation on a
+  timed/measured path.
 - **Label every assumption.** For each fact you need but cannot observe,
   write an explicit line — `ASSUMPTION: <fact> — affects <decision>` — in
   your plan, and prefer designs that are cheap to revisit if the assumption
@@ -151,6 +158,10 @@ Answer these about the data (in the tier 1+ plan):
 6. Can we use a **large lookup table**?
 7. Can we use a **small buffer/FIFO** to decouple producer from consumer?
 8. Can we **constrain the problem further** so a simpler machine suffices?
+9. Is there a **different algorithm or representation that fits the data better**
+   than the current machine? Subtraction has a floor; when filing the current
+   approach stops paying (a plateau), the win is often a *different* machine the
+   data's shape points to — reconsider the approach, don't only shrink it.
 
 ## Design rules
 
