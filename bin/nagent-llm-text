@@ -6,7 +6,12 @@ from pathlib import Path
 
 HELPERS_DIR = Path(__file__).resolve().parent / "helpers"
 sys.path.insert(0, str(HELPERS_DIR))
-from nagent_llm import add_llm_arguments, generate_text_with_usage, resolve_from_args
+from nagent_llm import (
+    add_llm_arguments,
+    generate_text_with_usage,
+    reasoning_value_from_args,
+    resolve_from_args,
+)
 from nagent_cli import emit_json, exit_on_description
 
 NAGENT_LLM_TEXT_DESCRIPTION = """\
@@ -54,11 +59,12 @@ def main() -> None:
         sys.exit(1)
 
     provider, model = resolve_from_args(args)
+    reasoning = reasoning_value_from_args(args)
     message = path.read_text(encoding="utf-8")
 
     try:
         result = generate_text_with_usage(
-            message, provider, model, cache_boundaries=args.cache_prefix_chars
+            message, provider, model, cache_boundaries=args.cache_prefix_chars, reasoning=reasoning
         )
     except Exception as exc:
         print(f"Error: {exc}", file=sys.stderr)

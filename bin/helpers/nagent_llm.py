@@ -130,6 +130,94 @@ def model_context_window(model: str) -> int | None:
     return MODEL_CONTEXT_WINDOWS.get(model)
 
 
+# --- reasoning level -------------------------------------------------------
+# Config carries an integer 1..REASONING_SCALE_MAX (a portable "N/5" dial) or a
+# provider-specific string (passed through verbatim). The integer is mapped to
+# each provider's native reasoning control by this table: the named effort
+# scales (anthropic, openai) map directly; google maps to a thinking-budget
+# token count (-1 = dynamic, 0 = off). None means "no portable knob at this
+# level" — the level is ignored and no parameter is sent. Reasoning on
+# Together's DeepSeek/Qwen models is intrinsic to the model, so the integer
+# scale sends nothing there; pass a provider-specific string (e.g. "low") to
+# force a reasoning_effort.
+REASONING_SCALE_MAX = 5
+REASONING_LEVELS = {
+    "anthropic":   ["low", "medium", "high", "xhigh", "max"],
+    "openai":      ["minimal", "low", "medium", "high", "high"],
+    "google":      [0, 4096, 8192, 16384, -1],
+    "together":    [None, None, None, None, None],
+    "cursor":      [None, None, None, None, None],
+    "claude-code": [None, None, None, None, None],
+}
+
+
+@dataclass
+class ReasoningSetting:
+    native: object | None = None   # provider-native value to apply, or None
+    label: str = "default"         # human label for --status
+    level: int | None = None       # the 1..5 level, when an integer was given
+    supported: bool = True         # False when an integer level has no mapping
+
+
+def _looks_like_int(value) -> bool:
+    if isinstance(value, bool):
+        return False
+    if isinstance(value, int):
+        return True
+    if isinstance(value, str):
+        return value.strip().lstrip("-").isdigit()
+    return False
+
+
+def _reasoning_label(provider, native, level, supported, passthrough) -> str:
+    if passthrough:
+        return f"{native} (provider-specific)"
+    if not supported:
+        return f"unsupported ({level}/{REASONING_SCALE_MAX})"
+    if provider == "google":
+        native_text = "dynamic" if native == -1 else ("off" if native == 0 else f"budget={native}")
+    else:
+        native_text = str(native)
+    return f"{native_text} ({level}/{REASONING_SCALE_MAX})"
+
+
+def resolve_reasoning(provider: str, value) -> ReasoningSetting:
+    """Resolve a config reasoning value to a provider-native setting.
+
+    - None / "" -> provider/model default (no parameter sent).
+    - integer or digit string -> clamped to 1..REASONING_SCALE_MAX and mapped
+      through REASONING_LEVELS; an unmapped level sends nothing (supported=False).
+    - any other string -> passed through verbatim as the provider-native value.
+    """
+    if value is None or (isinstance(value, str) and not value.strip()):
+        return ReasoningSetting()
+    if not _looks_like_int(value):
+        text = str(value).strip()
+        return ReasoningSetting(native=text, label=_reasoning_label(provider, text, None, True, True))
+    level = max(1, min(REASONING_SCALE_MAX, int(value)))
+    table = REASONING_LEVELS.get(provider) or []
+    native = table[level - 1] if len(table) >= level else None
+    supported = native is not None
+    return ReasoningSetting(
+        native=native if supported else None,
+        label=_reasoning_label(provider, native, level, supported, False),
+        level=level,
+        supported=supported,
+    )
+
+
+def reasoning_value_from_args(args):
+    """Raw reasoning value for a CLI front end: --reasoning overrides the
+    config 'reasoning' key. Returns the raw value (int/str/None), not resolved."""
+    cli = getattr(args, "reasoning", None)
+    if cli is not None:
+        return cli
+    try:
+        return load_config(getattr(args, "config", None)).get("reasoning")
+    except ValueError:
+        return None
+
+
 def estimate_token_count(text: str) -> int:
     if not text:
         return 0
@@ -253,19 +341,23 @@ def _together_client():
     return OpenAI(api_key=os.environ["TOGETHER_API_KEY"], base_url=TOGETHER_BASE_URL)
 
 
-def _together_chat(client, model, messages):
+def _together_chat(client, model, messages, reasoning=None):
     """One Together chat completion, always streamed. Some Together models
     (e.g. Qwen/Qwen3.7-Plus) ONLY support streaming and reject a non-streamed
     request; streaming is universal for Together chat models, so always
     streaming is safe for the rest too. Accumulates the delta text and returns
-    (text, usage); usage arrives in the final chunk via include_usage."""
+    (text, usage); usage arrives in the final chunk via include_usage.
+
+    reasoning, when set, is sent as the OpenAI-compatible reasoning_effort."""
     parts: list[str] = []
     usage = None
+    extra = {"extra_body": {"reasoning_effort": reasoning}} if reasoning is not None else {}
     stream = client.chat.completions.create(
         model=model,
         messages=messages,
         stream=True,
         stream_options={"include_usage": True},
+        **extra,
     )
     for chunk in stream:
         if getattr(chunk, "usage", None):
@@ -292,6 +384,13 @@ def add_llm_arguments(parser) -> None:
         "--config",
         type=Path,
         help="Path to nagent config JSON (default: ~/.nagent/config.json).",
+    )
+    parser.add_argument(
+        "--reasoning",
+        help=(
+            f"Reasoning level: integer 1-{REASONING_SCALE_MAX} (portable N/5 scale) "
+            "or a provider-specific name (default: from config)."
+        ),
     )
 
 
@@ -558,20 +657,29 @@ def generate_text_with_usage(
     provider: str,
     model: str,
     cache_boundaries: list[int] | None = None,
+    reasoning=None,
 ) -> LlmResult:
+    # Resolve the portable reasoning level (or provider-specific string) once;
+    # each branch attaches it in that provider's own protocol. native is None
+    # when no level was set or the level has no knob for this provider.
+    native = resolve_reasoning(provider, reasoning).native
+
     if provider == "openai":
         OpenAI = require_package(provider)
         client = OpenAI()
-        response = client.responses.create(model=model, input=message)
+        kwargs = {"reasoning": {"effort": native}} if native is not None else {}
+        response = client.responses.create(model=model, input=message, **kwargs)
         return _result_with_usage(response.output_text, getattr(response, "usage", None), message)
 
     if provider == "anthropic":
         anthropic = require_package(provider)
         client = anthropic.Anthropic()
+        kwargs = {"output_config": {"effort": native}} if native is not None else {}
         response = client.messages.create(
             model=model,
             max_tokens=8192,
             messages=[{"role": "user", "content": cache_prefix_blocks(message, cache_boundaries)}],
+            **kwargs,
         )
         return _result_with_usage(_anthropic_text(response), getattr(response, "usage", None), message)
 
@@ -579,7 +687,17 @@ def generate_text_with_usage(
         genai = require_package(provider)
         api_key = os.environ.get("GOOGLE_API_KEY") or os.environ["GEMINI_API_KEY"]
         client = genai.Client(api_key=api_key)
-        response = client.models.generate_content(model=model, contents=message)
+        kwargs = {}
+        if native is not None:
+            from google.genai import types
+
+            thinking = (
+                types.ThinkingConfig(thinking_budget=native)
+                if isinstance(native, int)
+                else types.ThinkingConfig(thinking_level=str(native))
+            )
+            kwargs["config"] = types.GenerateContentConfig(thinking_config=thinking)
+        response = client.models.generate_content(model=model, contents=message, **kwargs)
         return _result_with_usage(response.text or "", getattr(response, "usage_metadata", None), message)
 
     if provider == "together":
@@ -587,7 +705,7 @@ def generate_text_with_usage(
         # Responses API, so this path differs from the openai branch above.
         # cache_boundaries is ignored: Together has no block-cache API.
         client = _together_client()
-        text, usage = _together_chat(client, model, [{"role": "user", "content": message}])
+        text, usage = _together_chat(client, model, [{"role": "user", "content": message}], reasoning=native)
         return _result_with_usage(text, usage, message)
 
     if provider == "claude-code":

@@ -24,6 +24,8 @@ from nagent_llm import (
     list_models,
     list_providers,
     model_context_window,
+    reasoning_value_from_args,
+    resolve_reasoning,
     load_config,
     require_credentials,
     resolve_provider,
@@ -136,6 +138,7 @@ class LlmSettings:
     provider: str
     model: str
     config_path: Path | None = None
+    reasoning: str | None = None
 
 
 @dataclass
@@ -1196,6 +1199,8 @@ def call_llm(
     ]
     if llm.config_path is not None:
         command.extend(["--config", str(llm.config_path)])
+    if llm.reasoning is not None:
+        command.extend(["--reasoning", str(llm.reasoning)])
     for boundary in conversation_cache_boundaries(conversation_text):
         command.extend(["--cache-prefix-chars", str(boundary)])
 
@@ -2297,6 +2302,7 @@ def print_conversation_status(
     model: str,
     root: Path,
     *,
+    reasoning_label: str = "default",
     json_mode: bool = False,
 ) -> None:
     size = conversation_file.stat().st_size if conversation_file.is_file() else 0
@@ -2310,13 +2316,14 @@ def print_conversation_status(
                 "size": size,
                 "provider": provider,
                 "model": model,
+                "reasoning": reasoning_label,
                 "root_size_bytes": root_size,
                 "knowledge_items": knowledge_counts,
             }
         )
         return
     print(f"conversation:{conversation_file} size:{size}")
-    print(f"provider:{provider} model:{model}")
+    print(f"provider:{provider} model:{model} reasoning:{reasoning_label}")
     print(f"knowledge_items:{knowledge_total} root_size_bytes:{root_size}")
 
 
@@ -2718,6 +2725,13 @@ def main() -> int:
         help="Path to nagent config JSON (default: ~/.nagent/config.json).",
     )
     parser.add_argument(
+        "--reasoning",
+        help=(
+            "Reasoning level: integer 1-5 (portable N/5 scale) or a "
+            "provider-specific name (default: from config)."
+        ),
+    )
+    parser.add_argument(
         "--invocation",
         choices=["user", "delegated"],
         default="user",
@@ -2907,7 +2921,10 @@ def main() -> int:
         except ValueError as exc:
             print(f"Error: {exc}", file=sys.stderr)
             return 1
-        print_conversation_status(conversation_file, provider, model, root, json_mode=args.json)
+        reasoning_label = resolve_reasoning(provider, reasoning_value_from_args(args)).label
+        print_conversation_status(
+            conversation_file, provider, model, root, reasoning_label=reasoning_label, json_mode=args.json
+        )
         return 0
 
     if args.list_file_edits:
@@ -3165,7 +3182,7 @@ def main() -> int:
         print(f"Error: {exc}", file=sys.stderr)
         return 1
     require_credentials(provider)
-    llm = LlmSettings(provider=provider, model=model, config_path=args.config)
+    llm = LlmSettings(provider=provider, model=model, config_path=args.config, reasoning=args.reasoning)
 
     conversation_file.parent.mkdir(parents=True, exist_ok=True)
 

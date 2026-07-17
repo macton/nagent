@@ -2234,6 +2234,34 @@ class CliTests(unittest.TestCase):
         self.assertIn("together", names)
         self.assertNotIn("gemini", names)
 
+    def test_status_shows_reasoning_level_name(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "r"
+            config = Path(tmp) / "config.json"
+            config.write_text(
+                '{"provider": "anthropic", "model": "claude-fable-5", "reasoning": 4}',
+                encoding="utf-8",
+            )
+            result = subprocess.run(
+                [str(NAGENT), "--root", str(root), "--conversation", "c", "--config", str(config), "--status"],
+                capture_output=True,
+                text=True,
+                env=self.clean_env(),
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            # --status shows the resolved provider-native name for the level.
+            self.assertIn("reasoning:xhigh (4/5)", result.stdout)
+
+            override = subprocess.run(
+                [str(NAGENT), "--root", str(root), "--conversation", "c", "--config", str(config),
+                 "--reasoning", "1", "--status"],
+                capture_output=True,
+                text=True,
+                env=self.clean_env(),
+            )
+            self.assertEqual(override.returncode, 0, override.stderr)
+            self.assertIn("reasoning:low (1/5)", override.stdout)
+
     def test_list_file_edits_cli(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -2346,7 +2374,7 @@ class CliTests(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stderr)
             lines = result.stdout.strip().splitlines()
             self.assertEqual(lines[0], f"conversation:{conversation_file} size:{conversation_file.stat().st_size}")
-            self.assertEqual(lines[1], "provider:openai model:gpt-5.5")
+            self.assertEqual(lines[1], "provider:openai model:gpt-5.5 reasoning:default")
 
     def test_status_honors_provider_and_model(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -2374,7 +2402,7 @@ class CliTests(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stderr)
             lines = result.stdout.strip().splitlines()
             self.assertEqual(lines[0], f"conversation:{conversation_file} size:0")
-            self.assertEqual(lines[1], "provider:anthropic model:claude-test")
+            self.assertEqual(lines[1], "provider:anthropic model:claude-test reasoning:default")
 
     def test_status_missing_conversation_reports_zero(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -2400,7 +2428,7 @@ class CliTests(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stderr)
             lines = result.stdout.strip().splitlines()
             self.assertEqual(lines[0], f"conversation:{conversation_file} size:0")
-            self.assertEqual(lines[1], "provider:openai model:gpt-5.5")
+            self.assertEqual(lines[1], "provider:openai model:gpt-5.5 reasoning:default")
 
     def test_clear_archives_existing_conversation(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -2968,6 +2996,127 @@ class NagentLlmConfigTests(unittest.TestCase):
         # Unknown -> None means "fall back to the byte threshold", not a guess.
         self.assertIsNone(self.mod.model_context_window("some/unknown-model"))
 
+    def test_resolve_reasoning_integer_scale_maps_per_provider(self):
+        self.assertEqual(self.mod.resolve_reasoning("anthropic", 4).native, "xhigh")
+        self.assertEqual(self.mod.resolve_reasoning("openai", 1).native, "minimal")
+        self.assertEqual(self.mod.resolve_reasoning("google", 5).native, -1)
+        # digit strings are treated as the integer scale, not pass-through
+        self.assertEqual(self.mod.resolve_reasoning("anthropic", "2").native, "medium")
+        # out-of-range clamps to 1..5
+        self.assertEqual(self.mod.resolve_reasoning("anthropic", 9).native, "max")
+        self.assertEqual(self.mod.resolve_reasoning("anthropic", 0).native, "low")
+
+    def test_resolve_reasoning_default_and_unsupported(self):
+        default = self.mod.resolve_reasoning("openai", None)
+        self.assertIsNone(default.native)
+        self.assertEqual(default.label, "default")
+        # Together has no portable per-level knob -> nothing sent, flagged unsupported.
+        together = self.mod.resolve_reasoning("together", 3)
+        self.assertIsNone(together.native)
+        self.assertFalse(together.supported)
+        self.assertIn("unsupported", together.label)
+
+    def test_resolve_reasoning_string_passthrough(self):
+        passthrough = self.mod.resolve_reasoning("anthropic", "xhigh")
+        self.assertEqual(passthrough.native, "xhigh")
+        self.assertIn("provider-specific", passthrough.label)
+        # a provider-specific name is honored even where the integer scale isn't
+        self.assertEqual(self.mod.resolve_reasoning("together", "low").native, "low")
+
+    def test_reasoning_label_shows_provider_native_name(self):
+        self.assertEqual(self.mod.resolve_reasoning("anthropic", 4).label, "xhigh (4/5)")
+        self.assertEqual(self.mod.resolve_reasoning("google", 5).label, "dynamic (5/5)")
+        self.assertEqual(self.mod.resolve_reasoning("google", 1).label, "off (1/5)")
+
+    def test_openai_applies_reasoning_effort(self):
+        captured = {}
+
+        class FakeResponses:
+            def create(self, **kwargs):
+                captured.update(kwargs)
+                usage = unittest.mock.Mock(input_tokens=1, output_tokens=1)
+                return unittest.mock.Mock(output_text="ok", usage=usage)
+
+        class FakeClient:
+            responses = FakeResponses()
+
+        with unittest.mock.patch.object(self.mod, "require_package", return_value=lambda: FakeClient()):
+            self.mod.generate_text_with_usage("hi", "openai", "gpt-5.5", reasoning=4)
+        self.assertEqual(captured["reasoning"], {"effort": "high"})
+
+    def test_openai_omits_reasoning_when_unset(self):
+        captured = {}
+
+        class FakeResponses:
+            def create(self, **kwargs):
+                captured.update(kwargs)
+                return unittest.mock.Mock(output_text="ok", usage=unittest.mock.Mock(input_tokens=1, output_tokens=1))
+
+        class FakeClient:
+            responses = FakeResponses()
+
+        with unittest.mock.patch.object(self.mod, "require_package", return_value=lambda: FakeClient()):
+            self.mod.generate_text_with_usage("hi", "openai", "gpt-5.5")
+        self.assertNotIn("reasoning", captured)
+
+    def test_anthropic_applies_effort(self):
+        captured = {}
+
+        class FakeMessages:
+            def create(self, **kwargs):
+                captured.update(kwargs)
+                return unittest.mock.Mock(content=[], usage=None)
+
+        class FakeClient:
+            def __init__(self):
+                self.messages = FakeMessages()
+
+        fake_anthropic = unittest.mock.Mock(Anthropic=FakeClient)
+        with unittest.mock.patch.object(self.mod, "require_package", return_value=fake_anthropic):
+            self.mod.generate_text_with_usage("hi", "anthropic", "claude-fable-5", reasoning=5)
+        self.assertEqual(captured["output_config"], {"effort": "max"})
+
+    def test_google_applies_thinking_budget(self):
+        captured = {}
+
+        class FakeModels:
+            def generate_content(self, **kwargs):
+                captured.update(kwargs)
+                return unittest.mock.Mock(text="ok", usage_metadata=None)
+
+        class FakeClient:
+            models = FakeModels()
+
+        fake_genai = unittest.mock.Mock(Client=lambda api_key: FakeClient())
+        with unittest.mock.patch.object(self.mod, "require_package", return_value=fake_genai), \
+            unittest.mock.patch.dict(os.environ, {"GEMINI_API_KEY": "k"}, clear=False):
+            self.mod.generate_text_with_usage("hi", "google", "gemini-2.5-flash", reasoning=3)
+        self.assertEqual(captured["config"].thinking_config.thinking_budget, 8192)
+
+    def test_together_passes_reasoning_effort_passthrough(self):
+        captured = {}
+
+        def make_chunk(content=None, usage=None):
+            choices = [unittest.mock.Mock(delta=unittest.mock.Mock(content=content))] if content is not None else []
+            return unittest.mock.Mock(choices=choices, usage=usage)
+
+        class FakeCompletions:
+            def create(self, **kwargs):
+                captured.update(kwargs)
+                usage = type("U", (), {"prompt_tokens": 1, "completion_tokens": 1})()
+                return iter([make_chunk(content="ok"), make_chunk(usage=usage)])
+
+        class FakeChat:
+            completions = FakeCompletions()
+
+        class FakeClient:
+            chat = FakeChat()
+
+        with unittest.mock.patch.object(self.mod, "require_package", return_value=lambda **k: FakeClient()), \
+            unittest.mock.patch.dict(os.environ, {"TOGETHER_API_KEY": "k"}, clear=False):
+            self.mod.generate_text_with_usage("hi", "together", "Qwen/Qwen3.7-Plus", reasoning="low")
+        self.assertEqual(captured["extra_body"], {"reasoning_effort": "low"})
+
     def test_list_providers_catalog(self):
         catalog = self.mod.list_providers()
         names = [entry["provider"] for entry in catalog]
@@ -3298,8 +3447,9 @@ class NagentLlmConfigTests(unittest.TestCase):
         mod = load_nagent_llm_text_module()
         captured: dict = {}
 
-        def fake_generate(message, provider, model, cache_boundaries=None):
+        def fake_generate(message, provider, model, cache_boundaries=None, reasoning=None):
             captured["cache_boundaries"] = cache_boundaries
+            captured["reasoning"] = reasoning
             return unittest.mock.Mock(text="ok", input_tokens=1, output_tokens=1)
 
         with tempfile.TemporaryDirectory() as tmp:

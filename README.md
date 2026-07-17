@@ -951,9 +951,28 @@ Config: CLI flags → `NAGENT_CONFIG` → project `.nagent/config.json` →
   "checkpoint_interval_minutes": 60,
   "checkpoint_max_new_kb": 256,
   "rebuild_at_kb": 384,
-  "context_window_tokens": 0
+  "context_window_tokens": 0,
+  "reasoning": 3
 }
 ```
+
+`reasoning` sets how hard the model thinks. Give it an **integer 1–5** (a
+portable "N/5" dial, clamped to range) and nagent maps it to the active
+provider's native control; or give it a **provider-specific string** (e.g.
+`"xhigh"`, `"minimal"`) which is passed through verbatim. Omit it for the
+model's default. `--reasoning` overrides the config per run, and `nagent
+--status` prints the provider-native name the level resolved to.
+
+| `reasoning` | `anthropic` (`effort`) | `openai` (`effort`) | `google` (`thinking_budget`) | `together` / `cursor` / `claude-code` |
+| ----------- | ---------------------- | ------------------- | ---------------------------- | ------------------------------------- |
+| `1`         | `low`                  | `minimal`           | `0` (off)                    | — (reasoning is intrinsic;            |
+| `2`         | `medium`               | `low`               | `4096`                       | set a provider-specific string        |
+| `3`         | `high`                 | `medium`            | `8192`                       | such as `"low"` to force it)          |
+| `4`         | `xhigh`                | `high`              | `16384`                      |                                       |
+| `5`         | `max`                  | `high`              | `-1` (dynamic)               |                                       |
+
+A model that doesn't support a level (e.g. `xhigh` on an older Anthropic
+model) will reject the request — the provider error surfaces as-is.
 
 The conversation is rebuilt (compacted to initial context + checkpoint + recent
 tail) when **either** trigger fires first: the byte ceiling `rebuild_at_kb`, or

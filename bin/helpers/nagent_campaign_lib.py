@@ -112,6 +112,24 @@ def find_node(index: dict, item_id: str) -> dict | None:
     return None
 
 
+def resolve_item_refs(index: dict, refs: list[str], label: str) -> list[str]:
+    """Normalise and validate references to existing items.
+
+    `add` reports each new id as "item:<id>", so callers routinely pass that
+    printed form straight back; accept it and store the bare id. An unresolved
+    reference is rejected rather than stored, because a dangling ref is not
+    inert — it blocks its item forever while still rendering as a normal
+    dependency in `status`.
+    """
+    resolved = []
+    for ref in refs:
+        item_id = ref[len("item:"):] if ref.startswith("item:") else ref
+        if find_node(index, item_id) is None:
+            raise KeyError(f"{label} item not found: {ref}")
+        resolved.append(item_id)
+    return resolved
+
+
 def tree_depth(nodes: list) -> int:
     depth = 0
     for _node, node_depth, _siblings in walk_items(nodes):
@@ -176,7 +194,7 @@ def add_item(
     item_id = next_item_id(index, description)
     node = {"id": item_id, "status": "todo"}
     if blocked_by:
-        node["blocked_by"] = list(blocked_by)
+        node["blocked_by"] = resolve_item_refs(index, blocked_by, "blocked_by")
     if parent is not None:
         parent_node = find_node(index, parent)
         if parent_node is None:
