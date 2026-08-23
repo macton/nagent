@@ -679,6 +679,14 @@ class ActionTests(unittest.TestCase):
         self.assertIn("hello-nagent", result)
         self.assertIn("exit_code: 0", result)
 
+    def test_execute_shell_handles_non_utf8_output(self):
+        result = self.mod.execute_shell(
+            "python3 -c \"import sys; sys.stdout.buffer.write(b'\\xff\\xfe')\""
+        )
+        self.assertIn("<nagent-shell-result>", result)
+        self.assertIn("exit_code: 0", result)
+        self.assertIn("\ufffd", result)
+
     def test_shell_output_precedes_next_input_in_either_order(self):
         # A turn with both <nagent-shell> and <nagent-next> must record the
         # shell output in the conversation BEFORE the next-prompt, so the next

@@ -1431,6 +1431,8 @@ def execute_shell(commands: str, token_stats: TokenStats | None = None) -> str:
             shell=True,
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
         )
     stdout = result.stdout.rstrip("\n")
     stderr = result.stderr.rstrip("\n")
@@ -1453,7 +1455,14 @@ def run_hook(command: str, label: str, path: str | None = None) -> str:
     its exit code and output so the model sees the failure rather than guessing.
     """
     with wait_spinner(f"Running {label}"):
-        result = subprocess.run(command, shell=True, capture_output=True, text=True)
+        result = subprocess.run(
+            command,
+            shell=True,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        )
     stdout = result.stdout.rstrip("\n")
     stderr = result.stderr.rstrip("\n")
     attrs = f' exit_code="{result.returncode}"'
