@@ -2986,6 +2986,72 @@ class NagentLlmConfigTests(unittest.TestCase):
         self.assertEqual(captured["url"], f"{self.mod.TOGETHER_BASE_URL}/models")
         self.assertEqual(captured["auth"], "Bearer test-key")
 
+    def test_openrouter_streams_chat_completions_and_preserves_usage(self):
+        captured = {}
+
+        def make_chunk(content=None, usage=None):
+            choices = []
+            if content is not None:
+                choices = [unittest.mock.Mock(delta=unittest.mock.Mock(content=content))]
+            return unittest.mock.Mock(choices=choices, usage=usage)
+
+        class FakeCompletions:
+            def create(self, **kwargs):
+                captured.update(kwargs)
+                usage = type("FakeUsage", (), {"prompt_tokens": 11, "completion_tokens": 3})()
+                return iter([
+                    make_chunk(content="openrouter "),
+                    make_chunk(content="ok"),
+                    make_chunk(content=None, usage=usage),
+                ])
+
+        class FakeChat:
+            completions = FakeCompletions()
+
+        class FakeClient:
+            chat = FakeChat()
+
+        def fake_openai(**kwargs):
+            captured["client_kwargs"] = kwargs
+            return FakeClient()
+
+        with unittest.mock.patch.object(self.mod, "require_package", return_value=fake_openai), \
+            unittest.mock.patch.dict(os.environ, {"OPENROUTER_API_KEY": "test-key"}, clear=False):
+            result = self.mod.generate_text_with_usage("hello openrouter", "openrouter", "stealth/ox-alpha")
+
+        self.assertEqual(result.text, "openrouter ok")
+        self.assertEqual(result.input_tokens, 11)
+        self.assertEqual(result.output_tokens, 3)
+        self.assertEqual(captured["model"], "stealth/ox-alpha")
+        self.assertEqual(captured["messages"], [{"role": "user", "content": "hello openrouter"}])
+        self.assertTrue(captured["stream"])
+        self.assertEqual(captured["stream_options"], {"include_usage": True})
+        self.assertEqual(captured["client_kwargs"]["base_url"], self.mod.OPENROUTER_BASE_URL)
+        self.assertEqual(captured["client_kwargs"]["api_key"], "test-key")
+
+    def test_list_models_openrouter_parses_data_envelope(self):
+        import contextlib
+        import io
+
+        payload = json.dumps(
+            {"data": [{"id": "stealth/ox-alpha"}, {"id": "openai/gpt-5.1"}]}
+        ).encode("utf-8")
+
+        @contextlib.contextmanager
+        def fake_urlopen(request):
+            captured["url"] = request.full_url
+            captured["auth"] = request.headers.get("Authorization")
+            yield io.BytesIO(payload)
+
+        captured = {}
+        with unittest.mock.patch("urllib.request.urlopen", fake_urlopen), \
+            unittest.mock.patch.dict(os.environ, {"OPENROUTER_API_KEY": "test-key"}, clear=False):
+            models = self.mod.list_models("openrouter")
+
+        self.assertEqual(models, ["openai/gpt-5.1", "stealth/ox-alpha"])
+        self.assertEqual(captured["url"], f"{self.mod.OPENROUTER_BASE_URL}/models")
+        self.assertEqual(captured["auth"], "Bearer test-key")
+
     def test_model_context_window_known_and_unknown(self):
         # Verified against the Together API; the V4-Pro value was confirmed by
         # a context_length_exceeded error from the provider.
@@ -3127,6 +3193,8 @@ class NagentLlmConfigTests(unittest.TestCase):
         self.assertEqual(by_name["google"]["aliases"], ["gemini"])
         self.assertEqual(by_name["together"]["default_model"], self.mod.DEFAULT_MODELS["together"])
         self.assertEqual(by_name["together"]["credentials"], ["TOGETHER_API_KEY"])
+        self.assertEqual(by_name["openrouter"]["default_model"], "stealth/ox-alpha")
+        self.assertEqual(by_name["openrouter"]["credentials"], ["OPENROUTER_API_KEY"])
         # claude-code manages its own login: empty credential list.
         self.assertEqual(by_name["claude-code"]["credentials"], [])
 
@@ -3135,10 +3203,20 @@ class NagentLlmConfigTests(unittest.TestCase):
         self.assertEqual(provider, "together")
         self.assertEqual(model, self.mod.DEFAULT_MODELS["together"])
 
+    def test_openrouter_resolves_with_default_model(self):
+        provider, model = self.mod.resolve_settings(provider="openrouter")
+        self.assertEqual(provider, "openrouter")
+        self.assertEqual(model, "stealth/ox-alpha")
+
     def test_together_upload_rejects_non_image(self):
         with tempfile.NamedTemporaryFile(suffix=".pdf") as handle:
             with self.assertRaises(ValueError):
                 self.mod._together_upload(Path(handle.name), "summarize", "some-model")
+
+    def test_openrouter_upload_rejects_non_image(self):
+        with tempfile.NamedTemporaryFile(suffix=".pdf") as handle:
+            with self.assertRaises(ValueError):
+                self.mod._openrouter_upload(Path(handle.name), "summarize", "stealth/ox-alpha")
 
     def test_gemini_usage_counts_are_preserved(self):
         class FakeModels:

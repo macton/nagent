@@ -1,0 +1,272 @@
+#!/usr/bin/env python3
+"""Wait quietly for a result marker, process death, or a timeout."""
+
+from __future__ import annotations
+
+import argparse
+import math
+import os
+import re
+import sys
+import time
+from pathlib import Path
+
+
+EXIT_PROCESS_DIED = 2
+EXIT_TIMEOUT = 3
+EXIT_READ_ERROR = 74
+EXIT_INTERRUPTED = 130
+MAX_SELECTED_LINES = 100
+MAX_LINE_CHARS = 4096
+SAFE_FAILURE_RE = re.compile(
+    r"^rc=([+-]?\d+)\s+([A-Za-z0-9._-]+)(?:\s|$)",
+    flags=re.ASCII,
+)
+
+
+def nonnegative_int(value: str) -> int:
+    result = int(value)
+    if result < 0:
+        raise argparse.ArgumentTypeError("must be nonnegative")
+    return result
+
+
+def nonnegative_float(value: str) -> float:
+    result = float(value)
+    if not math.isfinite(result) or result < 0:
+        raise argparse.ArgumentTypeError("must be finite and nonnegative")
+    return result
+
+
+def positive_float(value: str) -> float:
+    result = float(value)
+    if not math.isfinite(result) or result <= 0:
+        raise argparse.ArgumentTypeError("must be finite and positive")
+    return result
+
+
+def positive_int(value: str) -> int:
+    result = int(value)
+    if result <= 0:
+        raise argparse.ArgumentTypeError("must be positive")
+    return result
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Wait without progress output until a result marker, process death, or timeout."
+    )
+    parser.add_argument("--file", type=Path, required=True, help="result file to watch")
+    parser.add_argument("--marker", required=True, help="completion marker to find")
+    parser.add_argument("--pid", type=positive_int, help="producer process ID to watch")
+    parser.add_argument(
+        "--timeout",
+        type=nonnegative_float,
+        default=0.0,
+        help="maximum seconds to wait; 0 waits indefinitely (default: 0)",
+    )
+    parser.add_argument(
+        "--interval",
+        type=positive_float,
+        default=30.0,
+        help="poll interval in seconds (default: 30)",
+    )
+    parser.add_argument(
+        "--tail-lines",
+        type=nonnegative_int,
+        default=3,
+        help="final result lines to print (default: 3)",
+    )
+    parser.add_argument(
+        "--nonmatch-prefix",
+        help="also print nonblank lines that do not start with this prefix",
+    )
+    parser.add_argument(
+        "--failure-log-dir",
+        type=Path,
+        help="directory containing NAME.log files for nonzero rc lines",
+    )
+    parser.add_argument(
+        "--failure-tail-lines",
+        type=nonnegative_int,
+        default=40,
+        help="lines to print from each failure log (default: 40)",
+    )
+    args = parser.parse_args()
+    if not args.marker:
+        parser.error("--marker must not be empty")
+    if args.failure_log_dir is not None and args.nonmatch_prefix is None:
+        parser.error("--failure-log-dir requires --nonmatch-prefix")
+    return args
+
+
+def read_result(path: Path) -> str | None:
+    try:
+        return path.read_text(encoding="utf-8", errors="replace")
+    except FileNotFoundError:
+        return None
+
+
+def process_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def clipped(line: str) -> str:
+    if len(line) <= MAX_LINE_CHARS:
+        return line
+    return line[:MAX_LINE_CHARS] + " [line truncated]"
+
+
+def print_lines(lines: list[str]) -> None:
+    for line in lines:
+        print(clipped(line))
+
+
+def tail_lines(text: str | None, count: int) -> list[str]:
+    if text is None or count == 0:
+        return []
+    return text.splitlines()[-count:]
+
+
+def print_partial(text: str | None, tail_count: int) -> None:
+    print("=== partial result ===")
+    print_lines(tail_lines(text, tail_count))
+
+
+def selected_nonmatches(
+    lines: list[str],
+    prefix: str,
+    marker: str,
+    tail_start: int,
+) -> tuple[list[str], bool]:
+    selected: list[str] = []
+    truncated = False
+    for index, line in enumerate(lines):
+        if index >= tail_start or not line or marker in line or line.startswith(prefix):
+            continue
+        if len(selected) == MAX_SELECTED_LINES:
+            truncated = True
+            break
+        selected.append(line)
+    return selected, truncated
+
+
+def failure_names(lines: list[str]) -> list[str]:
+    names: list[str] = []
+    seen: set[str] = set()
+    for line in lines:
+        match = SAFE_FAILURE_RE.match(line)
+        if match is None or int(match.group(1)) == 0:
+            continue
+        name = match.group(2)
+        if name not in seen:
+            seen.add(name)
+            names.append(name)
+    return names
+
+
+def print_failure_logs(directory: Path, names: list[str], tail_count: int) -> None:
+    for name in names:
+        path = directory / f"{name}.log"
+        try:
+            text = path.read_text(encoding="utf-8", errors="replace")
+        except FileNotFoundError:
+            continue
+        except OSError as exc:
+            print(f"warning: cannot read failure log {path}: {exc}", file=sys.stderr)
+            continue
+        print(f"=== failure: {clipped(name)} ===")
+        print_lines(tail_lines(text, tail_count))
+
+
+def print_success(text: str, args: argparse.Namespace) -> None:
+    lines = text.splitlines()
+    tail_start = max(0, len(lines) - args.tail_lines)
+    print("=== result ===")
+    print_lines(lines[tail_start:])
+    if args.nonmatch_prefix is None:
+        return
+    selected, truncated = selected_nonmatches(
+        lines,
+        args.nonmatch_prefix,
+        args.marker,
+        tail_start,
+    )
+    print("=== non-matching lines ===")
+    print_lines(selected)
+    if truncated:
+        print(f"[non-matching lines truncated after {MAX_SELECTED_LINES}]")
+    if args.failure_log_dir is not None:
+        print_failure_logs(
+            args.failure_log_dir,
+            failure_names(selected),
+            args.failure_tail_lines,
+        )
+
+
+def final_read(path: Path) -> tuple[str | None, int | None]:
+    try:
+        return read_result(path), None
+    except OSError as exc:
+        print(f"error: cannot read result file {path}: {exc}", file=sys.stderr)
+        return None, EXIT_READ_ERROR
+
+
+def main() -> int:
+    args = parse_args()
+    start = time.monotonic()
+    try:
+        while True:
+            text, error = final_read(args.file)
+            if error is not None:
+                return error
+            if text is not None and args.marker in text:
+                print_success(text, args)
+                return 0
+
+            if args.pid is not None and not process_alive(args.pid):
+                text, error = final_read(args.file)
+                if error is not None:
+                    return error
+                if text is not None and args.marker in text:
+                    print_success(text, args)
+                    return 0
+                print_partial(text, args.tail_lines)
+                print(
+                    f"error: process {args.pid} exited before marker {args.marker!r}",
+                    file=sys.stderr,
+                )
+                return EXIT_PROCESS_DIED
+
+            elapsed = time.monotonic() - start
+            if args.timeout and elapsed >= args.timeout:
+                text, error = final_read(args.file)
+                if error is not None:
+                    return error
+                if text is not None and args.marker in text:
+                    print_success(text, args)
+                    return 0
+                print_partial(text, args.tail_lines)
+                print(
+                    f"error: timed out after {args.timeout:g}s waiting for marker {args.marker!r}",
+                    file=sys.stderr,
+                )
+                return EXIT_TIMEOUT
+
+            sleep_for = args.interval
+            if args.timeout:
+                sleep_for = min(sleep_for, max(0.0, args.timeout - elapsed))
+            time.sleep(sleep_for)
+    except KeyboardInterrupt:
+        print("error: interrupted", file=sys.stderr)
+        return EXIT_INTERRUPTED
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

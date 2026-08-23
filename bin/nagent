@@ -1695,6 +1695,54 @@ def load_safety_settings(config_path: Path | None) -> dict:
     return settings
 
 
+def complete_literal_blocks(source: str, name: str) -> list[str]:
+    """Return complete literal <name>...</name> blocks in source order."""
+    open_tag = f"<{name}>"
+    close_tag = f"</{name}>"
+    blocks: list[str] = []
+    search_at = 0
+    while True:
+        start = source.find(open_tag, search_at)
+        if start == -1:
+            return blocks
+        end = source.find(close_tag, start + len(open_tag))
+        if end == -1:
+            search_at = start + len(open_tag)
+            continue
+        end += len(close_tag)
+        blocks.append(source[start:end])
+        search_at = end
+
+
+def remove_complete_literal_blocks(source: str, name: str) -> str:
+    open_tag = f"<{name}>"
+    close_tag = f"</{name}>"
+    parts: list[str] = []
+    search_at = 0
+    while True:
+        start = source.find(open_tag, search_at)
+        if start == -1:
+            parts.append(source[search_at:])
+            return "".join(parts)
+        end = source.find(close_tag, start + len(open_tag))
+        if end == -1:
+            parts.append(source[search_at:])
+            return "".join(parts)
+        parts.append(source[search_at:start])
+        search_at = end + len(close_tag)
+
+
+def unique_blocks_in_source_order(blocks: list[str]) -> list[str]:
+    seen: set[str] = set()
+    unique: list[str] = []
+    for block in blocks:
+        if block in seen:
+            continue
+        seen.add(block)
+        unique.append(block)
+    return unique
+
+
 def checkpoint_path(conversation_file: Path) -> Path:
     return conversation_file.with_name(conversation_file.name + ".checkpoint.md")
 
@@ -1842,13 +1890,17 @@ def rebuild_conversation(
 
     initial_context = content[span[0] : span[1]]
     body = content[span[1] :]
-    tail = body[-tail_chars:]
+    preserved_prompts = unique_blocks_in_source_order(complete_literal_blocks(body, "user-prompt"))
+    tail_body = remove_complete_literal_blocks(body, "user-prompt") if preserved_prompts else body
+    tail = tail_body[-tail_chars:]
     newline_at = tail.find("\n")
-    if len(tail) < len(body) and newline_at != -1:
+    if len(tail) < len(tail_body) and newline_at != -1:
         tail = tail[newline_at + 1 :]  # start the tail on a whole line
 
     archived = archive_conversation(conversation_file)
     parts = [initial_context, ""]
+    if preserved_prompts:
+        parts += preserved_prompts + [""]
     checkpoint_note = ""
     if checkpoint_text:
         parts += ["{checkpoint}", checkpoint_text, "{/checkpoint}", ""]
@@ -2508,6 +2560,7 @@ def edit_conversation(
 
     archived_content = archived.read_text(encoding="utf-8")
     preserved_context = extract_block(archived_content, INITIAL_CONTEXT_BLOCK)
+    original_prompts = complete_literal_blocks(archived_content, "user-prompt")
     if preserved_context is not None:
         stripped = remove_first_block(archived_content, INITIAL_CONTEXT_BLOCK).lstrip("\n")
         archived.write_text(stripped, encoding="utf-8")
@@ -2560,8 +2613,19 @@ def edit_conversation(
         )
 
     edited_body = archived.read_text(encoding="utf-8").lstrip("\n")
-    if preserved_context is not None:
+    edited_body = remove_complete_literal_blocks(edited_body, "user-prompt").lstrip("\n")
+    if preserved_context is not None and original_prompts:
+        archived.write_text(
+            "\n\n".join([preserved_context, *original_prompts, edited_body]).rstrip("\n") + "\n",
+            encoding="utf-8",
+        )
+    elif preserved_context is not None:
         archived.write_text(f"{preserved_context}\n\n{edited_body}", encoding="utf-8")
+    elif original_prompts:
+        archived.write_text(
+            "\n\n".join([*original_prompts, edited_body]).rstrip("\n") + "\n",
+            encoding="utf-8",
+        )
 
     loaded_archive = load_conversation(conversation_file, archived)
     ensure_initial_context(

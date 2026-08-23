@@ -10,12 +10,13 @@ from pathlib import Path
 
 from nagent_cli import git_toplevel
 
-PROVIDERS = ("openai", "anthropic", "google", "gemini", "cursor", "claude-code", "together")
+PROVIDERS = ("openai", "anthropic", "google", "gemini", "cursor", "claude-code", "together", "openrouter")
 PROVIDER_ALIASES = {"gemini": "google"}
 
-# Together exposes an OpenAI-wire-compatible API (chat completions + /v1/models),
-# so the "together" provider reuses the openai SDK pointed at this base URL.
+# Together and OpenRouter expose OpenAI-wire-compatible APIs (chat completions
+# + /v1/models), so those providers reuse the openai SDK pointed at their base URLs.
 TOGETHER_BASE_URL = "https://api.together.ai/v1"
+OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
 
 # For the claude-code provider, "default" means Claude Code's own configured
 # model: the SDK is invoked with model=None and Claude Code decides.
@@ -28,6 +29,7 @@ DEFAULT_MODELS = {
     "cursor": "composer-2.5",
     "claude-code": CLAUDE_CODE_DEFAULT_MODEL,
     "together": "meta-llama/Llama-3.3-70B-Instruct-Turbo",
+    "openrouter": "stealth/ox-alpha",
 }
 
 # An empty tuple means the provider manages its own credentials; claude-code
@@ -39,6 +41,7 @@ CREDENTIAL_ENV = {
     "cursor": ("CURSOR_API_KEY",),
     "claude-code": (),
     "together": ("TOGETHER_API_KEY",),
+    "openrouter": ("OPENROUTER_API_KEY",),
 }
 
 # Maximum input context window, in tokens, for models whose limit we have
@@ -81,6 +84,7 @@ PACKAGE_HINTS = {
     "cursor": "cursor-sdk",
     "claude-code": "claude-agent-sdk",
     "together": "openai",
+    "openrouter": "openai",
 }
 
 
@@ -146,6 +150,7 @@ REASONING_LEVELS = {
     "openai":      ["minimal", "low", "medium", "high", "high"],
     "google":      [0, 4096, 8192, 16384, -1],
     "together":    [None, None, None, None, None],
+    "openrouter":  [None, None, None, None, None],
     "cursor":      [None, None, None, None, None],
     "claude-code": [None, None, None, None, None],
 }
@@ -286,8 +291,8 @@ def require_package(provider: str):
         except ImportError:
             _missing_package(provider)
         return OpenAI
-    if provider == "together":
-        # Together is OpenAI-wire-compatible; reuse the openai SDK.
+    if provider in ("together", "openrouter"):
+        # OpenAI-wire-compatible providers; reuse the openai SDK.
         try:
             from openai import OpenAI
         except ImportError:
@@ -336,17 +341,26 @@ def _missing_package(provider: str) -> None:
     sys.exit(1)
 
 
+def _openai_compatible_client(provider: str, api_key_env: str, base_url: str):
+    OpenAI = require_package(provider)
+    return OpenAI(api_key=os.environ[api_key_env], base_url=base_url)
+
+
 def _together_client():
-    OpenAI = require_package("together")
-    return OpenAI(api_key=os.environ["TOGETHER_API_KEY"], base_url=TOGETHER_BASE_URL)
+    return _openai_compatible_client("together", "TOGETHER_API_KEY", TOGETHER_BASE_URL)
 
 
-def _together_chat(client, model, messages, reasoning=None):
-    """One Together chat completion, always streamed. Some Together models
-    (e.g. Qwen/Qwen3.7-Plus) ONLY support streaming and reject a non-streamed
-    request; streaming is universal for Together chat models, so always
-    streaming is safe for the rest too. Accumulates the delta text and returns
-    (text, usage); usage arrives in the final chunk via include_usage.
+def _openrouter_client():
+    return _openai_compatible_client("openrouter", "OPENROUTER_API_KEY", OPENROUTER_BASE_URL)
+
+
+def _openai_compatible_chat(client, model, messages, reasoning=None):
+    """One OpenAI-compatible chat completion, always streamed. Some providers'
+    models (e.g. Together Qwen/Qwen3.7-Plus) ONLY support streaming and reject
+    a non-streamed request; streaming is accepted by OpenRouter and the other
+    compatible chat models used here. Accumulates delta text and returns
+    (text, usage); usage arrives in the final chunk via include_usage when the
+    provider supports it.
 
     reasoning, when set, is sent as the OpenAI-compatible reasoning_effort."""
     parts: list[str] = []
@@ -368,6 +382,32 @@ def _together_chat(client, model, messages, reasoning=None):
             if content:
                 parts.append(content)
     return "".join(parts), usage
+
+
+def _together_chat(client, model, messages, reasoning=None):
+    return _openai_compatible_chat(client, model, messages, reasoning=reasoning)
+
+
+def _openrouter_chat(client, model, messages, reasoning=None):
+    return _openai_compatible_chat(client, model, messages, reasoning=reasoning)
+
+def _openai_compatible_list_models(url: str, api_key: str) -> list[str]:
+    # Together returns a top-level JSON array; OpenRouter returns
+    # {"data": [...]}. Accept both shapes and ignore malformed entries.
+    import urllib.request
+
+    request = urllib.request.Request(
+        url,
+        headers={"Authorization": f"Bearer {api_key}"},
+    )
+    with urllib.request.urlopen(request) as response:
+        payload = json.loads(response.read().decode("utf-8"))
+    items = payload.get("data", []) if isinstance(payload, dict) else payload
+    return sorted(
+        {item["id"] for item in items if isinstance(item, dict) and item.get("id")}
+    )
+
+
 
 
 def add_llm_arguments(parser) -> None:
@@ -415,21 +455,15 @@ def list_models(provider: str) -> list[str]:
         return sorted({model.id for model in client.models.list()})
 
     if provider == "together":
-        # Together's /v1/models returns a bare JSON array, not OpenAI's
-        # {"data": [...]} envelope, so the openai SDK's models.list() (which
-        # expects the envelope) raises on it. Fetch and parse the array
-        # directly. The dict-with-"data" fallback covers the envelope shape.
-        import urllib.request
-
-        request = urllib.request.Request(
+        return _openai_compatible_list_models(
             f"{TOGETHER_BASE_URL}/models",
-            headers={"Authorization": f"Bearer {os.environ['TOGETHER_API_KEY']}"},
+            os.environ["TOGETHER_API_KEY"],
         )
-        with urllib.request.urlopen(request) as response:
-            payload = json.loads(response.read().decode("utf-8"))
-        items = payload.get("data", []) if isinstance(payload, dict) else payload
-        return sorted(
-            {item["id"] for item in items if isinstance(item, dict) and item.get("id")}
+
+    if provider == "openrouter":
+        return _openai_compatible_list_models(
+            f"{OPENROUTER_BASE_URL}/models",
+            os.environ["OPENROUTER_API_KEY"],
         )
 
     if provider == "anthropic":
@@ -708,6 +742,14 @@ def generate_text_with_usage(
         text, usage = _together_chat(client, model, [{"role": "user", "content": message}], reasoning=native)
         return _result_with_usage(text, usage, message)
 
+    if provider == "openrouter":
+        # OpenRouter implements the chat completions API, not the OpenAI
+        # Responses API. cache_boundaries is ignored: OpenRouter has no
+        # nagent-supported block-cache API.
+        client = _openrouter_client()
+        text, usage = _openrouter_chat(client, model, [{"role": "user", "content": message}], reasoning=native)
+        return _result_with_usage(text, usage, message)
+
     if provider == "claude-code":
         return _claude_code_generate(message, model)
 
@@ -741,6 +783,8 @@ def generate_with_upload_usage(path: Path, prompt: str, provider: str, model: st
         return _google_upload(path, prompt, model)
     if provider == "together":
         return _together_upload(path, prompt, model)
+    if provider == "openrouter":
+        return _openrouter_upload(path, prompt, model)
     if provider == "cursor":
         return LlmResult(text=_cursor_upload(path, prompt, model))
     if provider == "claude-code":
@@ -857,22 +901,28 @@ def _google_upload(path: Path, prompt: str, model: str) -> LlmResult:
     return _result_with_usage(response.text or "", getattr(response, "usage_metadata", None), prompt)
 
 
-def _together_upload(path: Path, prompt: str, model: str) -> LlmResult:
-    # Together is a remote OpenAI-compatible API with no local-file read. Its
-    # vision models accept images as a base64 data URL via chat completions;
-    # non-image documents have no equivalent, so reject them explicitly.
+def _openai_compatible_upload(
+    path: Path,
+    prompt: str,
+    model: str,
+    provider_label: str,
+    client,
+    chat,
+) -> LlmResult:
+    # Remote OpenAI-compatible APIs cannot read local files. Vision models
+    # accept images as a base64 data URL via chat completions; non-image
+    # documents have no equivalent, so reject them explicitly.
     mime_type = _mime_type(path)
     if not _is_image_mime(mime_type):
         raise ValueError(
-            f"together provider supports image upload only; cannot upload "
+            f"{provider_label} provider supports image upload only; cannot upload "
             f"{mime_type} file {path.name}."
         )
     import base64
 
     data = base64.b64encode(path.read_bytes()).decode("ascii")
     data_url = f"data:{mime_type};base64,{data}"
-    client = _together_client()
-    text, usage = _together_chat(
+    text, usage = chat(
         client,
         model,
         [
@@ -886,6 +936,28 @@ def _together_upload(path: Path, prompt: str, model: str) -> LlmResult:
         ],
     )
     return _result_with_usage(text, usage, prompt)
+
+
+def _together_upload(path: Path, prompt: str, model: str) -> LlmResult:
+    return _openai_compatible_upload(
+        path,
+        prompt,
+        model,
+        "together",
+        _together_client(),
+        _together_chat,
+    )
+
+
+def _openrouter_upload(path: Path, prompt: str, model: str) -> LlmResult:
+    return _openai_compatible_upload(
+        path,
+        prompt,
+        model,
+        "openrouter",
+        _openrouter_client(),
+        _openrouter_chat,
+    )
 
 
 def _cursor_upload(path: Path, prompt: str, model: str) -> str:
