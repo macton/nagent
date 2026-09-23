@@ -51,6 +51,14 @@ from nagent_file_edit_lib import (
     same_file,
 )
 from nagent_file_patch_lib import apply_segment_patches
+from nagent_message_lib import (
+    drain_messages,
+    inbox_dir,
+    pending_message_paths,
+    remove_runfile,
+    runfile_path,
+    write_runfile,
+)
 from nagent_file_split_lib import slugify
 from nagent_distill_lib import digest_path, file_knowledge_path, knowledge_item_counts, root_size_bytes
 from nagent_campaign_lib import campaign_status_lines
@@ -1997,6 +2005,7 @@ def run_agent_loop(
     nagent_path = Path(__file__).resolve()
     user_responses: list[str] = []
     token_stats = token_stats or TokenStats()
+    inbox = inbox_dir(conversation_file)
 
     if file_edit_path is None:
         # Make this instance's scratch dir exist up front so the model can write
@@ -2010,6 +2019,13 @@ def run_agent_loop(
         append_to_conversation(conversation_file, f"<user-prompt>\n{initial_prompt}\n</user-prompt>")
 
     while True:
+        for message in drain_messages(inbox):
+            # Queued from another terminal while this run was mid-turn (see
+            # nagent-message). Delivered in the same shape as a typed prompt,
+            # so rebuild_conversation preserves it across a context rebuild.
+            append_to_conversation(
+                conversation_file, f"<user-prompt>\n{message}\n</user-prompt>"
+            )
         if hook_per_run:
             # Fresh ground-truth status at the top of every turn, before the
             # model speaks — so the next response is grounded in measured state
@@ -2120,6 +2136,11 @@ def run_agent_loop(
             continue
 
         if should_continue:
+            continue
+
+        if pending_message_paths(inbox):
+            # A message landed while this turn ran: answer it now instead of
+            # leaving it for the next invocation.
             continue
 
         return 0, user_responses
@@ -3306,6 +3327,12 @@ def main() -> int:
         # Unknown stays 0, so the byte threshold remains the sole trigger.
         safety_settings["context_window_tokens"] = model_context_window(llm.model) or 0
     token_stats = TokenStats()
+    # Publish liveness as data for nagent-message, for a user-invoked run only:
+    # sub-conversations and file-edit children would make "which instance did
+    # you mean" ambiguous exactly when the answer should be the one you started.
+    runfile = runfile_path(conversation_file) if user_direct_mode else None
+    if runfile is not None:
+        write_runfile(runfile)
     try:
         exit_code, responses = run_agent_loop(
             conversation_file,
@@ -3326,6 +3353,9 @@ def main() -> int:
         record_interrupt(conversation_file)
         print(INTERRUPTED_MESSAGE)
         return 130
+    finally:
+        if runfile is not None:
+            remove_runfile(runfile)
     if args.json:
         payload = {
             "exit_code": exit_code,

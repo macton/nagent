@@ -62,6 +62,10 @@ Thin wrappers live in `bin/`; real logic lives in `bin/helpers/*_lib.py`.
   git-history context.
 - `bin/nagent-file-split` / `-patch` / `-summarize` + their `_lib.py` — large-file
   handling (split → bounded edit → patch).
+- `bin/nagent-message` + `nagent_message_lib.py` — queue messages for a conversation
+  that is mid-run. Spools one file per message into `{name}.inbox/`; the loop drains
+  it at the top of every turn and appends each as `<user-prompt>`. A user-invoked run
+  publishes `{name}.run` (host, pid, started, cwd) so the tool can find it.
 
 ### The structured-tag protocol
 
@@ -82,6 +86,10 @@ correction turns appended to the conversation. If you add or change a tag, updat
   via `default_conversation_name()` / `default_pid()`.
 - `conversations/file-index-{pid}.json` — maps stable file ids (`device:inode` from
   `file_id_for_path()`, not paths) to per-file conversations, so renames survive.
+- `conversations/{name}.inbox/` — spooled messages awaiting delivery; drained into
+  the conversation as `<user-prompt>` blocks at the top of each turn.
+- `conversations/{name}.run` — liveness runfile for a user-invoked instance, removed
+  on exit. Stale (killed) and foreign-host runfiles are detected, not trusted.
 - `config.json` — provider/model defaults (overridable by `NAGENT_CONFIG` env var
   and then by CLI flags, in that precedence order).
 - `context.yaml` / `context.md` — root context injected into every conversation;

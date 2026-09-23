@@ -1,0 +1,273 @@
+#!/usr/bin/python3
+
+import argparse
+import re
+import subprocess
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+
+HELPERS_DIR = Path(__file__).resolve().parent / "helpers"
+sys.path.insert(0, str(HELPERS_DIR))
+from nagent_cli import emit_json, exit_on_description, resolve_default_root
+from nagent_message_lib import (
+    STATE_RUNNING,
+    conversation_instances,
+    inbox_dir,
+    pending_message_paths,
+    read_runfile,
+    runfile_path,
+    runfile_state,
+)
+
+NAGENT_STATUS_DESCRIPTION = """\
+Report what a nagent conversation is actually doing, from evidence.
+nagent-message --list answers liveness and queue depth only; this tool reads
+the sources that carry substance: the runfile (pid, started, cwd, liveness),
+the conversation file (latest turn number and token totals, last-activity
+time, a tail of the most recent lines), the instance's live child processes,
+and the inbox depth. With no argument it summarizes every instance that has
+a runfile or queued mail; with a conversation name it prints the full
+report. Read this before reporting on a worker; never describe a worker
+from liveness alone."""
+
+# The conversation driver appends one of these after every turn:
+#   <nagent-turn-status utc="..." turn="N" tokens_in_total="..." tokens_out_total="..." />
+# The last one in the file is the authoritative "where is this conversation" record.
+TURN_STATUS_OPEN = "<nagent-turn-status "
+ATTR_RE = re.compile(r'([a-z_]+)="([^"]*)"')
+
+# Conversation files grow to megabytes; every fact this tool needs from one
+# (the last turn-status line, the tail) lives at the end. Read one window.
+TAIL_WINDOW_BYTES = 256 * 1024
+
+
+def resolve_conversation_file(conversations: Path, name: str) -> Path:
+    """Mirrors nagent-message: a bare name is a file in the conversations
+    directory; anything with a separator is a path (campaign item
+    conversations are addressed that way)."""
+    reference = Path(name).expanduser()
+    if reference.is_absolute() or reference.parent != Path("."):
+        return reference
+    return conversations / name
+
+
+def read_tail_window(path: Path, window: int = TAIL_WINDOW_BYTES):
+    """The last `window` bytes as text, aligned to a line start.
+
+    Returns (text, file_size, truncated). Unreadable file: (None, 0, False) --
+    the caller reports the absence rather than dying."""
+    try:
+        size = path.stat().st_size
+        with path.open("rb") as handle:
+            truncated = size > window
+            if truncated:
+                handle.seek(size - window)
+            data = handle.read()
+    except OSError:
+        return None, 0, False
+    text = data.decode("utf-8", errors="replace")
+    if truncated:
+        text = text.split("\n", 1)[-1]
+    return text, size, truncated
+
+
+def last_turn_status(text: str) -> dict | None:
+    """Attributes of the final turn-status line in the window, or None when
+    the window holds no turn-status line."""
+    start = text.rfind(TURN_STATUS_OPEN)
+    if start < 0:
+        return None
+    end = text.find(">", start)
+    tag = text[start : end if end > 0 else len(text)]
+    return dict(ATTR_RE.findall(tag)) or None
+
+
+def child_process_lines(pid) -> list[str]:
+    """One line per live child (pid, etime, command), from ps.
+
+    Children are the direct evidence of what a running instance is executing
+    right now. Empty is a real state: the instance is between shell commands.
+    ps exits 1 when nothing matches; any other failure also reports empty --
+    a status report must not die because ps did."""
+    if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
+        return []
+    try:
+        result = subprocess.run(
+            ["ps", "--ppid", str(pid), "-o", "pid=,etime=,args="],
+            capture_output=True,
+            text=True,
+        )
+    except Exception:
+        return []
+    return [line.strip() for line in result.stdout.splitlines() if line.strip()]
+
+
+def format_age(seconds: float) -> str:
+    seconds = max(seconds, 0)
+    if seconds < 120:
+        return f"{int(seconds)}s"
+    if seconds < 7200:
+        return f"{int(seconds // 60)}m"
+    return f"{seconds / 3600:.1f}h"
+
+
+def activity_fields(path: Path, now: datetime) -> tuple[str | None, str | None]:
+    """(iso mtime, age string) for a conversation file, or (None, None)."""
+    try:
+        mtime = datetime.fromtimestamp(path.stat().st_mtime, timezone.utc)
+    except OSError:
+        return None, None
+    return mtime.isoformat(), format_age((now - mtime).total_seconds())
+
+
+def gather_report(conversations: Path, name: str, tail_lines: int) -> dict | None:
+    conversation_file = resolve_conversation_file(conversations, name)
+    if not conversation_file.is_file():
+        return None
+    payload = read_runfile(runfile_path(conversation_file))
+    state = "not-running" if payload is None else runfile_state(payload)
+    payload = payload or {}
+    text, size, truncated = read_tail_window(conversation_file)
+    turn = last_turn_status(text) if text else None
+    last_activity, idle = activity_fields(conversation_file, datetime.now(timezone.utc))
+    pid = payload.get("pid")
+    children = child_process_lines(pid) if state == STATE_RUNNING else []
+    tail = text.splitlines()[-tail_lines:] if text and tail_lines else []
+    return {
+        "conversation": name,
+        "path": str(conversation_file),
+        "state": state,
+        "host": payload.get("host"),
+        "pid": pid,
+        "started": payload.get("started"),
+        "cwd": payload.get("cwd"),
+        "pending": len(pending_message_paths(inbox_dir(conversation_file))),
+        "size_bytes": size,
+        "last_activity": last_activity,
+        "idle": idle,
+        "turn_status": turn,
+        "children": children,
+        "tail": tail,
+        "window_truncated": truncated,
+    }
+
+
+def print_report(report: dict) -> None:
+    print(f"conversation: {report['conversation']}")
+    print(f"path: {report['path']} ({report['size_bytes']} bytes)")
+    line = f"state: {report['state']}"
+    if report["pid"] is not None:
+        line += f"  pid={report['pid']}  started={report['started']}  cwd={report['cwd']}"
+    print(line)
+    print(f"pending messages: {report['pending']}")
+    if report["last_activity"]:
+        print(
+            f"last activity: {report['last_activity']} "
+            f"({report['idle']} ago, conversation mtime)"
+        )
+    turn = report["turn_status"]
+    if turn:
+        print(
+            "last turn: "
+            f"turn={turn.get('turn')} utc={turn.get('utc')} "
+            f"tokens_in_total={turn.get('tokens_in_total')} "
+            f"tokens_out_total={turn.get('tokens_out_total')}"
+        )
+    else:
+        print(
+            "last turn: no turn-status line in the final "
+            f"{TAIL_WINDOW_BYTES // 1024}KB of the conversation"
+        )
+    if report["state"] == STATE_RUNNING:
+        if report["children"]:
+            print("children (what it is executing right now):")
+            for child in report["children"]:
+                print(f"  {child}")
+        else:
+            print("children: none (between shell commands)")
+    if report["tail"]:
+        print(f"tail ({len(report['tail'])} lines):")
+        for tail_line in report["tail"]:
+            print(f"  {tail_line}")
+
+
+def print_summary(rows: list[dict]) -> None:
+    if not rows:
+        print("no nagent instances with a runfile or queued messages")
+        return
+    for row in rows:
+        print(
+            f"{row['state']}\t{row['conversation']}\tpid={row['pid']}\t"
+            f"pending={row['pending']}\tturn={row.get('turn') or '?'}\t"
+            f"idle={row.get('idle') or '?'}\tcwd={row['cwd']}"
+        )
+
+
+def main() -> int:
+    exit_on_description(NAGENT_STATUS_DESCRIPTION)
+
+    parser = argparse.ArgumentParser(
+        description=(
+            "Evidence-based status for nagent conversations: runfile liveness, "
+            "latest turn and token totals, live child processes, inbox depth, "
+            "and the conversation tail."
+        ),
+    )
+    parser.add_argument(
+        "conversation",
+        nargs="?",
+        help="Conversation name or path for a full report (default: summarize all instances).",
+    )
+    parser.add_argument(
+        "--root",
+        help=(
+            "Root directory for conversations (default: {git-toplevel}/.nagent "
+            "inside a git repo, else ~/.nagent)."
+        ),
+    )
+    parser.add_argument(
+        "--tail",
+        type=int,
+        default=40,
+        help="Lines of conversation tail in the full report; 0 disables (default: 40).",
+    )
+    parser.add_argument("--json", action="store_true", help="Print results as JSON.")
+    args = parser.parse_args()
+
+    if args.tail < 0:
+        print("Error: --tail must be >= 0", file=sys.stderr)
+        return 1
+
+    root = resolve_default_root(args.root)
+    conversations = root / "conversations"
+
+    if args.conversation:
+        report = gather_report(conversations, args.conversation, args.tail)
+        if report is None:
+            missing = resolve_conversation_file(conversations, args.conversation)
+            print(f"Error: conversation not found: {missing}", file=sys.stderr)
+            return 1
+        if args.json:
+            emit_json(report)
+        else:
+            print_report(report)
+        return 0
+
+    rows = conversation_instances(conversations)
+    now = datetime.now(timezone.utc)
+    for row in rows:
+        path = Path(row["path"])
+        row["last_activity"], row["idle"] = activity_fields(path, now)
+        text, _, _ = read_tail_window(path)
+        status = last_turn_status(text) if text else None
+        row["turn"] = status.get("turn") if status else None
+    if args.json:
+        emit_json({"instances": rows})
+    else:
+        print_summary(rows)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

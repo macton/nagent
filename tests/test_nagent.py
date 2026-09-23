@@ -19,6 +19,7 @@ NAGENT_FILE_SPLIT = BIN / "nagent-file-split"
 NAGENT_FILE_PATCH = BIN / "nagent-file-patch"
 NAGENT_FILE_EDIT = BIN / "nagent-file-edit"
 NAGENT_FILE_SUMMARIZE = BIN / "nagent-file-summarize"
+NAGENT_MESSAGE = BIN / "nagent-message"
 BIN_TOOLS = (
     NAGENT,
     NAGENT_LLM_TEXT,
@@ -27,6 +28,7 @@ BIN_TOOLS = (
     NAGENT_FILE_PATCH,
     NAGENT_FILE_EDIT,
     NAGENT_FILE_SUMMARIZE,
+    NAGENT_MESSAGE,
 )
 
 

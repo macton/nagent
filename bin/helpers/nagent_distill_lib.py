@@ -179,6 +179,12 @@ def scan_root(root: Path) -> list[Artifact]:
             if name.startswith("file-index-") or name.startswith("index-saved-conversations-"):
                 artifacts.append(Artifact(path, "index", "live", "index file", size, name))
                 continue
+            if name.endswith(".run"):
+                # Liveness runfile from a user-invoked instance (see
+                # nagent_message_lib), not a conversation. Its owner removes it
+                # on exit and rewrites it on the next run.
+                artifacts.append(Artifact(path, "index", "live", "instance runfile", size, name))
+                continue
             if str(path.resolve()) in saved_paths:
                 artifacts.append(Artifact(path, "conversation", "user-kept", "saved conversation", size, name))
                 continue

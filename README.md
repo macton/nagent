@@ -380,6 +380,54 @@ nagent --compact
 nagent --edit-conversation "keep the decisions and remove obsolete logs"
 ```
 
+**Talking to a run in progress** — A conversation that is mid-turn is not
+reading the terminal. Its state is still a file, though, so the message does
+not need the terminal. `nagent-message "text"` spools the message into
+`{name}.inbox/` beside the conversation; the loop drains that directory at the
+top of every turn and appends each message as a `<user-prompt>` — the same
+shape a typed prompt has, so it survives a context rebuild like any other one.
+A message that lands while the final turn is running extends the run rather
+than waiting for the next invocation.
+
+The producer never writes the conversation file. The running loop
+read-modify-writes that path (context refresh, checkpoint, rebuild), so an
+outside append could be silently overwritten; a spool directory has no such
+window. One file per message, written under a temp name and `rename()`d into
+place, is atomic — no locks on either side, and arrival order is filename
+order.
+
+Liveness is data too. A user-invoked run writes `{name}.run` (host, pid,
+started, cwd) and removes it on exit, so `nagent-message` can target the single
+running instance with no argument. A runfile left behind by a kill reads as
+`stale` rather than as a live target, and one written on another host reads as
+`unknown` rather than testing an unrelated local pid. Zero running instances,
+or more than one, is an error that names the alternatives instead of guessing
+where your message should go.
+
+```bash
+nagent-message --list
+nagent-message "stop after the current file and summarize what changed"
+nagent-message --conversation test-runner "also run the split tests"
+```
+
+**Reading a run's actual state** — `nagent-message --list` answers only
+"alive, and how much mail is queued". What a conversation is doing is also
+data on disk: the driver appends a `<nagent-turn-status>` line after every
+turn, the runfile names the pid, and the pid's children are the commands it
+is executing right now. `nagent-status` reads those sources and reports them:
+with no argument, one summary line per instance (state, pid, pending, latest
+turn, idle time); with a conversation name, the full report — liveness,
+latest turn and token totals, live child processes, inbox depth, and a tail
+of the conversation. It reads only the final 256KB of the conversation file,
+so a multi-megabyte worker log costs the same as a small one. Report on a
+worker from this evidence, not from liveness alone.
+
+```bash
+nagent-status
+nagent-status monitor-github-20260823-120635
+nagent-status test-runner --tail 80 --json
+```
+
 **Build your own:** memory is a data structure on disk. Give the user the
 same rights over it that they have over any other file, because it is one —
 and put it at the scope where it belongs.

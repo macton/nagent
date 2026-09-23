@@ -1,0 +1,186 @@
+#!/usr/bin/python3
+
+import argparse
+import sys
+from pathlib import Path
+
+HELPERS_DIR = Path(__file__).resolve().parent / "helpers"
+sys.path.insert(0, str(HELPERS_DIR))
+from nagent_cli import emit_json, exit_on_description, resolve_default_root
+from nagent_message_lib import (
+    STATE_RUNNING,
+    conversation_instances,
+    enqueue_messages,
+    inbox_dir,
+    pending_message_paths,
+    read_runfile,
+    runfile_path,
+    runfile_state,
+)
+
+NAGENT_MESSAGE_DESCRIPTION = """\
+Queue a message for a nagent conversation that is busy or not at a prompt.
+Use to add an instruction, correction, or fact to a run already in progress:
+the message is spooled to the conversation's inbox and delivered as a
+<user-prompt> at the top of its next turn, without interrupting the current
+one. With no --conversation it targets the single running instance. --list
+shows instances with a runfile or queued mail, their liveness, and queue
+depth. A message queued for a conversation that is not running waits for its
+next invocation. --list reports liveness and queue depth only; for what a
+conversation is actually doing, use nagent-status."""
+
+
+def resolve_message_text(text_args: list[str]) -> str | None:
+    """CLI words, or stdin when the last word is '-' or nothing was piped in a
+    pipeline. Mirrors how nagent itself reads a prompt."""
+    if text_args and text_args[-1] == "-":
+        piped = sys.stdin.read()
+        leading = " ".join(text_args[:-1])
+        if leading and piped:
+            return f"{leading}\n{piped}"
+        return leading or piped or None
+    if text_args:
+        return " ".join(text_args)
+    if sys.stdin.isatty():
+        return None
+    return sys.stdin.read() or None
+
+
+def resolve_conversation_file(conversations: Path, name: str) -> Path:
+    """A bare name is a file in the conversations directory; anything with a
+    separator is a path, which is how campaign item conversations are named."""
+    reference = Path(name).expanduser()
+    if reference.is_absolute() or reference.parent != Path("."):
+        return reference
+    return conversations / name
+
+
+def format_row(row: dict) -> str:
+    return (
+        f"{row['state']}\t{row['conversation']}\tpid={row['pid']}\t"
+        f"pending={row['pending']}\tstarted={row['started']}\tcwd={row['cwd']}"
+    )
+
+
+def print_instances(rows: list[dict], *, json_mode: bool) -> None:
+    if json_mode:
+        emit_json({"instances": rows})
+        return
+    if not rows:
+        print("no nagent instances with a runfile or queued messages")
+        return
+    for row in rows:
+        print(format_row(row))
+
+
+def select_target(rows: list[dict]) -> tuple[dict | None, str | None]:
+    """Exactly one running instance is the common case and needs no argument.
+    Zero and many are errors, not guesses: a message delivered to the wrong
+    conversation is worse than one that was refused."""
+    running = [row for row in rows if row["state"] == STATE_RUNNING]
+    if len(running) == 1:
+        return running[0], None
+    if not running:
+        return None, (
+            "no running nagent instance found; "
+            "use --conversation NAME to queue for a specific conversation "
+            "(nagent-message --list)"
+        )
+    names = ", ".join(row["conversation"] for row in running)
+    return None, f"{len(running)} running nagent instances; use --conversation NAME: {names}"
+
+
+def main() -> int:
+    exit_on_description(NAGENT_MESSAGE_DESCRIPTION)
+
+    parser = argparse.ArgumentParser(
+        description=(
+            "Queue a message for a nagent conversation; it is delivered as a "
+            "<user-prompt> at the top of that conversation's next turn."
+        ),
+    )
+    parser.add_argument(
+        "text",
+        nargs="*",
+        help="Message text. Use trailing '-' to read stdin until EOF.",
+    )
+    parser.add_argument(
+        "--conversation",
+        help="Target conversation name or path (default: the single running instance).",
+    )
+    parser.add_argument(
+        "--root",
+        help=(
+            "Root directory for conversations (default: {git-toplevel}/.nagent "
+            "inside a git repo, else ~/.nagent)."
+        ),
+    )
+    parser.add_argument(
+        "--list",
+        action="store_true",
+        help="List instances with a runfile or queued messages, and exit.",
+    )
+    parser.add_argument("--json", action="store_true", help="Print results as JSON.")
+    args = parser.parse_args()
+
+    root = resolve_default_root(args.root)
+    conversations = root / "conversations"
+    rows = conversation_instances(conversations)
+
+    if args.list:
+        print_instances(rows, json_mode=args.json)
+        return 0
+
+    if args.conversation:
+        conversation_file = resolve_conversation_file(conversations, args.conversation)
+        if not conversation_file.is_file():
+            print(f"Error: conversation not found: {conversation_file}", file=sys.stderr)
+            return 1
+        payload = read_runfile(runfile_path(conversation_file))
+        state = "not-running" if payload is None else runfile_state(payload)
+        name = args.conversation
+    else:
+        target, error = select_target(rows)
+        if target is None:
+            print(f"Error: {error}", file=sys.stderr)
+            if not args.json and rows:
+                print_instances(rows, json_mode=False)
+            return 1
+        conversation_file = Path(target["path"])
+        state = target["state"]
+        name = target["conversation"]
+
+    text = resolve_message_text(args.text)
+    if text is None or not text.strip():
+        print("Error: message text is empty", file=sys.stderr)
+        return 1
+
+    inbox = inbox_dir(conversation_file)
+    written = enqueue_messages(inbox, [text])
+    pending = len(pending_message_paths(inbox))
+
+    if args.json:
+        emit_json(
+            {
+                "conversation": name,
+                "conversation_path": str(conversation_file),
+                "state": state,
+                "queued": [str(path) for path in written],
+                "pending": pending,
+            }
+        )
+        return 0
+
+    for path in written:
+        print(f"queued:{path}")
+    print(f"conversation:{name} state:{state} pending:{pending}")
+    if state != STATE_RUNNING:
+        print(
+            f"note: {name} is {state}; the message is delivered on its next run",
+            file=sys.stderr,
+        )
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
