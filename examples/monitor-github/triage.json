@@ -1,0 +1,59 @@
+{
+  "context": [
+    "§3 Blocked means something outside this cycle's reach: an unanswered question, art that does not exist, a decision that is the user's to make. Say which. Anything else - large, unfamiliar, tedious, touches the hot path, needs a new harness - is work, not a block.",
+    "§3 'This needs more than one cycle' is not a reason to move past an item. It is a description of the work. Multi-cycle items are normal - #88 took fourteen. #103 (drag-to-reassign) and #110 (the crew-name relay) were both passed over for being 'multi-cycle jobs with written specs' - which is the exact case for starting them, since a written spec means there is nothing left to decide.",
+    "§3 Also read the comment thread of anything carried as blocked: Matt answers clarification issues in place, and an answer that arrived since the note was written turns blocked work back into actionable work.",
+    "§1a A staging lane cannot prove anything that needs the display, the GPU, or a real client - the gate owns those. Scheduling a client-driving issue into a staging slot spends the cycle on code reading and proves nothing: #176 ('moving the cursor quickly while firing') went to staging on 2026-08-26 and came back with two correctly-attributed dead ends and zero new measurements, because its proof was never anything the staging lane could run. Give client-driving work to the lane that is about to gate, and keep headless, source-level or server-only items for the staging slot."
+  ],
+  "constraints": [
+    "Size, unfamiliarity, tedium, hot-path risk and 'needs a new harness' are work, never blocks.",
+    "A written spec means there is nothing left to decide, so it is work.",
+    "The lane answer follows what the item's PROOF needs, not what its fix touches."
+  ],
+  "questions": {
+    "state": {
+      "question": "Is this item work this cycle can start, or is it blocked on something outside the cycle's reach?",
+      "type": "choice",
+      "options": {
+        "work": "everything the cycle can start now, however large or unfamiliar",
+        "blocked-question": "waiting on an unanswered question that must go to Matt",
+        "blocked-art": "waiting on art that does not exist",
+        "blocked-user-decision": "waiting on a decision that is the user's to make"
+      }
+    },
+    "lane": {
+      "question": "Which lane can actually run this item's proof?",
+      "type": "choice",
+      "options": {
+        "gate": "the lane about to gate; owns the display, the GPU and real clients",
+        "staging": "headless, source-level or server-only work only"
+      }
+    }
+  },
+  "items": [
+    {
+      "id": "#103",
+      "context": "drag-to-reassign for crew. S22 specifies the interaction end to end: press-hold on a crew chip, drag to a station node, release to commit, with the snap radius given in WU. Estimated at three to four cycles. Proof needs a real drag against a running client."
+    },
+    {
+      "id": "#110",
+      "context": "crew-name relay: names entered on one client do not reach the other. S14 specifies the wire field and the truncation rule. Reproduces headless against two server-side sessions; no rendering involved."
+    },
+    {
+      "id": "#211",
+      "context": "Matt's report: the WORK screen's station labels should use the ordinal names from S19, but S19 lists only five of the eight stations and does not say what the other three are called. Nothing in documents/design/ names them. The label text cannot be written until he says what they are."
+    },
+    {
+      "id": "#176",
+      "context": "moving the cursor quickly while firing drops shots. Needs two clients and the display to reproduce: the shot is issued from the client's aim state at input time."
+    },
+    {
+      "id": "#238",
+      "context": "the damaged-hull overlay for size-class 3 frames renders the size-class 2 sheet. The correct sheet has never been authored - there is no PNG for it in assets/, and the manifest has no entry. The code path is a one-line lookup once the asset exists."
+    },
+    {
+      "id": "#241",
+      "context": "sim_shields.cpp recomputes the facing table every tick for every ship; it is the hottest loop in the sim and there is no harness that measures it yet. A fix means writing a Tracy-instrumented pin first, then restructuring the table. Large, in the hot path, unfamiliar. Measurable entirely server-side."
+    }
+  ]
+}

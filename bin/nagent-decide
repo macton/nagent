@@ -1,0 +1,152 @@
+#!/usr/bin/python3
+
+import argparse
+import sys
+from pathlib import Path
+
+HELPERS_DIR = Path(__file__).resolve().parent / "helpers"
+sys.path.insert(0, str(HELPERS_DIR))
+from nagent_llm import (
+    add_llm_arguments,
+    generate_text_with_usage,
+    reasoning_value_from_args,
+    resolve_from_args,
+)
+from nagent_cli import emit_json, exit_on_description
+from nagent_decide_lib import (
+    EXIT_BAD_REQUEST,
+    EXIT_OK,
+    EXIT_PROVIDER,
+    MAX_ATTEMPTS,
+    DecideError,
+    decide,
+    load_request,
+    render_prompt,
+)
+
+NAGENT_DECIDE_DESCRIPTION = """\
+Make constrained decisions: JSON request in, JSON answers out, every answer drawn
+from a closed set the caller declares. Read a decision JSON on stdin (or --input)
+holding the evidence, the constraints, and the questions; each question is
+choice (pick one), multi (pick some), or score (rate every option on an ordered
+scale) and MUST list its options. Optional "items" apply the same questions to a
+batch, sending the shared evidence once. Each answer carries a one-line reason
+and a self-reported confidence; set "rationale" or "confidence" to false in the
+request to drop either and pay fewer output tokens.
+Prefer this over reasoning a decision out in the conversation: it costs one
+bounded call instead of a turn over the whole conversation, and an answer
+outside the declared options is rejected rather than accepted. Use nagent itself for open-ended work whose answers cannot
+be enumerated up front."""
+
+EXAMPLE = """\
+Example request (stdin):
+
+{
+  "context": "#176 needs two clients and a display to prove anything.",
+  "constraints": [
+    "A staging lane has no display, no GPU and no real client."
+  ],
+  "questions": {
+    "lane": {
+      "question": "Which lane should this item be scheduled into?",
+      "type": "choice",
+      "options": {
+        "gate": "the lane about to run the gate; owns display, GPU and clients",
+        "staging": "headless, source-level or server-only work only"
+      }
+    }
+  },
+  "items": [
+    {"id": "#176", "context": "moving the cursor quickly while firing drops shots"}
+  ]
+}
+"""
+
+
+def main() -> int:
+    exit_on_description(NAGENT_DECIDE_DESCRIPTION)
+
+    parser = argparse.ArgumentParser(
+        description=(
+            "Constrained decisions over a closed answer set. Reads a decision request "
+            "as JSON and prints the answers as JSON."
+        ),
+        epilog=EXAMPLE,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument(
+        "--input",
+        help="Path to the request JSON (default: stdin).",
+    )
+    parser.add_argument(
+        "--prompt-out",
+        help="Also write the rendered prompt here, so the generator's input is inspectable.",
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Validate the request and print the rendered prompt; make no LLM call.",
+    )
+    parser.add_argument(
+        "--attempts",
+        type=int,
+        default=MAX_ATTEMPTS,
+        help=f"Tries allowed before giving up on an unusable reply (default: {MAX_ATTEMPTS}).",
+    )
+    add_llm_arguments(parser)
+    args = parser.parse_args()
+
+    if args.attempts < 1:
+        print("Error: --attempts must be >= 1", file=sys.stderr)
+        return EXIT_BAD_REQUEST
+
+    if args.input:
+        path = Path(args.input).expanduser()
+        if not path.is_file():
+            print(f"Error: file not found: {path}", file=sys.stderr)
+            return EXIT_PROVIDER
+        source = path.read_text(encoding="utf-8")
+    else:
+        source = sys.stdin.read()
+
+    try:
+        request = load_request(source)
+    except DecideError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return exc.exit_code
+
+    # A batch of zero answers nothing and sends nothing: render no prompt, make no
+    # call, and say so in the same output shape as any other run.
+    empty_batch = not request["items"]
+    prompt = "" if empty_batch else render_prompt(request)[0]
+
+    if args.prompt_out:
+        Path(args.prompt_out).expanduser().write_text(prompt, encoding="utf-8")
+
+    if args.dry_run:
+        sys.stdout.write(prompt)
+        return EXIT_OK
+
+    provider, model = ("none", "none") if empty_batch else resolve_from_args(args)
+    reasoning = reasoning_value_from_args(args)
+
+    def generate(text, cache_boundaries):
+        return generate_text_with_usage(
+            text, provider, model, cache_boundaries=cache_boundaries, reasoning=reasoning
+        )
+
+    try:
+        result = decide(request, generate, max_attempts=args.attempts)
+    except DecideError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return exc.exit_code
+    except Exception as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return EXIT_PROVIDER
+
+    emit_json({"provider": provider, "model": model, **result})
+    return EXIT_OK
+
+
+if __name__ == "__main__":
+    sys.exit(main())

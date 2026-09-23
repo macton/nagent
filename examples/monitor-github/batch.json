@@ -1,0 +1,72 @@
+{
+  "context": [
+    "§3 The test is coupling, not similarity. Two issues belong in one cycle when solving them apart would mean doing the same work twice or would invalidate the other's measurements: they name the same surface (one panel, one screen, one control); they are owned by the same layout function, so one fix moves the other's numbers; proving one requires a validator that would also prove the other; one's fix re-pins the same validators the other would; one is Matt's own report of what an audit-derived issue describes (his wording wins, and implementing the audit's version alone leaves his issue open against the same surface).",
+    "§3 Two issues that merely sound alike, or share a subsystem without sharing geometry or a call path, are not a batch. Bundling those makes a cycle bigger and proves nothing extra.",
+    "§3 The sweep is the bottleneck. The gate is 72-90 minutes and the flock serialises it machine-wide. So coupled items MUST batch, and independent items on disjoint surfaces SHOULD. The limit is attribution, not size: batch as many items as you can attribute a red to from the failing validator alone. Where you cannot predict attribution, keep the batch smaller.",
+    "§3 Prefer items that share a FIXTURE, not merely a gate. When two candidates share a fixture, each one's pin becomes a control for the other's change at no cost. When they merely share a gate, all you save is wall clock.",
+    "§1a How much to put in one gate: a red gate with N commits has N suspects. Batch when the items are independent and each is individually proven; keep a behaviour change separate from a large mechanical move when you can.",
+    "§3 Recorded cases: #132 (the HUD's two chrome bands, from a design audit) was the same two bands as #182 and #183, Matt's own reports - implementing the audit alone would have shipped less than he asked for and left both his issues open. #129 could not be finished without #186: the WORK screen's resource column was anchored to the comms panel's live bottom edge, so a mode-dependent panel height moved it."
+  ],
+  "constraints": [
+    "The anchor is fixed and is not a candidate. Every answer is about joining THIS anchor's cycle.",
+    "Similarity is not coupling. Sharing a subsystem without sharing geometry or a call path is not coupling.",
+    "Answer 'no' when the only thing gained would be a bigger cycle."
+  ],
+  "questions": {
+    "batch": {
+      "question": "Should this candidate join the anchor's cycle?",
+      "type": "choice",
+      "options": {
+        "must": "coupled - solving them apart means doing the same work twice or invalidates the other's measurements",
+        "should": "independent, on a disjoint surface, and a red would still name its own owner - worth the amortised gate",
+        "no": "not coupled and not worth enlarging the cycle for"
+      }
+    },
+    "coupling": {
+      "question": "Which coupling tests does this candidate actually satisfy against the anchor?",
+      "type": "multi",
+      "options": {
+        "same-surface": "names the same panel, screen or control",
+        "same-layout-function": "owned by the same layout function, so one fix moves the other's numbers",
+        "shared-validator": "proving one requires a validator that would also prove the other",
+        "repins-same-validators": "one's fix re-pins the same validators the other would",
+        "matts-own-report": "one is Matt's own report of what an audit-derived issue describes",
+        "shared-fixture": "both drive the same test fixture, so each pin controls the other",
+        "none": "no coupling test fires"
+      },
+      "constraints": [
+        "Answer 'none' alone when nothing fires. Never pair 'none' with another option."
+      ]
+    },
+    "attribution": {
+      "question": "If the shared gate goes red, could this candidate's red be attributed from the failing validator alone?",
+      "type": "choice",
+      "options": {
+        "yes": "the surfaces are disjoint enough that a failing validator names its own owner",
+        "no": "a red here could belong to either change and would cost a bisect"
+      }
+    }
+  },
+  "items": [
+    {
+      "id": "#182",
+      "context": "ANCHOR is #132, an audit-derived issue covering the HUD's two chrome bands. Candidate #182 is Matt Yaney's own report about those same two HUD chrome bands; it additionally orders the resource readout and crew chips deleted and comms moved up."
+    },
+    {
+      "id": "#186",
+      "context": "ANCHOR is #129, the WORK screen's resource column position. Candidate #186 changes the comms panel height per mode. The resource column is anchored to the comms panel's live bottom edge."
+    },
+    {
+      "id": "#194",
+      "context": "ANCHOR is #193, the muzzle flash offset on the three-client fixture. Candidate #194 changes projectile spawn timing and is proven on that same three-client fixture. It shares no source file with #193, but like every commit it touches scripts/regress.sh for validator registration and scripts/step202_validate.py for the byte ratchet."
+    },
+    {
+      "id": "#207",
+      "context": "ANCHOR is #193, the muzzle flash offset on the three-client fixture. Candidate #207 is also in the renderer: it fixes a colour-ramp lookup on the damage overlay. Same subsystem, different file, different call path, different fixture, no shared validator."
+    },
+    {
+      "id": "#220",
+      "context": "ANCHOR is #129, the WORK screen's resource column position. Candidate #220 is a mechanical rename of 42 identifiers across the sim, touching no screen and no layout function. It is large but entirely mechanical and its own validators are the compile plus step-audit."
+    }
+  ]
+}

@@ -793,7 +793,112 @@ nagent --list-file-edits
 artifact's identity and scope write authority to it. Session memory = what
 happened today. Artifact memory = what we learned about this file.
 
-## 15. Campaigns: Plans as Operable Artifacts
+## 15. Decisions Are Lookups, Not Reasoning
+
+**Idea** — A decision whose answers you can list before asking is not
+reasoning work. It is a lookup against a closed set, and routing it through
+the conversation loop pays twice: the whole conversation goes to the model to
+produce one word, and nothing checks that the word came back in a usable form.
+
+`nagent-decide` is the constrained interface: a JSON request carrying the
+evidence, the constraints and — required — the options, and a JSON answer set
+where every value is a member of the set the caller declared. Three question
+types, because three is what the real decisions needed:
+
+| type | the answer |
+| --- | --- |
+| `choice` | exactly one option |
+| `multi` | one or more options |
+| `score` | every option rated on an ordered `levels` scale |
+
+There is no free-text answer, and that is the whole point. An answer outside
+the declared options is **rejected and retried**, never coerced to the nearest
+option: a wrong answer that looks valid is the one failure the tool exists to
+prevent.
+
+Each answer also carries a one-line `why` and a self-reported `confidence`.
+Both are requested fields — `"rationale": false` and `"confidence": false` drop
+them — and both are on by default, because an unexplained decision is
+unauditable and the caller who has measured their own case is the one who
+should trade that away. The output layout does not change either way: the keys
+are always present and are `null` when the request turned them off, so every
+consumer has one path. `confidence` is the model's own estimate, not a
+calibrated probability — `issues/0003` records that nothing has measured
+whether it separates right answers from wrong ones, so nothing should threshold
+on it yet.
+
+What they cost, measured on the same 34 decisions:
+
+| model | both on | both off | output tokens |
+| --- | --- | --- | --- |
+| `gpt-5.5` | 9,291 | 9,076 | 4,866 → 4,808 |
+| `gemini-2.5-flash` | 7,841 | 5,877 | 3,059 → 1,261 |
+
+So the lever is real but provider-shaped: **−59% output tokens on a
+non-reasoning model, −1% on a reasoning one**, where reasoning tokens dominate
+the output and two short fields are noise beside them. Accuracy was 34/34 in
+both bare runs; the `gemini` full run's single miss is one sample and is not
+evidence either way.
+
+**Where there is one, there are many.** `items` applies the same questions to
+a batch, so the shared evidence is sent once and every item comes back
+answered from one call. An empty `items` array is a legitimate request that
+answers nothing, makes no call, and costs nothing — which is the common case
+in a poller that found no work.
+
+**Example**
+
+```bash
+nagent-decide --input examples/monitor-github/triage.json
+nagent-decide --input examples/monitor-github/triage.json --dry-run   # inspect the prompt, call nothing
+```
+
+### Measured against the loop
+
+`examples/monitor-github/` breaks a real 18,000-line standing runbook into
+three decision requests — queue triage, batch selection, and the runbook's
+ambiguity test — with ground truth taken from rulings the runbook records for
+itself. `compare.py` runs both paths on **byte-identical evidence**: the
+`nagent` side is handed the exact prompt `nagent-decide` renders, so only the
+machinery differs. Tokens are the provider's own counts on both sides.
+
+On `openai` / `gpt-5.5`, 34 checks across the three requests:
+
+| path | input | output | total | correct |
+| --- | --- | --- | --- | --- |
+| `nagent-decide` | 4,425 | 4,866 | **9,291** | 34/34 |
+| `nagent`, same excerpted evidence | 23,908 | 2,571 | **26,479** | 34/34 |
+| `nagent`, carrying the whole runbook (10 of the 34) | 322,851 | 966 | **323,817** | 10/10 |
+
+Two separate results. Against the same excerpted evidence the loop costs
+**2.85x** — that is the loop's *floor*, measured with an empty conversation
+and one turn. Against what a real cycle actually carries, the same ten
+decisions cost **323,817 tokens instead of 1,885: 172x**. The evidence a
+decision needs is a few hundred words; the conversation that decision is
+sitting in is not.
+
+Accuracy did not pay for it. `google` / `gemini-2.5-flash` answers the same
+34 for **7,841** tokens at 33/34 — a decision this constrained runs on a cheap
+model.
+
+### The failure this prevents, measured
+
+The first run of the comparison scored `nagent` at **0/35**. It had decided
+every case correctly and answered `"gate — the lane about to gate; owns the
+display, the GPU and real clients"` — the option name with its description
+pasted on. Right decision, unusable form, and silent: every `== "gate"` a
+script makes returns false. `nagent-decide` rejected the same mistake and
+corrected it, which is why its first run shows `attempts=2`.
+
+Then the repo's own rule applied — when output is wrong, fix the generator,
+not the artifact. The prompt was listing options as `name — description`,
+so the fix was in the rendering: quote every option name. Retries went to
+zero, `nagent-decide` dropped from 22,548 tokens to 9,291, and `nagent`
+started complying too. The remaining difference is not that the loop cannot
+produce a usable answer. It is that nothing in the loop checks, and
+`nagent-decide` does.
+
+## 16. Campaigns: Plans as Operable Artifacts
 
 **Idea** — After everything else became a file, the model's sense of what to
 do next is the last hidden state: re-decided every turn, invisible,
@@ -880,7 +985,7 @@ being data.
 
 # Part VII — How This Differs From Frameworks
 
-## 16. Own the Inputs
+## 17. Own the Inputs
 
 **Idea** — Use a framework when it buys something concrete. The question to
 ask first is who owns the data.

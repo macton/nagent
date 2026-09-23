@@ -1,0 +1,28 @@
+{
+  "_note": "Ground truth for the monitor-github decision examples. Every expectation is taken from a ruling monitor-github.md records for itself, or follows directly from a rule it states. A value is a list when the runbook's own text admits more than one defensible answer; a question omitted for an item is one the evidence deliberately does not settle, and it is not scored. #220 expected \"no\" because §1a says to keep a behaviour change separate from a large mechanical move: the first run of this example answered \"no\" against an expectation of \"should\", the runbook rule was found to settle it, and the rule was added to the evidence rather than the answer being forced.",
+
+  "triage.json": {
+    "#103": {"state": "work", "lane": "gate"},
+    "#110": {"state": "work", "lane": "staging"},
+    "#211": {"state": "blocked-question"},
+    "#176": {"state": "work", "lane": "gate"},
+    "#238": {"state": "blocked-art"},
+    "#241": {"state": "work", "lane": "staging"}
+  },
+
+  "batch.json": {
+    "#182": {"batch": "must", "coupling_includes": ["matts-own-report"]},
+    "#186": {"batch": "must", "coupling_includes": ["same-layout-function"]},
+    "#194": {"batch": ["must", "should"], "coupling_includes": ["shared-fixture"]},
+    "#207": {"batch": "no", "coupling": ["none"]},
+    "#220": {"batch": "no", "coupling": ["none"]}
+  },
+
+  "clarify.json": {
+    "#724": {"verdict": "design-answers", "goes_to_matt": "no", "confidence_in_corpus": {"corpus-coverage": "settled"}},
+    "#731": {"verdict": "genuinely-underdetermined", "goes_to_matt": "yes", "confidence_in_corpus": {"corpus-coverage": "silent"}},
+    "#736": {"verdict": "convention-precedent", "goes_to_matt": "no"},
+    "#742": {"verdict": "departure-defect", "goes_to_matt": "no", "confidence_in_corpus": {"corpus-coverage": ["partial", "settled"]}},
+    "#749": {"verdict": "genuinely-underdetermined", "goes_to_matt": "yes", "confidence_in_corpus": {"corpus-coverage": ["silent", "partial"]}}
+  }
+}

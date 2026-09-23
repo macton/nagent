@@ -1072,6 +1072,27 @@ class ActionTests(unittest.TestCase):
         self.assertIn("Never rewrite your own conversation file while running", context)
         self.assertIn("the user may edit it between runs", context)
 
+    def test_build_initial_context_defers_enumerable_decisions_to_nagent_decide(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            context = self.mod.build_initial_context(
+                Path(tmp),
+                NAGENT.resolve(),
+                "user",
+                "conv",
+            )
+
+        self.assertIn("defer them to nagent-decide", context)
+        # The rule has to say WHY, or it reads as a preference and loses to habit:
+        # the conversation is not sent, and the answer's form is checked.
+        self.assertIn("closed set", context)
+        self.assertIn("not this whole conversation", context)
+        self.assertIn('"items" array', context)
+        # And it has to say where the boundary is, or it swallows real work.
+        self.assertIn("cannot be listed up front", context)
+        # nagent-decide is discovered as a bin/ tool, so its own description is
+        # present too -- the rule and the tool must not drift apart.
+        self.assertIn("nagent-decide", context)
+
     def test_resolve_initial_prompt_prefers_cli_prompt(self):
         with unittest.mock.patch.object(self.mod.sys, "stdin", io.StringIO("from stdin")):
             self.assertEqual(self.mod.resolve_initial_prompt("from cli"), "from cli")

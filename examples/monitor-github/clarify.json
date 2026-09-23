@@ -1,0 +1,70 @@
+{
+  "context": [
+    "§6 Before you decide anything is underdetermined, grep the design documents. The ship-graphic node picker sat recorded as 'blocked on Matt' across three cycles and he was asked the same question four times; the answer was in S29 the whole time, in five panel sections, plus two statements in S21. Three cycles of 'awaiting Matt' were three cycles of nobody re-reading the source.",
+    "§6 The design does not have to be SILENT for a Clarify to be wrong - read the quote as an answer. #724 was filed as 'Clarify: is a ship's hit area a circle, or the drawn outline of its frame?' Its own body quotes S08:139 - 'Hitbox shape is defined by frame.' The document it cites answers the question it asks. The failure has a signature: the Clarify quotes the sentence that answers it. When a filing quotes a spec line and then asks a question, read that line again as an answer before it goes to Matt.",
+    "§6 A choice the implementation made that no document authorises is not ambiguity. It is a departure, and the document wins. The test is one grep: search the specs for the thing the CODE assumed, not for the thing the issue is about. If the corpus is silent on it and states a requirement it violates, that is a defect with an answer rather than a question with two.",
+    "§6 The corpus can express a thing for one subject and not another: S17 gives DRONES a named HitboxRadius field, so a circular hitbox exists in the design - for the one thing that has one. Ships have no such field, so the ship circle is a departure rather than an unwritten convention.",
+    "§6 Distinguish a CONVENTION from a TRANSCRIPTION - only a convention is precedent. A value that appears once, copied from somewhere, is a transcription. A rule the corpus applies repeatedly is a convention and may be extended.",
+    "§6 When the design has no VALUE, look for its UNIT. §6 also says: search the design first, then guess, ship, and ask - a genuine gap is implemented with a stated guess, not parked."
+  ],
+  "constraints": [
+    "A quoted spec line that answers the question makes the filing a defect, not a Clarify.",
+    "Silence plus a violated requirement is a defect with an answer, not a question with two.",
+    "Only a rule the corpus applies repeatedly is precedent. A single copied value is not.",
+    "'genuinely-underdetermined' is reserved for gaps the corpus does not settle in any of the ways above."
+  ],
+  "questions": {
+    "verdict": {
+      "question": "What is this filing actually?",
+      "type": "choice",
+      "options": {
+        "design-answers": "the design already answers it outright; retitle off Clarify and implement",
+        "departure-defect": "the corpus is silent on what the code assumed and states a requirement the code violates; it is a defect with an answer",
+        "convention-precedent": "the corpus does not state this case but applies a rule repeatedly that settles it; extend the convention",
+        "genuinely-underdetermined": "the corpus does not settle it; guess, ship, and ask Matt one explicit question"
+      }
+    },
+    "goes_to_matt": {
+      "question": "Does this filing need to go to Matt as a blocking question?",
+      "type": "choice",
+      "options": {
+        "no": "it is answerable from the corpus; sending it costs a cycle and creates a false blocker",
+        "yes": "it must go to him as one explicit question, with the work shipped on a stated guess meanwhile"
+      }
+    },
+    "confidence_in_corpus": {
+      "question": "How completely does the design corpus settle this filing?",
+      "type": "score",
+      "options": [
+        "corpus-coverage"
+      ],
+      "levels": {
+        "silent": "nothing in the corpus touches it",
+        "partial": "the corpus constrains it but does not settle it",
+        "settled": "the corpus states the answer"
+      }
+    }
+  },
+  "items": [
+    {
+      "id": "#724",
+      "context": "Filed as 'Clarify: is a ship's hit area a circle, or the drawn outline of its frame?'. Its body quotes S08:139 - 'Hitbox shape is defined by frame.' The implementation uses a circle, taken from S13:24-28, a table headed 'WU Diameter' giving 60/90/140 by size class under 'Ship size in WU is the authoritative hitbox reference'. S08:25 states 'Projectiles must never visually hit empty space or pass through visible ship geometry.' S17:32 and S17:41 give drones a HitboxRadius: 15 WU. Ships have no such field. The frames are notched darts."
+    },
+    {
+      "id": "#731",
+      "context": "Filed as 'Clarify: what is the cooldown on the repair station?'. A grep of documents/design/ for 'repair' returns S11's description of the station's crew slot and its animation, and nothing about a cooldown. No other station's cooldown is stated anywhere in the corpus either. No requirement in the corpus is violated by any particular cooldown value."
+    },
+    {
+      "id": "#736",
+      "context": "Filed as 'Clarify: should the ammo readout use the abbreviated unit suffix?'. The corpus never mentions the ammo readout's suffix. It does state the abbreviated suffix for the fuel readout (S07), the shield readout (S07), the hull readout (S08) and the power readout (S09) - four separate readouts, same rule, stated each time."
+    },
+    {
+      "id": "#742",
+      "context": "Filed as 'Clarify: may a docked ship fire?'. The corpus never says whether docking suppresses weapons. The code lets a docked ship fire. S05:88 states 'While docked, a ship's systems are offline and under the station's control.' S05:91 lists weapons among a ship's systems. No document authorises firing while docked."
+    },
+    {
+      "id": "#749",
+      "context": "Filed as 'Clarify: what is the drone patrol radius?'. The corpus gives no radius for drone patrol. S17 gives drones a HitboxRadius: 15 WU and a PatrolSpeed in WU/s, so the corpus expresses drone distances in WU. No requirement is violated by any particular radius."
+    }
+  ]
+}
