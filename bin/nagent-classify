@@ -26,18 +26,28 @@ from nagent_classify_lib import (
 )
 
 NAGENT_CLASSIFY_DESCRIPTION = """\
-Classify a set of inputs into a closed set of categories: JSON in, JSON out.
-Read a request on stdin (or --input) holding "question" (the dimension being
-classified on), "categories" (the closed set, with optional descriptions),
-"inputs" (what to classify), and any shared "context" and "constraints". Every
-input comes back with its category, and the output also carries "buckets", the
-inverse index from each category to the inputs assigned to it — every declared
-category is present even when empty. Set "multi_label" to true when an input may
-belong to several categories. A category outside the declared set is rejected
-and retried, never accepted. The shared evidence is sent once for the whole
-input set, so this costs one bounded call rather than a turn over the whole
-conversation. Use nagent-decide when different questions apply to the same
-items; use this when one category set applies to many inputs."""
+Sort a set of inputs into a closed set of categories: JSON in, JSON out.
+Request on stdin or --input:
+
+{"question":    "the dimension you are classifying on",         // REQUIRED
+ "categories":  ["name", ...] | {"name": "description", ...},   // REQUIRED, >= 2
+ "inputs":      [{"id": "...", "text": <any JSON>}, ...],       // REQUIRED, [] is legal
+ "context":     <shared evidence; optional>,
+ "constraints": ["rule", ...],                                  // optional
+ "multi_label": false, "rationale": true, "confidence": true}   // optional
+
+Note the shapes: "categories" is a list of names or an object mapping name to
+description, never a list of objects; each input is {"id", "text"}. Returns
+{"classified": [{"input", "category", "categories", "confidence", "why"}, ...],
+"buckets": {"category": ["input id", ...]}} — one row per input in request order,
+plus the inverse index, in which every declared category is a key even when
+nothing was assigned to it. "category" holds the single assignment and is null
+when "multi_label" is true; "categories" is always the full assigned list.
+"question" is required because a set like {high, medium, low} does not say high
+WHAT. A category outside the declared set is rejected and retried, never
+accepted, and the shared context is sent once for the whole input set.
+Use nagent-decide when several different questions apply to the same items; use
+this when one category set applies to many inputs."""
 
 EXAMPLE = """\
 Example request (stdin):

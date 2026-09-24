@@ -193,6 +193,18 @@ class RequestValidationTests(unittest.TestCase):
             with self.assertRaisesRegex(ClassifyError, field):
                 validate_request(request(**{field: "yes"}))
 
+    def test_a_fenced_request_file_is_accepted(self):
+        fenced = "```json\n" + json.dumps(REQUEST) + "\n```\n"
+        self.assertEqual(len(load_request(fenced)["inputs"]), 2)
+
+    def test_a_non_object_request_file_is_rejected_as_a_request(self):
+        for text in ("not json at all", "[1, 2]", ""):
+            with self.subTest(text=text):
+                with self.assertRaises(ClassifyError) as caught:
+                    load_request(text)
+                self.assertEqual(caught.exception.exit_code, EXIT_BAD_REQUEST)
+                self.assertNotIn("reply:", str(caught.exception))
+
     def test_load_request_reports_bad_json_with_the_request_exit_code(self):
         with self.assertRaises(ClassifyError) as caught:
             load_request("{not json")

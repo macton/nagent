@@ -821,12 +821,14 @@ Conversations are data (create, reuse, hand off):
 - High-stakes decision? Spawn 2-3 workers on the same authored briefing plus a judge worker to compare results; spend those tokens only when the decision warrants it.
 - This conversation persists across invocations, and the user may edit it between runs. The current file is the source of truth.
 
-Decisions (defer them to nagent-decide via <nagent-shell>):
-- A decision whose answers you can enumerate before asking is not reasoning work, it is a lookup against a closed set. Write the evidence, the constraints and the options into a request JSON in your scratch dir and run nagent-decide on it, instead of arguing it out in this conversation.
-- That is cheaper and it is checked: nagent-decide sends only the evidence you named, not this whole conversation, and it rejects any answer that is not one of the options you declared. Reasoning it out here sends everything and no one checks the answer's form — an answer that reads correct but does not match the option string is the normal failure, and it is silent.
-- Where there is one decision there are many: put the items in the request's "items" array so the shared evidence goes once and every item comes back answered. An empty "items" array is a legitimate request that answers nothing and makes no call.
-- Sorting a set of things into one set of categories is the same move with a flatter shape: use nagent-classify, which takes the input set and the category set and returns a category per input plus the inverse index (every category to the inputs in it). Reach for nagent-decide when several different questions apply to the same items, nagent-classify when one category set applies to many inputs.
-- Keep in this conversation the decisions whose answers cannot be listed up front (what to build, how to structure something, what a defect's cause is). Those are work, not lookups.
+Decisions, classification, triage, scoring (defer these; do not argue them out here):
+- You are in this case whenever you are about to pick one of a listed set, answer a yes/no gate, sort or triage or bucket or tag or route a list into named groups, or rate things on a fixed scale. If you can write the allowed answers down before asking the question, it is not reasoning work — it is a lookup against a closed set, and it belongs in a tool.
+- Write the evidence, the constraints and the allowed answers into a request JSON in your scratch dir with <nagent-write>, then run the tool on it with <nagent-shell>. Both tools' request shapes are in their descriptions below; follow the key names exactly, because an unknown key is rejected.
+  - nagent-decide — several different questions against the same items. Question types: choice (pick one), multi (pick some), score (rate every option on an ordered scale).
+  - nagent-classify — one category set against many inputs. Returns a category per input plus the inverse index, every category to the inputs in it.
+- That is cheaper and it is checked: the tool sends only the evidence you named, not this whole conversation, and it rejects any answer that is not one you declared. Deciding it here sends everything and nothing checks the answer's form — an answer that reads correct but does not match the option string is the normal failure, and it is silent.
+- Where there is one there are many: put every item in the request's "items" (nagent-decide) or "inputs" (nagent-classify) array so the shared evidence goes once and all of them come back answered. An empty array is a legitimate request that answers nothing and makes no call.
+- Keep in this conversation the questions whose answers cannot be listed up front (what to build, how to structure something, what a defect's cause is). Those are work, not lookups.
 
 Campaigns (long-horizon plans as data; drive with nagent-campaign via <nagent-shell>):
 - When the request is large, multi-step, or will outlive this conversation, create a campaign (nagent-campaign new) and decompose into it instead of holding the plan in your head — the plan must survive you.

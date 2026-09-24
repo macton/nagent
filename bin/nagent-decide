@@ -25,20 +25,32 @@ from nagent_decide_lib import (
 )
 
 NAGENT_DECIDE_DESCRIPTION = """\
-Make constrained decisions: JSON request in, JSON answers out, every answer drawn
-from a closed set the caller declares. Read a decision JSON on stdin (or --input)
-holding the evidence, the constraints, and the questions; each question is
-choice (pick one), multi (pick some), or score (rate every option on an ordered
-scale) and MUST list its options. Optional "items" apply the same questions to a
-batch, sending the shared evidence once. Each answer carries a one-line reason
-and a self-reported confidence; set "rationale" or "confidence" to false in the
-request to drop either and pay fewer output tokens.
+Make constrained decisions: JSON request in, JSON answers out, every answer
+drawn from a closed set the caller declares. Request on stdin or --input:
+
+{"context":   <evidence: string, object or array; optional>,
+ "constraints": ["rule", ...],                                  // optional
+ "questions": {"<your-question-id>": {
+     "question": "...",
+     "type":     "choice" | "multi" | "score",
+     "options":  ["name", ...] | {"name": "description", ...},  // REQUIRED
+     "levels":   ["lowest", ..., "highest"]}},                  // score only
+ "items":     [{"id": "...", "context": <any JSON>}, ...],      // optional batch
+ "rationale": true, "confidence": true}                         // optional, default true
+
+choice picks one option, multi picks one or more, score rates every option on
+levels. Answers come back as {"decisions": [{"item", "answers": {"<question-id>":
+{"choice"|"choices"|"scores", "confidence", "why"}}}]}, one entry per item in
+request order. With "items" the shared context is sent once for the whole batch;
+an empty "items" array answers nothing and makes no call. Set "rationale" or
+"confidence" false to drop those fields and pay fewer output tokens. Unknown keys
+are rejected, and an answer outside the declared options is rejected and retried
+rather than accepted.
 Prefer this over reasoning a decision out in the conversation: it costs one
-bounded call instead of a turn over the whole conversation, and an answer
-outside the declared options is rejected rather than accepted. Use nagent-classify instead when one category set applies to
-many inputs and you want a category per input plus the inverse index. Use
-nagent itself for open-ended work whose answers cannot be enumerated up
-front."""
+bounded call instead of a turn over the whole conversation, and nothing in the
+conversation checks an answer's form. Use nagent-classify instead when one
+category set applies to many inputs and you want the inverse index too. Use
+nagent itself for open-ended work whose answers cannot be enumerated up front."""
 
 EXAMPLE = """\
 Example request (stdin):

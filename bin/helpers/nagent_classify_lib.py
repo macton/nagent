@@ -84,6 +84,7 @@ from nagent_decide_lib import (  # noqa: F401  (EXIT_* re-exported for the CLI)
     MAX_ATTEMPTS,
     DecideError,
     decide,
+    load_request_json,
     normalize_constraints,
     normalize_labels,
     render_context,
@@ -204,9 +205,9 @@ def validate_request(raw) -> dict:
 
 def load_request(text: str) -> dict:
     try:
-        raw = json.loads(text)
-    except json.JSONDecodeError as exc:
-        raise ClassifyError(f"request: not valid JSON: {exc}") from exc
+        raw = load_request_json(text)
+    except DecideError as exc:
+        raise ClassifyError(str(exc), exc.exit_code) from exc
     return validate_request(raw)
 
 

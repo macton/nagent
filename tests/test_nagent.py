@@ -1097,20 +1097,51 @@ class ActionTests(unittest.TestCase):
                 "conv",
             )
 
-        self.assertIn("defer them to nagent-decide", context)
+        # A heading naming only "decisions" does not fire for a model about to sort or
+        # rate a list, so the block has to carry the vocabulary of the actual cases.
+        for trigger in ("triage", "bucket", "tag", "route", "yes/no gate", "fixed scale"):
+            with self.subTest(trigger=trigger):
+                self.assertIn(trigger, context)
         # The rule has to say WHY, or it reads as a preference and loses to habit:
         # the conversation is not sent, and the answer's form is checked.
         self.assertIn("closed set", context)
         self.assertIn("not this whole conversation", context)
-        self.assertIn('"items" array', context)
+        # Both tools named, with the rule that routes between them.
+        self.assertIn("nagent-decide", context)
+        self.assertIn("nagent-classify", context)
+        self.assertIn("one category set against many inputs", context)
+        # All three question types, so scoring does not read as out of scope.
+        for qtype in ("choice", "multi", "score"):
+            self.assertIn(qtype, context)
+        # The batch arrays are named for both tools, under their real key names.
+        self.assertIn('"items"', context)
+        self.assertIn('"inputs"', context)
+        # Being told to use a tool is not enough if the schema is strict.
+        self.assertIn("follow the key names exactly", context)
         # And it has to say where the boundary is, or it swallows real work.
         self.assertIn("cannot be listed up front", context)
-        # nagent-decide is discovered as a bin/ tool, so its own description is
-        # present too -- the rule and the tool must not drift apart.
-        self.assertIn("nagent-decide", context)
-        # And the rule has to route to the right sibling, or the two tools overlap.
-        self.assertIn("nagent-classify", context)
-        self.assertIn("one category set applies to many inputs", context)
+
+    def test_initial_context_carries_both_request_schemas_by_key_name(self):
+        """The loop is told to use these tools; it must also be able to.
+
+        The schemas reach context through each tool's --description. They were once
+        described in prose -- "holding the evidence, the constraints, and the
+        questions" -- and a model given only that context wrote {"evidence": ...}
+        and a list-of-objects "questions", both rejected with exit 2. Asserting the
+        literal key names keeps the prose from creeping back."""
+        with tempfile.TemporaryDirectory() as tmp:
+            context = self.mod.build_initial_context(
+                Path(tmp), NAGENT.resolve(), "user", "conv"
+            )
+        for key in ('"context"', '"constraints"', '"questions"', '"options"', '"levels"'):
+            with self.subTest(tool="nagent-decide", key=key):
+                self.assertIn(key, context)
+        for key in ('"question"', '"categories"', '"inputs"', '"multi_label"', '"buckets"'):
+            with self.subTest(tool="nagent-classify", key=key):
+                self.assertIn(key, context)
+        # The two shapes a model got wrong are called out explicitly.
+        self.assertIn("never a list of objects", context)
+        self.assertIn("an unknown key is rejected", context)
 
     def test_resolve_initial_prompt_prefers_cli_prompt(self):
         with unittest.mock.patch.object(self.mod.sys, "stdin", io.StringIO("from stdin")):

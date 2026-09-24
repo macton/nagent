@@ -268,6 +268,28 @@ class RequestValidationTests(unittest.TestCase):
         request = validate_request({**CHOICE_REQUEST, "items": [{"id": "a", "context": {"n": 1}}]})
         self.assertEqual(request["items"][0]["context"], "n: 1")
 
+    def test_a_fenced_request_file_is_accepted(self):
+        # A request file is written by a model, and models fence JSON. The same
+        # library already strips fences from model replies; a fence carries no
+        # meaning that stripping it could lose. Measured: gemini-2.5-flash fenced
+        # its request when asked for one from the initial context alone.
+        fenced = "```json\n" + json.dumps(CHOICE_REQUEST) + "\n```\n"
+        self.assertEqual(len(load_request(fenced)["questions"]), 1)
+
+    def test_a_request_wrapped_in_prose_is_accepted(self):
+        text = "Here is the request:\n" + json.dumps(CHOICE_REQUEST) + "\nHope that helps."
+        self.assertEqual(len(load_request(text)["questions"]), 1)
+
+    def test_a_non_object_request_file_is_still_rejected_as_a_request(self):
+        for text in ("not json at all", "[1, 2]", "", "   "):
+            with self.subTest(text=text):
+                with self.assertRaises(DecideError) as caught:
+                    load_request(text)
+                self.assertEqual(caught.exception.exit_code, EXIT_BAD_REQUEST)
+                # The message must read as a request problem, not a reply problem.
+                self.assertIn("request:", str(caught.exception))
+                self.assertNotIn("reply:", str(caught.exception))
+
     def test_load_request_reports_bad_json_as_a_request_error(self):
         with self.assertRaises(DecideError) as caught:
             load_request("{not json")

@@ -294,12 +294,21 @@ def validate_request(raw) -> dict:
     }
 
 
-def load_request(text: str) -> dict:
+def load_request_json(text: str) -> dict:
+    """The request object from a file a model wrote.
+
+    Tolerates a ```json fence and surrounding prose for the same reason
+    parse_json_object does for replies: the file is model output, models fence
+    JSON, and a fence carries no meaning that stripping it could lose. Anything
+    that is not a JSON object is still rejected, with the request exit code."""
     try:
-        raw = json.loads(text)
-    except json.JSONDecodeError as exc:
-        raise DecideError(f"request: not valid JSON: {exc}") from exc
-    return validate_request(raw)
+        return parse_json_object(text)
+    except DecideError as exc:
+        raise DecideError(f"request: {exc}".replace("request: reply:", "request:"), EXIT_BAD_REQUEST) from exc
+
+
+def load_request(text: str) -> dict:
+    return validate_request(load_request_json(text))
 
 
 # --------------------------------------------------------------------------- #
