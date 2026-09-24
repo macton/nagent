@@ -232,17 +232,29 @@ deduplicated by basename with the most specific layer winning. Drop an
 executable in `.nagent/bin/` and every conversation in that project knows it.
 Nothing else to register.
 
-| Tool                    | Role                                                |
-| ----------------------- | --------------------------------------------------- |
-| `nagent`                | Main structured conversation loop.                  |
-| `nagent-llm-text`       | Send a text file to the configured LLM.             |
-| `nagent-llm-upload`     | Upload a supported file with a prompt.              |
-| `nagent-file-edit`      | Per-file conversation for one source file.          |
-| `nagent-file-split`     | Split large file into segments + `index.json`.      |
-| `nagent-file-patch`     | Merge segments, write patch, validate hashes.       |
-| `nagent-file-summarize` | Summarize inline or via split summaries.            |
-| `nagent-distill`        | Harvest, merge, and graduate knowledge; reclaim.    |
-| `nagent-campaign`       | Operate campaigns: plans as data, driven in passes. |
+| Tool                     | Role                                                     |
+| ------------------------ | -------------------------------------------------------- |
+| `nagent`                 | Main structured conversation loop.                       |
+| `nagent-llm-text`        | Send a text file to the configured LLM.                  |
+| `nagent-llm-upload`      | Upload a supported file with a prompt.                   |
+| `nagent-file-edit`       | Per-file conversation for one source file.                |
+| `nagent-file-split`      | Split large file into segments + `index.json`.            |
+| `nagent-file-patch`      | Merge segments, write patch, validate hashes.             |
+| `nagent-file-summarize`  | Summarize inline or via split summaries.                  |
+| `nagent-decide`          | Constrained decisions over a closed option set (§15).     |
+| `nagent-classify`        | Sort an input set into a closed category set (§15).       |
+| `nagent-distill`         | Harvest, merge, and graduate knowledge; reclaim.          |
+| `nagent-campaign`        | Operate campaigns: plans as data, driven in passes.       |
+| `nagent-message`         | Queue a message for a conversation that is mid-run.       |
+| `nagent-status`          | Report what a conversation is doing, from evidence.       |
+| `nagent-wait-for-result` | Block until a result marker, process death, or timeout.   |
+
+Each row's role is that tool's own `--description`, shortened. Asking the tools
+rather than writing the list from memory is also how you find a gap in it:
+`nagent-wait-for-result` does not handle `--description`, so it is the one tool
+here the loop cannot see — reachable from `<nagent-shell>` by name, invisible to
+context assembly. A hand-maintained table would have hidden that; the tools
+answering for themselves is what surfaced it.
 
 **Example**
 
@@ -793,7 +805,7 @@ nagent --list-file-edits
 artifact's identity and scope write authority to it. Session memory = what
 happened today. Artifact memory = what we learned about this file.
 
-## 15. Decisions Are Lookups, Not Reasoning
+## 15. Decisions and Classification Are Lookups, Not Reasoning
 
 **Idea** — A decision whose answers you can list before asking is not
 reasoning work. It is a lookup against a closed set, and routing it through
