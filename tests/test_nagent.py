@@ -20,16 +20,32 @@ NAGENT_FILE_PATCH = BIN / "nagent-file-patch"
 NAGENT_FILE_EDIT = BIN / "nagent-file-edit"
 NAGENT_FILE_SUMMARIZE = BIN / "nagent-file-summarize"
 NAGENT_MESSAGE = BIN / "nagent-message"
-BIN_TOOLS = (
-    NAGENT,
-    NAGENT_LLM_TEXT,
-    NAGENT_LLM_UPLOAD,
-    NAGENT_FILE_SPLIT,
-    NAGENT_FILE_PATCH,
-    NAGENT_FILE_EDIT,
-    NAGENT_FILE_SUMMARIZE,
-    NAGENT_MESSAGE,
-)
+
+
+def discoverable_bin_tools() -> tuple[Path, ...]:
+    """Every executable in bin/, derived from the filesystem.
+
+    This is the set the contract covers: CLAUDE.md says a tool becomes visible to
+    the loop by being an executable in bin/ that handles --description, and
+    collect_bin_tool_descriptions walks bin/ non-recursively and silently skips
+    anything that exits nonzero. So an executable that does not answer the flag is
+    invisible to context assembly and nothing says so.
+
+    Derived rather than hand-listed on purpose. This was a tuple of eight names
+    behind a test called test_all_bin_tools_support_description, and it passed for
+    as long as nagent-wait-for-result -- an executable that exited 2 on the flag,
+    because argparse rejected it before main() ran -- was simply absent from the
+    tuple. A list of tools maintained by hand beside a registry built by asking
+    them is the drift the registry exists to remove.
+
+    Non-executable files are excluded: they are not tools, and discovery skips
+    them anyway."""
+    return tuple(
+        sorted(entry for entry in BIN.iterdir() if entry.is_file() and os.access(entry, os.X_OK))
+    )
+
+
+BIN_TOOLS = discoverable_bin_tools()
 
 
 def load_nagent_module():
@@ -2105,6 +2121,23 @@ class InitialTextTests(unittest.TestCase):
 
 
 class ToolDescriptionTests(unittest.TestCase):
+    def test_the_tool_set_is_discovered_not_hand_listed(self):
+        # Guard the guard: a scan that silently returned nothing would make every
+        # test below vacuously pass.
+        self.assertGreaterEqual(len(BIN_TOOLS), 10)
+        self.assertIn(NAGENT, BIN_TOOLS)
+
+    def test_every_executable_in_bin_appears_in_assembled_context(self):
+        # The end-to-end guarantee: not merely that each tool answers the flag, but
+        # that the loop's own assembly step ends up carrying every one of them.
+        sys.path.insert(0, str(BIN / "helpers"))
+        from nagent_cli import collect_bin_tool_descriptions
+
+        described = collect_bin_tool_descriptions(BIN)
+        for tool in BIN_TOOLS:
+            with self.subTest(tool=tool.name):
+                self.assertIn(tool.name, described)
+
     def test_all_bin_tools_support_description(self):
         for tool in BIN_TOOLS:
             with self.subTest(tool=tool.name):

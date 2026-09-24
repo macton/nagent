@@ -250,11 +250,21 @@ Nothing else to register.
 | `nagent-wait-for-result` | Block until a result marker, process death, or timeout.   |
 
 Each row's role is that tool's own `--description`, shortened. Asking the tools
-rather than writing the list from memory is also how you find a gap in it:
-`nagent-wait-for-result` does not handle `--description`, so it is the one tool
-here the loop cannot see — reachable from `<nagent-shell>` by name, invisible to
-context assembly. A hand-maintained table would have hidden that; the tools
-answering for themselves is what surfaced it.
+rather than writing the list from memory is also how the last gap in it turned
+up: `nagent-wait-for-result` did not handle the flag at all. Its `argparse`
+parser rejected the unknown option and exited 2 before `main()` ran, so
+`collect_bin_tool_descriptions()` — which skips anything that exits nonzero —
+skipped it silently. The tool was reachable from `<nagent-shell>` by name and
+invisible to context assembly, and nothing anywhere said so.
+
+It answers the flag now, and the more useful repair was to the test. A case
+called `test_all_bin_tools_support_description` had been passing against a
+hand-written tuple of eight of the then-thirteen tools; the one that was broken
+was simply not in the list. It now derives the set from `bin/` the way discovery
+does — every executable, no names written down — so the next tool that forgets
+the flag fails a test instead of quietly vanishing from the prompt. A list of
+tools kept by hand beside a registry built by asking them is precisely the drift
+the registry exists to remove.
 
 **Example**
 

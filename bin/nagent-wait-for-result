@@ -11,6 +11,26 @@ import sys
 import time
 from pathlib import Path
 
+HELPERS_DIR = Path(__file__).resolve().parent / "helpers"
+sys.path.insert(0, str(HELPERS_DIR))
+from nagent_cli import exit_on_description
+
+NAGENT_WAIT_FOR_RESULT_DESCRIPTION = """\
+Block until a long job finishes, without spending a turn per check.
+Watches --file for --marker and returns as soon as it appears. With --pid it
+also returns when the producer process dies, because a job that exits without
+writing its marker looks identical to one still running. --timeout bounds the
+wait (0, the default, waits indefinitely) and --interval sets the poll period
+(default 30s). Both the pid-death and timeout paths re-read the file first, so a
+marker that lands in the race window still succeeds. On success it prints the
+last --tail-lines lines; --nonmatch-prefix also prints the lines that do not
+start with that prefix, and --failure-log-dir tails NAME.log for each 'rc=N
+NAME' line with a nonzero rc.
+Use this rather than sleeping and re-reading from the conversation: a poll loop
+driven from the loop costs a turn and a whole conversation per look, while this
+costs one shell call however long the job runs. Exit codes: 0 marker found,
+2 producer exited first, 3 timed out, 74 result file unreadable,
+130 interrupted."""
 
 EXIT_PROCESS_DIED = 2
 EXIT_TIMEOUT = 3
@@ -219,6 +239,7 @@ def final_read(path: Path) -> tuple[str | None, int | None]:
 
 
 def main() -> int:
+    exit_on_description(NAGENT_WAIT_FOR_RESULT_DESCRIPTION)
     args = parse_args()
     start = time.monotonic()
     try:
