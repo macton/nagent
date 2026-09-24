@@ -1,8 +1,8 @@
-# 0003 — nagent-decide: open questions
+# 0003 — nagent-decide / nagent-classify: open questions
 
 Status: open
 Filed: 2026-09-22
-Area: `bin/nagent-decide`, `bin/helpers/nagent_decide_lib.py`
+Area: `bin/nagent-decide`, `bin/nagent-classify`, and their `_lib.py` files
 
 These are the design questions the first implementation deliberately did not
 answer, each with what would settle it. None blocks use.
@@ -42,6 +42,12 @@ does not catch an item answered carelessly because it was fortieth.
 **What would settle it:** the same question set over a synthetic batch of
 5/10/25/50 items with known answers, scored per position. If accuracy falls with
 position, the fix is a caller-visible chunk size, not a hidden one.
+
+This now covers `nagent-classify` as well, and more sharply: an input set is the
+natural thing to grow, and a caller with 200 rows to sort will hand over 200.
+The live classify measurements used 6 and 5 inputs. A 40-input set is exercised
+only against a mock, which proves the reshaping and the grid check scale, not
+that the model's attention does.
 
 ## 3. Only the `anthropic` branch honours the cache boundary
 

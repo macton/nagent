@@ -13,73 +13,73 @@ from nagent_llm import (
     resolve_from_args,
 )
 from nagent_cli import emit_json, exit_on_description
-from nagent_decide_lib import (
+from nagent_classify_lib import (
     EXIT_BAD_REQUEST,
     EXIT_OK,
     EXIT_PROVIDER,
     MAX_ATTEMPTS,
+    ClassifyError,
     DecideError,
-    decide,
+    classify,
     load_request,
-    render_prompt,
+    render_classify_prompt,
 )
 
-NAGENT_DECIDE_DESCRIPTION = """\
-Make constrained decisions: JSON request in, JSON answers out, every answer drawn
-from a closed set the caller declares. Read a decision JSON on stdin (or --input)
-holding the evidence, the constraints, and the questions; each question is
-choice (pick one), multi (pick some), or score (rate every option on an ordered
-scale) and MUST list its options. Optional "items" apply the same questions to a
-batch, sending the shared evidence once. Each answer carries a one-line reason
-and a self-reported confidence; set "rationale" or "confidence" to false in the
-request to drop either and pay fewer output tokens.
-Prefer this over reasoning a decision out in the conversation: it costs one
-bounded call instead of a turn over the whole conversation, and an answer
-outside the declared options is rejected rather than accepted. Use nagent-classify instead when one category set applies to
-many inputs and you want a category per input plus the inverse index. Use
-nagent itself for open-ended work whose answers cannot be enumerated up
-front."""
+NAGENT_CLASSIFY_DESCRIPTION = """\
+Classify a set of inputs into a closed set of categories: JSON in, JSON out.
+Read a request on stdin (or --input) holding "question" (the dimension being
+classified on), "categories" (the closed set, with optional descriptions),
+"inputs" (what to classify), and any shared "context" and "constraints". Every
+input comes back with its category, and the output also carries "buckets", the
+inverse index from each category to the inputs assigned to it — every declared
+category is present even when empty. Set "multi_label" to true when an input may
+belong to several categories. A category outside the declared set is rejected
+and retried, never accepted. The shared evidence is sent once for the whole
+input set, so this costs one bounded call rather than a turn over the whole
+conversation. Use nagent-decide when different questions apply to the same
+items; use this when one category set applies to many inputs."""
 
 EXAMPLE = """\
 Example request (stdin):
 
 {
-  "context": "#176 needs two clients and a display to prove anything.",
-  "constraints": [
-    "A staging lane has no display, no GPU and no real client."
-  ],
-  "questions": {
-    "lane": {
-      "question": "Which lane should this item be scheduled into?",
-      "type": "choice",
-      "options": {
-        "gate": "the lane about to run the gate; owns display, GPU and clients",
-        "staging": "headless, source-level or server-only work only"
-      }
-    }
+  "question": "Which lane can actually run this item's proof?",
+  "context": "The gate owns the display, the GPU and real clients.",
+  "constraints": ["A staging lane has no display, no GPU and no real client."],
+  "categories": {
+    "gate": "needs the display, the GPU or a real client",
+    "staging": "headless, source-level or server-only"
   },
-  "items": [
-    {"id": "#176", "context": "moving the cursor quickly while firing drops shots"}
+  "inputs": [
+    {"id": "#176", "text": "cursor moved quickly while firing drops shots"},
+    {"id": "#110", "text": "crew-name relay; reproduces headless, no rendering"}
   ]
+}
+
+Output:
+
+{
+  "classified": [
+    {"input": "#176", "category": "gate", "categories": ["gate"], ...},
+    {"input": "#110", "category": "staging", "categories": ["staging"], ...}
+  ],
+  "buckets": {"gate": ["#176"], "staging": ["#110"]}
 }
 """
 
 
 def main() -> int:
-    exit_on_description(NAGENT_DECIDE_DESCRIPTION)
+    exit_on_description(NAGENT_CLASSIFY_DESCRIPTION)
 
     parser = argparse.ArgumentParser(
         description=(
-            "Constrained decisions over a closed answer set. Reads a decision request "
-            "as JSON and prints the answers as JSON."
+            "Classify inputs into a closed category set. Reads a request as JSON and "
+            "prints a category per input, plus the inverse index, as JSON."
         ),
         epilog=EXAMPLE,
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    parser.add_argument(
-        "--input",
-        help="Path to the request JSON (default: stdin).",
-    )
+    parser.add_argument("--input", help="Path to the request JSON (default: stdin).")
     parser.add_argument(
         "--prompt-out",
         help="Also write the rendered prompt here, so the generator's input is inspectable.",
@@ -117,10 +117,10 @@ def main() -> int:
         print(f"Error: {exc}", file=sys.stderr)
         return exc.exit_code
 
-    # A batch of zero answers nothing and sends nothing: render no prompt, make no
-    # call, and say so in the same output shape as any other run.
-    empty_batch = not request["items"]
-    prompt = "" if empty_batch else render_prompt(request)[0]
+    # An empty input set classifies nothing and sends nothing: render no prompt,
+    # make no call, and report in the same shape as any other run.
+    empty_batch = not request["inputs"]
+    prompt = "" if empty_batch else render_classify_prompt(request)[0]
 
     if args.prompt_out:
         Path(args.prompt_out).expanduser().write_text(prompt, encoding="utf-8")
@@ -138,7 +138,7 @@ def main() -> int:
         )
 
     try:
-        result = decide(request, generate, max_attempts=args.attempts)
+        result = classify(request, generate, max_attempts=args.attempts)
     except DecideError as exc:
         print(f"Error: {exc}", file=sys.stderr)
         return exc.exit_code

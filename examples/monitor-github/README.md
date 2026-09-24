@@ -31,6 +31,45 @@ What is **not** here is deliberate. Ordering by issue number, "is this SHA in
 `.monitor-state`", and pagination are `sort -n`, `grep` and `--paginate`. They
 are not decisions and routing them through a model would be strictly worse.
 
+## The two classification requests
+
+Two of the runbook's dimensions are classifications rather than multi-question
+decisions, so they are also expressed for `nagent-classify` — same evidence, same
+ground truth, flatter shape:
+
+| file | dimension | mode | inputs | categories |
+| --- | --- | --- | --- | --- |
+| `lane-classify.json` | which lane can run this item's proof (§1a) | single-label | 6 | 2 |
+| `coupling-classify.json` | which coupling tests fire against the anchor (§3) | multi-label | 5 | 7 |
+
+`lane-classify.json` carries only the one §1a context entry that bears on the
+lane, not the three §3 entries about blocked-versus-work that `triage.json`
+needs. That trimming is the point of the tool: send the evidence that applies to
+the question being asked.
+
+```bash
+../../bin/nagent-classify --input lane-classify.json
+../../bin/nagent-classify --input coupling-classify.json
+```
+
+Both score against the same `expected.json` entries the decide requests use —
+`lane` from `triage.json`, `coupling` from `batch.json`:
+
+| model | tokens | correct |
+| --- | --- | --- |
+| `gpt-5.5` | 3,698 | 9/9 |
+| `gemini-2.5-flash` | 3,316 | 9/9 |
+
+First attempt in every case. The `buckets` index came back right too, including
+`shared-validator` and `repins-same-validators` as empty — nothing was assigned
+to them, which is a result rather than a gap.
+
+One thing this is **not** evidence for: `gemini-2.5-flash` got `#194`'s
+`shared-fixture` right here, where the same model answered `none` for it through
+`batch.json`. The requests differ (trimmed context, one question instead of
+three), it is a single sample, and it says nothing about either tool being more
+accurate than the other.
+
 ## Ground truth
 
 `expected.json` holds the expected answers, and every one is a ruling the

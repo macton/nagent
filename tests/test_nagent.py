@@ -1092,6 +1092,9 @@ class ActionTests(unittest.TestCase):
         # nagent-decide is discovered as a bin/ tool, so its own description is
         # present too -- the rule and the tool must not drift apart.
         self.assertIn("nagent-decide", context)
+        # And the rule has to route to the right sibling, or the two tools overlap.
+        self.assertIn("nagent-classify", context)
+        self.assertIn("one category set applies to many inputs", context)
 
     def test_resolve_initial_prompt_prefers_cli_prompt(self):
         with unittest.mock.patch.object(self.mod.sys, "stdin", io.StringIO("from stdin")):

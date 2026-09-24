@@ -62,6 +62,17 @@ Thin wrappers live in `bin/`; real logic lives in `bin/helpers/*_lib.py`.
   git-history context.
 - `bin/nagent-file-split` / `-patch` / `-summarize` + their `_lib.py` — large-file
   handling (split → bounded edit → patch).
+- `bin/nagent-decide` + `nagent_decide_lib.py` — constrained decisions. JSON request
+  (evidence, constraints, questions, each with a REQUIRED closed option set) in, JSON
+  answers out; `items` applies the questions to a batch with the shared evidence sent
+  once. An answer outside the declared set is rejected and retried, never coerced.
+- `bin/nagent-classify` + `nagent_classify_lib.py` — classification: an input set and
+  one category set in, a category per input plus the inverse `buckets` index out. It
+  does not reimplement the decide path — it translates into a validated decide request
+  carrying one `choice`/`multi` question and reuses that renderer, validator and retry
+  loop, so the enforcement guarantee is identical. What it adds is the flatter request
+  and output shape. Reach for decide when several different questions apply to the same
+  items; classify when one category set applies to many inputs.
 - `bin/nagent-message` + `nagent_message_lib.py` — queue messages for a conversation
   that is mid-run. Spools one file per message into `{name}.inbox/`; the loop drains
   it at the top of every turn and appends each as `<user-prompt>`. A user-invoked run

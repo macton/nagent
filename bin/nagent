@@ -825,6 +825,7 @@ Decisions (defer them to nagent-decide via <nagent-shell>):
 - A decision whose answers you can enumerate before asking is not reasoning work, it is a lookup against a closed set. Write the evidence, the constraints and the options into a request JSON in your scratch dir and run nagent-decide on it, instead of arguing it out in this conversation.
 - That is cheaper and it is checked: nagent-decide sends only the evidence you named, not this whole conversation, and it rejects any answer that is not one of the options you declared. Reasoning it out here sends everything and no one checks the answer's form — an answer that reads correct but does not match the option string is the normal failure, and it is silent.
 - Where there is one decision there are many: put the items in the request's "items" array so the shared evidence goes once and every item comes back answered. An empty "items" array is a legitimate request that answers nothing and makes no call.
+- Sorting a set of things into one set of categories is the same move with a flatter shape: use nagent-classify, which takes the input set and the category set and returns a category per input plus the inverse index (every category to the inputs in it). Reach for nagent-decide when several different questions apply to the same items, nagent-classify when one category set applies to many inputs.
 - Keep in this conversation the decisions whose answers cannot be listed up front (what to build, how to structure something, what a defect's cause is). Those are work, not lookups.
 
 Campaigns (long-horizon plans as data; drive with nagent-campaign via <nagent-shell>):
@@ -1433,7 +1434,14 @@ def execute_write(
     try:
         file_path.parent.mkdir(parents=True, exist_ok=True)
         file_path.write_text(content, encoding="utf-8")
-        return f'<nagent-write-result path="{path}" status="ok" />'
+        # Report the RESOLVED path and the size read back from disk, not the requested path and
+        # the length of what we meant to write. A bare status="ok" asserts nothing a reader can
+        # check: it cannot distinguish a file written where the model asked from one written
+        # somewhere else, nor a full write from a truncated one. The two figures are what make
+        # the confirmation evidence rather than a claim.
+        written = file_path.stat().st_size if file_path.exists() else -1
+        return (f'<nagent-write-result path="{path}" status="ok" '
+                f'resolved="{file_path}" bytes="{written}" lines="{content.count(chr(10))}" />')
     except OSError as exc:
         return f'<nagent-write-result path="{path}" status="error">{exc}</nagent-write-result>'
 

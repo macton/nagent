@@ -853,6 +853,55 @@ nagent-decide --input examples/monitor-github/triage.json
 nagent-decide --input examples/monitor-github/triage.json --dry-run   # inspect the prompt, call nothing
 ```
 
+### Classification is the same move, flatter
+
+Sorting many things into one set of categories is one decision shape, so
+`nagent-classify` does not reimplement any of it. A validated classify request
+is *translated* into a validated `nagent-decide` request carrying a single
+`choice` (or `multi`) question, and that renderer, validator and correction loop
+run unchanged — the enforcement guarantee is identical by construction, not by
+a second implementation that has to be kept in step.
+
+What it adds is the data shape, which is why it is a tool and not a paragraph
+of advice: the category set is declared once instead of per question, the output
+is a flat row per input instead of a grid to walk, and it carries the **inverse
+index** as well, because bucketing the inputs is what a caller does next.
+
+```bash
+nagent-classify --input examples/monitor-github/lane-classify.json
+```
+
+```json
+{
+  "classified": [{"input": "#176", "category": "gate", "categories": ["gate"], ...}],
+  "buckets": {"gate": ["#103", "#211", "#176", "#238"], "staging": ["#110", "#241"]}
+}
+```
+
+Every declared category is a bucket key even when nothing landed in it — an
+empty bucket is a result, not a gap. `"multi_label": true` lets an input carry
+several categories, and then `categories` is the list to read and `category` is
+null; the layout does not change either way.
+
+`question` is **required**, unlike anything in `nagent-decide`. A category set
+like `{high, medium, low}` does not state "high *what*", and a classification
+made on the wrong dimension is exactly the kind of wrong answer that reads
+correct. One required line removes the whole class.
+
+Measured on the runbook's own two classification dimensions — the lane a queue
+item's proof needs (single-label, 6 inputs) and which coupling tests a candidate
+satisfies (multi-label, 5 inputs, 7 categories) — against the same ground truth:
+
+| model | tokens | correct |
+| --- | --- | --- |
+| `gpt-5.5` | 3,698 | 9/9 |
+| `gemini-2.5-flash` | 3,316 | 9/9 |
+
+First attempt both times, including the two categories nothing was assigned to.
+The prompt is rendered in `nagent-decide`'s register ("questions", "items"),
+which is a little off for a classification; this measurement is what says to
+leave it alone rather than specialize the renderer on a hunch.
+
 ### Measured against the loop
 
 `examples/monitor-github/` breaks a real 18,000-line standing runbook into
