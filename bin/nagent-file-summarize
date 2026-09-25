@@ -23,7 +23,8 @@ NAGENT_FILE_SUMMARIZE_DESCRIPTION = """\
 Summarize a text file using the configured LLM. For files larger than 64KB,
 automatically splits with nagent-file-split --summarize, summarizes each segment,
 and stores per-segment summaries in index.json. Use when you need a quick overview
-of a file without loading the full contents into context."""
+of a file without loading the full contents into context.
+Call: nagent-file-summarize --file PATH [--json]"""
 
 
 def summarize_via_split(

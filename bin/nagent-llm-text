@@ -17,7 +17,8 @@ from nagent_cli import emit_json, exit_on_description
 NAGENT_LLM_TEXT_DESCRIPTION = """\
 Send the contents of a text file to the configured LLM and print the response.
 Use for one-shot text generation outside the nagent conversation loop, or when
-another tool (including nagent itself) needs to forward a file as an LLM message."""
+another tool (including nagent itself) needs to forward a file as an LLM message.
+Call: nagent-llm-text --file PROMPT_FILE [--json]"""
 
 
 def main() -> None:

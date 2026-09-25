@@ -13,7 +13,9 @@ NAGENT_LLM_UPLOAD_DESCRIPTION = """\
 Upload a file with a prompt to the configured LLM and print the response.
 Use when the task needs vision or document understanding (images, PDFs, office
 files, code artifacts) that plain conversation text cannot represent well. Not
-for archives (.zip); extract files first."""
+for archives (.zip); extract files first.
+Call: nagent-llm-upload --file PATH --prompt "what to ask about it"
+"""
 
 MAX_FILE_BYTES = 50 * 1024 * 1024
 

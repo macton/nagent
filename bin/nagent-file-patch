@@ -14,7 +14,8 @@ NAGENT_FILE_PATCH_DESCRIPTION = """\
 Merge edits from split segment files back into the original source file.
 Use after modifying segments produced by nagent-file-split; writes a unified
 diff patch, applies the merged content, validates source hash, and refreshes
-index.json line numbers. Run this once all segment edits are complete."""
+index.json line numbers. Run this once all segment edits are complete.
+Call: nagent-file-patch --index INDEX_JSON [--dry-run]"""
 
 
 def main() -> None:

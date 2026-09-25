@@ -4,6 +4,7 @@ import importlib.util
 import io
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -20,6 +21,22 @@ NAGENT_FILE_PATCH = BIN / "nagent-file-patch"
 NAGENT_FILE_EDIT = BIN / "nagent-file-edit"
 NAGENT_FILE_SUMMARIZE = BIN / "nagent-file-summarize"
 NAGENT_MESSAGE = BIN / "nagent-message"
+
+
+def strip_bracketed(text: str) -> str:
+    """`text` with every balanced [...] group removed.
+
+    argparse writes optional arguments inside brackets in its usage line, so what
+    is left is exactly the required part."""
+    kept, depth = [], 0
+    for char in text:
+        if char == "[":
+            depth += 1
+        elif char == "]":
+            depth = max(0, depth - 1)
+        elif depth == 0:
+            kept.append(char)
+    return "".join(kept)
 
 
 def discoverable_bin_tools() -> tuple[Path, ...]:
@@ -2180,6 +2197,34 @@ class ToolDescriptionTests(unittest.TestCase):
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertIn("path:", result.stdout)
                 self.assertGreater(len(result.stdout.strip()), 20)
+
+    def test_every_required_option_is_named_in_its_own_description(self):
+        """A tool the loop is told to use must be callable from what context carries.
+
+        The descriptions said what each tool does and never named --file, --index or
+        --prompt, so a model given only that context wrote a positional -- the natural
+        guess for a CLI, and wrong for six of these tools. Every one exited 2 before
+        doing any work. argparse's usage line puts optional things in brackets, so
+        what survives stripping them is required, and every required option has to
+        appear in the text that reaches the prompt."""
+        for tool in BIN_TOOLS:
+            usage = subprocess.run(
+                [str(tool), "--help"], capture_output=True, text=True
+            ).stdout
+            match = re.search(r"usage:(.*?)\n\n", usage, re.DOTALL)
+            if not match:
+                continue
+            required = re.findall(
+                r"(--[a-z][a-z0-9-]*)", strip_bracketed(" ".join(match.group(1).split()))
+            )
+            if not required:
+                continue
+            described = subprocess.run(
+                [str(tool), "--description"], capture_output=True, text=True
+            ).stdout
+            for option in required:
+                with self.subTest(tool=tool.name, option=option):
+                    self.assertIn(option, described)
 
     def test_nagent_description_does_not_require_prompt(self):
         result = subprocess.run(

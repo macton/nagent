@@ -29,7 +29,8 @@ Split a large file into structure-aware segments (~32KB by default) with index.j
 Use when a file is too large for context or when you want to read and edit one
 segment at a time. Workflow: split, edit segment files, then merge with
 nagent-file-patch. Supports --natural for type-specific boundaries, --refresh
-to re-split after the source changes, and --summarize to LLM-summarize each segment."""
+to re-split after the source changes, and --summarize to LLM-summarize each segment.
+Call: nagent-file-split --file PATH [--natural] [--summarize], or nagent-file-split --refresh INDEX_JSON to re-split after the source changed."""
 
 NAGENT_FILE_SUMMARIZE = Path(__file__).resolve().parent / "nagent-file-summarize"
 
