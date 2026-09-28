@@ -673,7 +673,11 @@ class ActionTests(unittest.TestCase):
         boundaries = self.mod.conversation_cache_boundaries(text)
         volatile_at = text.find("\nInstance:")
         context_end = text.index("</initial_context>") + len("</initial_context>")
+        # The end of the file is deliberately not a boundary: measured against
+        # claude-opus-5, only a byte-identical repeat reads that entry back, and
+        # every nagent turn appends. See conversation_cache_boundaries.
         self.assertEqual(boundaries, [volatile_at, context_end])
+        self.assertNotIn(len(text), boundaries)
 
         # No initial context, or context not at the start: no boundaries.
         self.assertEqual(self.mod.conversation_cache_boundaries("plain text"), [])
@@ -682,6 +686,159 @@ class ActionTests(unittest.TestCase):
         # File that is exactly the context: only the volatile boundary.
         context_only = text[:context_end]
         self.assertEqual(self.mod.conversation_cache_boundaries(context_only), [volatile_at])
+
+    def test_call_llm_records_cache_tokens_from_json(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            conversation = Path(tmp) / "conv"
+            conversation.write_text("prompt text", encoding="utf-8")
+
+            def fake_run(cmd, **kwargs):
+                payload = {
+                    "response": "ok",
+                    "input_tokens": 500,
+                    "output_tokens": 20,
+                    "cache_read_tokens": 400,
+                    "cache_write_tokens": 50,
+                }
+                return unittest.mock.Mock(returncode=0, stdout=json.dumps(payload), stderr="")
+
+            stats = self.mod.TokenStats()
+            with unittest.mock.patch.object(self.mod.subprocess, "run", fake_run):
+                output, error, truncated = self.mod.call_llm(
+                    conversation, self.mod.LlmSettings("anthropic", "claude-opus-5"), stats
+                )
+        self.assertEqual((output, error), ("ok", None))
+        # input stays "tokens sent"; the two counts explain how much of it was
+        # served from, and written to, the provider's cache.
+        self.assertEqual(stats.recursive_input_tokens, 500)
+        self.assertEqual(stats.recursive_cache_read_tokens, 400)
+        self.assertEqual(stats.recursive_cache_write_tokens, 50)
+
+    def test_call_llm_reports_a_truncated_turn_with_its_stop_reason(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            conversation = Path(tmp) / "conv"
+            conversation.write_text("prompt text", encoding="utf-8")
+
+            def run_with(payload):
+                def fake_run(cmd, **kwargs):
+                    return unittest.mock.Mock(
+                        returncode=0, stdout=json.dumps(payload), stderr=""
+                    )
+
+                with unittest.mock.patch.object(self.mod.subprocess, "run", fake_run):
+                    return self.mod.call_llm(
+                        conversation,
+                        self.mod.LlmSettings("anthropic", "claude-opus-5"),
+                        self.mod.TokenStats(),
+                    )
+
+            base = {"response": "half a fi", "input_tokens": 9, "output_tokens": 2}
+            # Truncated: the provider's own word comes back for the message text.
+            self.assertEqual(
+                run_with({**base, "stop_reason": "max_tokens", "truncated": True}),
+                ("half a fi", None, "max_tokens"),
+            )
+            # Finished normally: nothing to report, even though a reason exists.
+            self.assertEqual(
+                run_with({**base, "stop_reason": "end_turn", "truncated": False}),
+                ("half a fi", None, None),
+            )
+            # A provider that reports nothing is not treated as truncated.
+            self.assertEqual(run_with(base), ("half a fi", None, None))
+            # Truncated but nameless still reports something the note can print.
+            self.assertEqual(
+                run_with({**base, "truncated": True}), ("half a fi", None, "output cap")
+            )
+
+    def test_truncated_turn_tells_the_model_it_hit_a_limit_not_a_format_error(self):
+        # The whole point of carrying the stop reason: a cut-off turn must not be
+        # corrected as bad formatting, or the model rewrites the same oversized
+        # turn and pays the full input again, three times, then the run aborts.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            conversation = root / "conversation"
+            conversation.write_text("", encoding="utf-8")
+            call_llm = unittest.mock.Mock(
+                side_effect=[
+                    # Cut off mid-write: an unclosed body, so no runnable tag.
+                    ('<nagent-write path="/tmp/x">half a fi', None, "max_tokens"),
+                    ("<nagent-response>done</nagent-response>", None, None),
+                ]
+            )
+            with unittest.mock.patch.object(self.mod, "call_llm", call_llm), \
+                unittest.mock.patch.object(self.mod, "run_safety_net", lambda *a, **k: None):
+                code, responses = self.mod.run_agent_loop(
+                    conversation,
+                    root,
+                    self.mod.LlmSettings(provider="anthropic", model="claude-opus-5"),
+                    "go",
+                    "4242",
+                    json_mode=True,
+                )
+            text = conversation.read_text(encoding="utf-8")
+        self.assertEqual(code, 0)
+        self.assertIn("cut off by the provider", text)
+        self.assertIn("stop reason: max_tokens", text)
+        self.assertIn("This is a length limit, not a formatting mistake.", text)
+
+    def test_a_truncated_turn_that_still_parsed_is_recorded_as_truncated(self):
+        # The turn had a complete tag and ran, but the provider stopped it at the
+        # cap: whatever came after is gone, so the conversation has to say so.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            conversation = root / "conversation"
+            conversation.write_text("", encoding="utf-8")
+            call_llm = unittest.mock.Mock(
+                side_effect=[
+                    ("<nagent-shell>echo work</nagent-shell>", None, "max_tokens"),
+                    ("<nagent-response>done</nagent-response>", None, None),
+                ]
+            )
+            with unittest.mock.patch.object(self.mod, "call_llm", call_llm), \
+                unittest.mock.patch.object(self.mod, "run_safety_net", lambda *a, **k: None):
+                self.mod.run_agent_loop(
+                    conversation,
+                    root,
+                    self.mod.LlmSettings(provider="anthropic", model="claude-opus-5"),
+                    "go",
+                    "4242",
+                    json_mode=True,
+                )
+            text = conversation.read_text(encoding="utf-8")
+        self.assertIn("echo work", text)
+        self.assertIn("cut off by the provider", text)
+
+    def test_a_truncated_final_response_does_not_end_the_run(self):
+        # parse_response captures an unclosed <nagent-response> to EOF, so a turn
+        # cut off mid-answer parses as a complete final response. Ending there
+        # would hand the caller half an answer as the result.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            conversation = root / "conversation"
+            conversation.write_text("", encoding="utf-8")
+            call_llm = unittest.mock.Mock(
+                side_effect=[
+                    ("<nagent-response>the answer is th", None, "max_tokens"),
+                    ("<nagent-response>the answer is three</nagent-response>", None, None),
+                ]
+            )
+            with unittest.mock.patch.object(self.mod, "call_llm", call_llm), \
+                unittest.mock.patch.object(self.mod, "run_safety_net", lambda *a, **k: None):
+                code, responses = self.mod.run_agent_loop(
+                    conversation,
+                    root,
+                    self.mod.LlmSettings(provider="anthropic", model="claude-opus-5"),
+                    "go",
+                    "4242",
+                    json_mode=True,
+                )
+            text = conversation.read_text(encoding="utf-8")
+        self.assertEqual(code, 0)
+        self.assertEqual(call_llm.call_count, 2)
+        self.assertIn("cut off by the provider", text)
+        # The finished answer is what the caller gets; the partial one is not the
+        # last word, though it stays in the conversation as what happened.
+        self.assertEqual(responses[-1], "the answer is three")
 
     def test_call_llm_passes_cache_boundaries(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -763,10 +920,30 @@ class ActionTests(unittest.TestCase):
                     "response": "<nagent-response>ok</nagent-response>",
                     "input_tokens": 12,
                     "output_tokens": 3,
+                    "cache_read_tokens": 8,
+                    "cache_write_tokens": 2,
                 }
             )
         )
-        self.assertEqual(parsed, ("<nagent-response>ok</nagent-response>", 12, 3))
+        self.assertEqual(
+            parsed,
+            self.mod.LlmTurn(
+                text="<nagent-response>ok</nagent-response>",
+                input_tokens=12,
+                output_tokens=3,
+                cache_read_tokens=8,
+                cache_write_tokens=2,
+            ),
+        )
+
+        # A provider that reports no cache activity: the counts read as zero,
+        # not as missing, so the caller never branches on presence.
+        older = self.mod.parse_llm_json_output(
+            json.dumps({"response": "ok", "input_tokens": 12, "output_tokens": 3})
+        )
+        self.assertEqual(older, self.mod.LlmTurn(text="ok", input_tokens=12, output_tokens=3))
+        self.assertFalse(older.truncated)
+        self.assertIsNone(older.stop_reason)
 
     def test_call_llm_updates_token_stats_from_json(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -788,7 +965,7 @@ class ActionTests(unittest.TestCase):
 
             self.mod.NAGENT_LLM_TEXT = fake_llm
             stats = self.mod.TokenStats()
-            output, error = self.mod.call_llm(
+            output, error, truncated = self.mod.call_llm(
                 conversation,
                 self.mod.LlmSettings(provider="openai", model="gpt-5.5"),
                 stats,
@@ -811,7 +988,7 @@ class ActionTests(unittest.TestCase):
 
             stats = self.mod.TokenStats()
             with unittest.mock.patch.object(self.mod.subprocess, "run", fake_run):
-                output, error = self.mod.call_llm(
+                output, error, truncated = self.mod.call_llm(
                     conversation,
                     self.mod.LlmSettings(provider="openai", model="gpt-5.5"),
                     stats,
@@ -830,8 +1007,8 @@ class ActionTests(unittest.TestCase):
             def fake_call_llm(*args, **kwargs):
                 attempts.append(1)
                 if len(attempts) == 1:
-                    return None, "transient bridge failure"
-                return "<nagent-response>retry ok</nagent-response>", None
+                    return None, "transient bridge failure", None
+                return "<nagent-response>retry ok</nagent-response>", None, None
 
             with unittest.mock.patch.object(self.mod, "call_llm", fake_call_llm):
                 code, responses = self.mod.run_agent_loop(
@@ -858,7 +1035,7 @@ class ActionTests(unittest.TestCase):
             with unittest.mock.patch.object(
                 self.mod,
                 "call_llm",
-                return_value=(None, "persistent bridge failure"),
+                return_value=(None, "persistent bridge failure", None),
             ):
                 code, responses = self.mod.run_agent_loop(
                     conversation,
@@ -891,7 +1068,7 @@ class ActionTests(unittest.TestCase):
             with unittest.mock.patch.object(
                 self.mod,
                 "call_llm",
-                return_value=("<nagent-response>ok</nagent-response>", None),
+                return_value=("<nagent-response>ok</nagent-response>", None, None),
             ):
                 code, responses = self.mod.run_agent_loop(
                     conversation,
@@ -934,8 +1111,8 @@ class ActionTests(unittest.TestCase):
             conversation.write_text("", encoding="utf-8")
             call_llm = unittest.mock.Mock(
                 side_effect=[
-                    ("<nagent-shell>echo work</nagent-shell>", None),
-                    ("<nagent-response>done</nagent-response>", None),
+                    ("<nagent-shell>echo work</nagent-shell>", None, None),
+                    ("<nagent-response>done</nagent-response>", None, None),
                 ]
             )
             with unittest.mock.patch.object(self.mod, "call_llm", call_llm):
@@ -1082,6 +1259,23 @@ class ActionTests(unittest.TestCase):
             context.index("Instance:"),
             context.index("Environment:"),
         )
+
+    def test_stable_prefix_is_identical_across_conversations_of_one_mode(self):
+        # conversation_cache_boundaries marks everything above "Instance:" as a
+        # prefix shared between conversations. That is only true if no
+        # per-conversation value is interpolated above it — the scratch dir was,
+        # three times, and cost every conversation its own cache entry.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            texts = [
+                self.mod.build_initial_context(root, NAGENT.resolve(), "user", name)
+                for name in ("conv-aaaa-1111", "conv-bbbb-2222")
+            ]
+        stable = [text.split("\nInstance:", 1)[0] for text in texts]
+        self.assertEqual(stable[0], stable[1])
+        # And each conversation still learns its own scratch dir, below Instance.
+        for text, name in zip(texts, ("conv-aaaa-1111", "conv-bbbb-2222")):
+            self.assertIn(f"- scratch dir: {self.mod.conversation_scratch_dir(name)}", text)
 
     def test_build_initial_context_states_loop_contract_and_conversation_reuse(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1340,10 +1534,13 @@ class ActionTests(unittest.TestCase):
             conversation_input_tokens=100,
             recursive_input_tokens=150,
             recursive_output_tokens=40,
+            recursive_cache_read_tokens=120,
+            recursive_cache_write_tokens=25,
         )
         self.assertEqual(
             stats.status_line(),
-            "[Turns:2 Conversation-Tokens:100 Tokens-In:150 Tokens-Out:40]",
+            "[Turns:2 Conversation-Tokens:100 Tokens-In:150 Tokens-Out:40 "
+            "Cache-Read:120 Cache-Write:25]",
         )
 
     def test_call_llm_wait_spinner_names_provider_and_model(self):
@@ -1411,7 +1608,8 @@ class ActionTests(unittest.TestCase):
                 stdout.getvalue().strip().splitlines(),
                 [
                     "done",
-                    "[Turns:2 Conversation-Tokens:100 Tokens-In:150 Tokens-Out:40]",
+                    "[Turns:2 Conversation-Tokens:100 Tokens-In:150 Tokens-Out:40 "
+                    "Cache-Read:0 Cache-Write:0]",
                 ],
             )
 
@@ -1817,7 +2015,8 @@ class ActionTests(unittest.TestCase):
                 stdout.getvalue().strip().splitlines(),
                 [
                     "summary ok",
-                    "[Turns:1 Conversation-Tokens:5 Tokens-In:30 Tokens-Out:4]",
+                    "[Turns:1 Conversation-Tokens:5 Tokens-In:30 Tokens-Out:4 "
+                    "Cache-Read:0 Cache-Write:0]",
                 ],
             )
 
@@ -3103,6 +3302,151 @@ class NagentLlmConfigTests(unittest.TestCase):
         self.assertEqual(captured["client_kwargs"]["base_url"], self.mod.TOGETHER_BASE_URL)
         self.assertEqual(captured["client_kwargs"]["api_key"], "test-key")
 
+    # ---- the streaming seam -------------------------------------------------
+    # Streaming lives in one shared helper, _openai_compatible_chat, and only
+    # together/openrouter reach it. These tests pin what that helper does with a
+    # stream, and what it still ignores, so a change there is deliberate.
+
+    @staticmethod
+    def _fake_stream(chunks, captured):
+        """A client whose chat.completions.create returns `chunks`."""
+
+        class FakeCompletions:
+            def create(self, **kwargs):
+                captured.update(kwargs)
+                return iter(chunks)
+
+        class FakeChat:
+            completions = FakeCompletions()
+
+        class FakeClient:
+            chat = FakeChat()
+
+        return lambda **kwargs: FakeClient()
+
+    @staticmethod
+    def _chunk(content=None, usage=None, reasoning=None, finish_reason=None):
+        delta = unittest.mock.Mock(content=content, reasoning_content=reasoning)
+        choices = []
+        if content is not None or reasoning is not None or finish_reason is not None:
+            choices = [unittest.mock.Mock(delta=delta, finish_reason=finish_reason)]
+        return unittest.mock.Mock(choices=choices, usage=usage)
+
+    def _stream_result(self, chunks, provider="together", key="TOGETHER_API_KEY"):
+        captured: dict = {}
+        with unittest.mock.patch.object(
+            self.mod, "require_package", return_value=self._fake_stream(chunks, captured)
+        ), unittest.mock.patch.dict(os.environ, {key: "test-key"}, clear=False):
+            result = self.mod.generate_text_with_usage("hi", provider, "m")
+        return result, captured
+
+    def test_stream_text_is_the_content_deltas_only(self):
+        # Qwen-style models on Together emit reasoning_content alongside content.
+        # Reasoning is not the answer: it must not land in the text nagent parses
+        # for tags, or a reasoning leak becomes a protocol violation.
+        result, _ = self._stream_result([
+            self._chunk(reasoning="let me think"),
+            self._chunk(content="<nagent-response>"),
+            self._chunk(reasoning="still thinking"),
+            self._chunk(content="ok</nagent-response>"),
+        ])
+        self.assertEqual(result.text, "<nagent-response>ok</nagent-response>")
+
+    def test_stream_with_no_content_returns_empty_text_rather_than_raising(self):
+        # Current contract, recorded on purpose: a reply that is all reasoning
+        # (or all filtered out) is an empty success here, and the loop catches it
+        # one level up as "Response contains no nagent tags" and retries. Unlike
+        # truncation, this one carries no reason — the provider reports none, so
+        # there is nothing for nagent to pass on.
+        result, _ = self._stream_result([
+            self._chunk(reasoning="thought only"),
+            self._chunk(content=None, usage=type("U", (), {"prompt_tokens": 9, "completion_tokens": 0})()),
+        ])
+        self.assertEqual(result.text, "")
+        self.assertEqual(result.input_tokens, 9)
+
+    def test_stream_without_usage_falls_back_to_character_estimates(self):
+        # include_usage is requested, but a provider may not honour it.
+        result, captured = self._stream_result([self._chunk(content="abcd" * 10)])
+        self.assertEqual(captured["stream_options"], {"include_usage": True})
+        self.assertEqual(result.input_tokens, self.mod.estimate_token_count("hi"))
+        self.assertEqual(result.output_tokens, self.mod.estimate_token_count("abcd" * 10))
+
+    def test_stream_reports_the_finish_reason_that_says_it_was_truncated(self):
+        # A reply cut off at the provider's cap arrives as ordinary text with an
+        # unclosed tag body. The finish reason is the only thing separating it
+        # from a short reply, so it has to survive the stream.
+        truncated = "<nagent-write path=\"/tmp/x\">half a fi"
+        result, _ = self._stream_result([
+            self._chunk(content=truncated),
+            self._chunk(content=None, finish_reason="length"),
+        ])
+        self.assertEqual(result.text, truncated)
+        self.assertEqual(result.stop_reason, "length")
+        self.assertTrue(self.mod.output_was_truncated(result.stop_reason))
+
+    def test_stream_that_finishes_normally_reports_a_non_truncating_reason(self):
+        result, _ = self._stream_result([
+            self._chunk(content="<nagent-response>ok</nagent-response>"),
+            self._chunk(content=None, finish_reason="stop"),
+        ])
+        self.assertEqual(result.stop_reason, "stop")
+        self.assertFalse(self.mod.output_was_truncated(result.stop_reason))
+
+    def test_openai_requests_are_not_streamed(self):
+        # The asymmetry is real and worth stating: only the two
+        # OpenAI-compatible providers stream; the rest block on one response.
+        captured: dict = {}
+
+        class FakeResponses:
+            def create(self, **kwargs):
+                captured.update(kwargs)
+                return unittest.mock.Mock(output_text="ok", usage=None)
+
+        client = unittest.mock.Mock(responses=FakeResponses())
+        with unittest.mock.patch.object(self.mod, "require_package", return_value=lambda: client):
+            self.mod.generate_text_with_usage("hi", "openai", "gpt-5.5")
+        self.assertNotIn("stream", captured)
+
+    def test_anthropic_requests_are_streamed_with_one_shared_output_cap(self):
+        # Streamed via messages.stream(): the request carries the whole
+        # conversation and a thinking model can take minutes, so a non-streamed
+        # create() sits on the SDK's 10-minute timeout. The cap is one named
+        # constant, large because streaming makes a large cap free.
+        captured: dict = {}
+        fake = self._fake_anthropic(captured, blocks=[self._text_block("ok")])
+        with unittest.mock.patch.object(self.mod, "require_package", return_value=fake):
+            result = self.mod.generate_text_with_usage("hi", "anthropic", "claude-opus-5")
+        self.assertEqual(result.text, "ok")
+        self.assertEqual(captured["max_tokens"], self.mod.ANTHROPIC_MAX_OUTPUT_TOKENS)
+        self.assertGreater(self.mod.ANTHROPIC_MAX_OUTPUT_TOKENS, 8192)
+
+    def test_anthropic_reports_the_stop_reason_and_whether_it_truncated(self):
+        captured: dict = {}
+        fake = self._fake_anthropic(
+            captured, blocks=[self._text_block("half a fi")], stop_reason="max_tokens"
+        )
+        with unittest.mock.patch.object(self.mod, "require_package", return_value=fake):
+            result = self.mod.generate_text_with_usage("hi", "anthropic", "claude-opus-5")
+        self.assertEqual(result.stop_reason, "max_tokens")
+        self.assertTrue(self.mod.output_was_truncated(result.stop_reason))
+
+        finished = self._fake_anthropic(
+            captured, blocks=[self._text_block("done")], stop_reason="end_turn"
+        )
+        with unittest.mock.patch.object(self.mod, "require_package", return_value=finished):
+            result = self.mod.generate_text_with_usage("hi", "anthropic", "claude-opus-5")
+        self.assertEqual(result.stop_reason, "end_turn")
+        self.assertFalse(self.mod.output_was_truncated(result.stop_reason))
+
+    def test_output_was_truncated_spans_both_provider_vocabularies(self):
+        # anthropic says max_tokens, the OpenAI-compatible chat APIs say length.
+        # Callers read this predicate instead of learning either spelling.
+        self.assertTrue(self.mod.output_was_truncated("max_tokens"))
+        self.assertTrue(self.mod.output_was_truncated("length"))
+        for finished in ("end_turn", "stop", "stop_sequence", "refusal", None, ""):
+            self.assertFalse(self.mod.output_was_truncated(finished))
+
     def test_list_models_together_parses_bare_array(self):
         # Together returns a top-level JSON array, not OpenAI's {"data": [...]}.
         import contextlib
@@ -3268,19 +3612,45 @@ class NagentLlmConfigTests(unittest.TestCase):
             self.mod.generate_text_with_usage("hi", "openai", "gpt-5.5")
         self.assertNotIn("reasoning", captured)
 
-    def test_anthropic_applies_effort(self):
-        captured = {}
+    # ---- the anthropic seam -------------------------------------------------
+
+    @staticmethod
+    def _fake_anthropic(captured, blocks=(), usage=None, stop_reason=None, beta=False):
+        """A fake anthropic package whose messages.stream() is the context
+        manager the real SDK returns, handing back one final Message."""
+
+        class FakeStream:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+            def get_final_message(self):
+                return type(
+                    "FakeMessage",
+                    (),
+                    {"content": list(blocks), "usage": usage, "stop_reason": stop_reason},
+                )()
 
         class FakeMessages:
-            def create(self, **kwargs):
+            def stream(self, **kwargs):
                 captured.update(kwargs)
-                return unittest.mock.Mock(content=[], usage=None)
+                return FakeStream()
 
-        class FakeClient:
-            def __init__(self):
-                self.messages = FakeMessages()
+        messages = FakeMessages()
+        client = unittest.mock.Mock(
+            messages=messages, beta=unittest.mock.Mock(messages=messages)
+        )
+        return unittest.mock.Mock(Anthropic=lambda: client)
 
-        fake_anthropic = unittest.mock.Mock(Anthropic=FakeClient)
+    @staticmethod
+    def _text_block(text):
+        return type("FakeBlock", (), {"type": "text", "text": text})()
+
+    def test_anthropic_applies_effort(self):
+        captured = {}
+        fake_anthropic = self._fake_anthropic(captured)
         with unittest.mock.patch.object(self.mod, "require_package", return_value=fake_anthropic):
             self.mod.generate_text_with_usage("hi", "anthropic", "claude-fable-5", reasoning=5)
         self.assertEqual(captured["output_config"], {"effort": "max"})
@@ -3625,27 +3995,52 @@ class NagentLlmConfigTests(unittest.TestCase):
         self.assertEqual(self.mod.cache_prefix_blocks(message, [99]), message)
         self.assertEqual(self.mod.cache_prefix_blocks(message, None), message)
 
+    def test_cache_prefix_blocks_marks_the_whole_message_on_a_tail_boundary(self):
+        # A boundary at len(message) marks the last block too and leaves no
+        # unmarked trailing block: the caller's next request starts with this
+        # message, so the tail written here is read back instead of re-sent.
+        message = "abcdefgh"
+        blocks = self.mod.cache_prefix_blocks(message, [5, len(message)])
+        self.assertEqual(
+            blocks,
+            [
+                {"type": "text", "text": "abcde", "cache_control": {"type": "ephemeral"}},
+                {"type": "text", "text": "fgh", "cache_control": {"type": "ephemeral"}},
+            ],
+        )
+        self.assertEqual("".join(b["text"] for b in blocks), message)
+
+        # A boundary past the end is still dropped.
+        self.assertEqual(self.mod.cache_prefix_blocks(message, [len(message) + 1]), message)
+
+        # The tail boundary alone marks the one block covering everything.
+        self.assertEqual(
+            self.mod.cache_prefix_blocks(message, [len(message)]),
+            [{"type": "text", "text": message, "cache_control": {"type": "ephemeral"}}],
+        )
+
+    def test_cache_prefix_blocks_never_exceeds_the_provider_breakpoint_limit(self):
+        # Anthropic rejects more than 4 cache_control blocks per request.
+        message = "x" * 100
+        blocks = self.mod.cache_prefix_blocks(message, [10, 20, 30, 40, 50, 60, 100])
+        marked = [b for b in blocks if "cache_control" in b]
+        self.assertLessEqual(len(marked), 4)
+        self.assertEqual("".join(b["text"] for b in blocks), message)
+
     def test_anthropic_cache_boundaries_split_blocks_and_count_cached_usage(self):
         captured: dict = {}
-
-        class FakeMessages:
-            def create(self, **kwargs):
-                captured.update(kwargs)
-                usage = type(
-                    "FakeUsage",
-                    (),
-                    {
-                        "input_tokens": 7,
-                        "output_tokens": 3,
-                        "cache_read_input_tokens": 90,
-                        "cache_creation_input_tokens": 10,
-                    },
-                )()
-                block = type("FakeBlock", (), {"type": "text", "text": "anthropic ok"})()
-                return type("FakeResponse", (), {"content": [block], "usage": usage})()
-
-        fake_anthropic = unittest.mock.Mock(
-            Anthropic=lambda: unittest.mock.Mock(messages=FakeMessages())
+        usage = type(
+            "FakeUsage",
+            (),
+            {
+                "input_tokens": 7,
+                "output_tokens": 3,
+                "cache_read_input_tokens": 90,
+                "cache_creation_input_tokens": 10,
+            },
+        )()
+        fake_anthropic = self._fake_anthropic(
+            captured, blocks=[self._text_block("anthropic ok")], usage=usage
         )
         message = "s" * 100
         with unittest.mock.patch.object(self.mod, "require_package", return_value=fake_anthropic):
@@ -3663,6 +4058,16 @@ class NagentLlmConfigTests(unittest.TestCase):
         # input = uncached 7 + cache read 90 + cache write 10
         self.assertEqual(result.input_tokens, 107)
         self.assertEqual(result.output_tokens, 3)
+        # ...and the two parts survive as their own fields, so a caller can tell
+        # a cache hit from a cache miss instead of only seeing the total.
+        self.assertEqual(result.cache_read_tokens, 90)
+        self.assertEqual(result.cache_write_tokens, 10)
+
+    def test_providers_without_cache_reporting_report_zero_cache_tokens(self):
+        usage = type("FakeUsage", (), {"prompt_tokens": 40, "completion_tokens": 5})()
+        result = self.mod._result_with_usage("text", usage, "prompt")
+        self.assertEqual(result.input_tokens, 40)
+        self.assertEqual((result.cache_read_tokens, result.cache_write_tokens), (0, 0))
 
     def test_llm_text_forwards_cache_prefix_chars(self):
         mod = load_nagent_llm_text_module()

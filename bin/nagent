@@ -155,20 +155,35 @@ class TokenStats:
     conversation_input_tokens: int = 0
     recursive_input_tokens: int = 0
     recursive_output_tokens: int = 0
+    # Of recursive_input_tokens, the part the provider served from its prompt
+    # cache and the part it wrote into it. Zero on providers that report
+    # neither, so a zero read total is only evidence when the provider caches.
+    recursive_cache_read_tokens: int = 0
+    recursive_cache_write_tokens: int = 0
 
     def status_line(self) -> str:
         return (
             f"[Turns:{self.turn_count} "
             f"Conversation-Tokens:{self.conversation_input_tokens} "
             f"Tokens-In:{self.recursive_input_tokens} "
-            f"Tokens-Out:{self.recursive_output_tokens}]"
+            f"Tokens-Out:{self.recursive_output_tokens} "
+            f"Cache-Read:{self.recursive_cache_read_tokens} "
+            f"Cache-Write:{self.recursive_cache_write_tokens}]"
         )
 
-    def add_llm_turn(self, input_tokens: int, output_tokens: int) -> None:
+    def add_llm_turn(
+        self,
+        input_tokens: int,
+        output_tokens: int,
+        cache_read_tokens: int = 0,
+        cache_write_tokens: int = 0,
+    ) -> None:
         self.turn_count += 1
         self.conversation_input_tokens = input_tokens
         self.recursive_input_tokens += input_tokens
         self.recursive_output_tokens += output_tokens
+        self.recursive_cache_read_tokens += cache_read_tokens
+        self.recursive_cache_write_tokens += cache_write_tokens
 
     def add_recursive(self, input_tokens: int, output_tokens: int) -> None:
         self.recursive_input_tokens += input_tokens
@@ -180,6 +195,8 @@ class TokenStats:
             "conversation_input_tokens": self.conversation_input_tokens,
             "recursive_input_tokens": self.recursive_input_tokens,
             "recursive_output_tokens": self.recursive_output_tokens,
+            "recursive_cache_read_tokens": self.recursive_cache_read_tokens,
+            "recursive_cache_write_tokens": self.recursive_cache_write_tokens,
         }
 
 
@@ -235,22 +252,28 @@ def large_file_guidance() -> str:
 - Merge edits back with <nagent-file-patch index="{{index-path}}"/>."""
 
 
-def file_edit_rules(file_edit_path: Path | None, scratch_dir: Path | None = None) -> str:
+def file_edit_rules(file_edit_path: Path | None) -> str:
+    """The write-boundary rules. Both variants are byte-identical across
+    conversations on purpose: the two paths they used to name (the file-edit
+    target and this instance's scratch dir) are volatile, so they are stated
+    once under Instance/Environment and referred to from here. That keeps every
+    byte above Instance shareable as one cached prefix."""
     if file_edit_path is not None:
         return f"""File editing (this session):
-- You may use <nagent-write> on this file: {file_edit_path}
-- You may also write segment files from a split of this file (via <nagent-file-read>).
+- You may use <nagent-write> on the one file named as "file-edit target" under Instance below.
+- You may also write segment files from a split of that file (via <nagent-file-read>).
 - Merge segment edits with <nagent-file-patch index="{{index-path}}"/>.
 - Do not use shell commands to write files; use <nagent-write> for edits.
 {large_file_guidance()}"""
 
     return f"""File editing:
-- <nagent-write> may write only inside your scratch directory: {scratch_dir}
-  (each nagent instance has its own, so concurrent instances never collide). Put briefings,
-  generated sources, and other scratch files there — a write anywhere else is rejected.
+- <nagent-write> may write only inside your scratch directory, named as "scratch dir" under
+  Environment below (each nagent instance has its own, so concurrent instances never
+  collide). Put briefings, generated sources, and other scratch files there — a write
+  anywhere else is rejected.
 - To create or edit files elsewhere (project files), use nagent-file-edit.
 - Prefer <nagent-write>/nagent-file-edit over shell redirection for writes; if you must write via
-  shell, keep it inside {scratch_dir} so you do not collide with other instances.
+  shell, keep it inside that scratch dir so you do not collide with other instances.
 {large_file_guidance()}"""
 
 
@@ -799,7 +822,7 @@ Protocol rules:
 - Tag bodies are raw text. Do not escape characters. Never emit a literal close tag (e.g. </nagent-shell>) inside a body; the first matching close tag ends the body.
 - Emit nothing outside tags. Prose, unknown tags, and reasoning leaks (e.g. <thought>) are ignored and take no action — the turn proceeds on whatever valid tags it contains, or asks you to retry if there are none. A misshapen nagent tag (wrong attributes, missing body or close) comes back with a correction request.
 - After your action tags run, each result is appended to this conversation as a <nagent-*-result> block and you are called again. Never fabricate results; act on the appended ones.
-- After each of your turns nagent appends a self-closing <nagent-turn-status utc="..." turn="N" tokens_in_total="..." tokens_out_total="..." /> line (driver output, not something you emit). To measure the wall-clock and token cost of any span — e.g. testing one hypothesis — diff the totals and UTC times of the status lines that bracket it.
+- After each of your turns nagent appends a self-closing <nagent-turn-status utc="..." turn="N" tokens_in_total="..." tokens_out_total="..." cache_read_total="..." cache_write_total="..." /> line (driver output, not something you emit). To measure the wall-clock and token cost of any span — e.g. testing one hypothesis — diff the totals and UTC times of the status lines that bracket it. The cache totals are the part of tokens_in_total the provider served from, and wrote to, its prompt cache; both stay 0 on providers that do not report cache use.
 - Multiple tags in one turn run in order.
 - A result with an error status is data: change your approach instead of retrying the identical action.
 
@@ -816,7 +839,7 @@ Context management (every nagent conversation, including sub-conversations):
 Conversations are data (create, reuse, hand off):
 - Reuse a worker: <nagent-conversation conversation-file="{{name}}"> continues that conversation with its accumulated context. Name workers you will call again (e.g. "test-runner"); use a fresh unnamed sub-conversation when isolation matters more than memory.
 - Resume saved work: conversation-name="{{saved-name}}" starts the child from a conversation the user saved with --save-conversation.
-- Author a worker's context: write a curated briefing into your scratch dir with <nagent-write> (e.g. {scratch_dir}/briefing.md), then spawn <nagent-conversation conversation-file="{scratch_dir}/briefing.md">. Include only what the worker needs: goal, constraints, paths, known facts.
+- Author a worker's context: write a curated briefing into your scratch dir with <nagent-write> (e.g. briefing.md there), then spawn <nagent-conversation conversation-file="{{that path}}">. Include only what the worker needs: goal, constraints, paths, known facts.
 - Hand off when noisy: if this conversation is mostly stale tool output, distill goal/state/decisions into a sub-conversation prompt, delegate the rest, and tell your caller about the handoff. Never rewrite your own conversation file while running.
 - High-stakes decision? Spawn 2-3 workers on the same authored briefing plus a judge worker to compare results; spend those tokens only when the decision warrants it.
 - This conversation persists across invocations, and the user may edit it between runs. The current file is the source of truth.
@@ -835,8 +858,8 @@ Campaigns (long-horizon plans as data; drive with nagent-campaign via <nagent-sh
 - Use nagent-campaign update --dry-run first when cost is unclear. Never edit a campaign's index.yaml or item files directly from this conversation; drive changes through the CLI.
 - Asked about ongoing work? Check nagent-campaign status before answering from memory.
 
-{file_edit_rules(file_edit_path, scratch_dir)}{campaign_worker_block}
-{tools_block}{context_layers_block}{campaign_status_block}{knowledge_block}{file_edit_detail_block}
+{file_edit_rules(file_edit_path)}{campaign_worker_block}
+{tools_block}{context_layers_block}{campaign_status_block}{knowledge_block}
 Instance:
 - invocation: {invocation}
 - conversation: {conversation_name}
@@ -846,7 +869,8 @@ Environment:
 - nagent root: {root}
 - nagent process: {process_path}
 - cwd: {Path.cwd()}
-- host (uname -a): {host_uname()}{git_section}
+- scratch dir: {scratch_dir}
+- host (uname -a): {host_uname()}{git_section}{file_edit_detail_block}
 </initial_context>"""
 
 
@@ -1095,7 +1119,25 @@ def turn_status_block(token_stats: TokenStats, now: datetime, *, invalid_ref: st
         f'utc="{now.strftime("%Y-%m-%dT%H:%M:%SZ")}" '
         f'turn="{token_stats.turn_count}" '
         f'tokens_in_total="{token_stats.recursive_input_tokens}" '
-        f'tokens_out_total="{token_stats.recursive_output_tokens}"{invalid} />'
+        f'tokens_out_total="{token_stats.recursive_output_tokens}" '
+        f'cache_read_total="{token_stats.recursive_cache_read_tokens}" '
+        f'cache_write_total="{token_stats.recursive_cache_write_tokens}"{invalid} />'
+    )
+
+
+def truncation_note(stop_reason: str) -> str:
+    """What nagent tells the model when the provider cut its turn off.
+
+    Without this the conversation records a turn with an unfinished tag body and
+    a generic "invalid format" complaint, and the model has no way to tell a
+    mistake from a ceiling — so it rewrites the whole turn instead of continuing,
+    and pays the full input again each time."""
+    return (
+        f"Your previous turn was cut off by the provider before you finished it "
+        f"(stop reason: {stop_reason}); the text above ends mid-output and its last "
+        "tag body is incomplete. This is a length limit, not a formatting mistake. "
+        "Continue from where it stopped, in smaller pieces: emit fewer tags per turn, "
+        "and for a large file write it in parts or delegate the write."
     )
 
 
@@ -1158,7 +1200,29 @@ def coerce_token_count(value) -> int:
         return 0
 
 
-def parse_llm_json_output(stdout: str) -> tuple[str, int, int] | None:
+@dataclass
+class LlmTurn:
+    """One turn as it crosses the nagent-llm-text boundary: the whole wire
+    protocol in one flat record, with every field defaulted so an older or
+    thinner payload reads as absent rather than failing.
+
+    cache_read/cache_write_tokens are a subset of input_tokens. truncated says
+    the provider cut the reply off at its output cap, so the last tag body is
+    unfinished; stop_reason is that provider's own word for why, kept only for
+    the message nagent writes into the conversation."""
+
+    text: str
+    input_tokens: int = 0
+    output_tokens: int = 0
+    cache_read_tokens: int = 0
+    cache_write_tokens: int = 0
+    stop_reason: str | None = None
+    truncated: bool = False
+
+
+def parse_llm_json_output(stdout: str) -> LlmTurn | None:
+    """The LlmTurn in a nagent-llm-text --json payload, or None when stdout is
+    not that shape (a provider that printed something else, or plain text)."""
     try:
         payload = json.loads(stdout)
     except json.JSONDecodeError:
@@ -1166,21 +1230,45 @@ def parse_llm_json_output(stdout: str) -> tuple[str, int, int] | None:
     response = payload.get("response")
     if not isinstance(response, str):
         return None
-    return (
-        response,
-        coerce_token_count(payload.get("input_tokens")),
-        coerce_token_count(payload.get("output_tokens")),
+    stop_reason = payload.get("stop_reason")
+    return LlmTurn(
+        text=response,
+        input_tokens=coerce_token_count(payload.get("input_tokens")),
+        output_tokens=coerce_token_count(payload.get("output_tokens")),
+        cache_read_tokens=coerce_token_count(payload.get("cache_read_tokens")),
+        cache_write_tokens=coerce_token_count(payload.get("cache_write_tokens")),
+        stop_reason=stop_reason if isinstance(stop_reason, str) else None,
+        truncated=payload.get("truncated") is True,
     )
 
 
 def conversation_cache_boundaries(text: str) -> list[int]:
-    """Character offsets ending the stable prefixes of a conversation file.
+    """Character offsets ending the cacheable prefixes of a conversation file.
 
-    Two boundaries when the file starts with an initial-context block: the
-    start of the volatile Instance section (shared byte-for-byte across
-    conversations of the same mode and root) and the end of the context block
-    (stable across every turn of this conversation). Providers that cache on
-    block boundaries reuse those prefixes instead of re-reading them."""
+    Two, when the file starts with an initial-context block: the start of the
+    volatile Instance section (byte-identical across conversations of the same
+    mode and root, so separate conversations share it) and the end of the context
+    block (fixed for this conversation's whole run). Providers that cache on
+    block boundaries reuse these; the rest ignore the offsets.
+
+    The end of the file is deliberately NOT a boundary, though cache_prefix_blocks
+    supports one there. The conversation is append-only, so marking it looks like
+    it should let the next turn read this turn's history back — and measured
+    against claude-opus-5, it does not. Numbers from one real conversation here
+    (12570 prompt tokens, prefix through the context block 7917):
+
+        identical message, no tail mark      read 7917
+        identical message, tail marked       read 12570   <- the mark does work
+        grown message, tail marked           read 7917    <- no gain
+        grown message, previous turn's end
+          also kept as a 4th breakpoint      read 7917    <- still no gain
+
+    Only a byte-identical repeat reads the tail entry, and nagent never sends one:
+    every turn appends. So the mark would buy a cache write per turn against a
+    read that does not happen. Measured through OpenRouter, the one Claude
+    endpoint with credit here, so it is possible the Anthropic API behaves
+    differently — re-check with tests/… (see the README) before re-enabling by
+    appending len(text) here."""
     span = find_block_span(text, INITIAL_CONTEXT_BLOCK)
     if span is None or span[0] != 0:
         return []
@@ -1197,7 +1285,10 @@ def call_llm(
     conversation_file: Path,
     llm: LlmSettings,
     token_stats: TokenStats,
-) -> tuple[str | None, str | None]:
+) -> tuple[str | None, str | None, str | None]:
+    """(output, error, truncated-at-cap reason). The third value is the
+    provider's stop reason when it cut the reply off at the output cap, and None
+    otherwise — including when the provider reports no stop reason at all."""
     try:
         conversation_text = conversation_file.read_text(encoding="utf-8")
     except OSError:
@@ -1230,25 +1321,22 @@ def call_llm(
                 text=True,
             )
     except Exception as exc:
-        return None, str(exc)
+        return None, str(exc), None
     if result.returncode != 0:
         error = result.stderr.strip() or result.stdout.strip() or "nagent-llm-text failed"
-        return None, error
+        return None, error, None
 
-    parsed = parse_llm_json_output(result.stdout)
-    if parsed is None:
-        llm_output = result.stdout
-        input_tokens = token_stats.conversation_input_tokens
-        output_tokens = estimate_token_count(llm_output)
-    else:
-        llm_output, input_tokens, output_tokens = parsed
-        if input_tokens == 0:
-            input_tokens = token_stats.conversation_input_tokens
-        if output_tokens == 0:
-            output_tokens = estimate_token_count(llm_output)
+    turn = parse_llm_json_output(result.stdout)
+    if turn is None:
+        # Not a --json payload: take stdout as the whole reply and estimate.
+        turn = LlmTurn(text=result.stdout)
+    input_tokens = turn.input_tokens or token_stats.conversation_input_tokens
+    output_tokens = turn.output_tokens or estimate_token_count(turn.text)
 
-    token_stats.add_llm_turn(input_tokens, output_tokens)
-    return llm_output, None
+    token_stats.add_llm_turn(
+        input_tokens, output_tokens, turn.cache_read_tokens, turn.cache_write_tokens
+    )
+    return turn.text, None, (turn.stop_reason or "output cap") if turn.truncated else None
 
 
 def execute_read(path: str) -> str:
@@ -2051,8 +2139,9 @@ def run_agent_loop(
             run_safety_net(conversation_file, root, llm, safety_settings)
         llm_output, error = None, None
         tags, ignored = [], []
+        truncated_at = None
         for attempt in range(MAX_FORMAT_RETRIES):
-            llm_output, error = call_llm(conversation_file, llm, token_stats)
+            llm_output, error, truncated_at = call_llm(conversation_file, llm, token_stats)
             if error is not None:
                 append_to_conversation(
                     conversation_file,
@@ -2064,19 +2153,30 @@ def run_agent_loop(
             tags, ignored, parse_error = parse_response(llm_output)
             if parse_error is not None:
                 # A known tag was malformed: ask the model to fix it and retry.
+                # A cut-off turn lands here too, and its cause is not a format
+                # mistake — say so, or the model retries the same oversized turn.
+                note = (
+                    truncation_note(truncated_at)
+                    if truncated_at
+                    else f"Invalid nagent response format: {parse_error}. "
+                    "Respond only with valid nagent tags."
+                )
                 append_to_conversation(
                     conversation_file,
                     f"<agent-response>\n{llm_output}\n</agent-response>\n"
-                    f"<system>Invalid nagent response format: {parse_error}. "
-                    f"Respond only with valid nagent tags.</system>",
+                    f"<system>{note}</system>",
                 )
                 continue
             if tags:
                 break
 
-            # No actionable tag. If we tolerated junk, say what we ignored;
-            # otherwise the turn was empty. Either way, retry.
-            note = ignored_correction(ignored) if ignored else "Response contains no nagent tags."
+            # No actionable tag. If the provider cut the turn off, that is the
+            # reason and the model needs it; if we tolerated junk, say what we
+            # ignored; otherwise the turn was empty. Either way, retry.
+            if truncated_at:
+                note = truncation_note(truncated_at)
+            else:
+                note = ignored_correction(ignored) if ignored else "Response contains no nagent tags."
             append_to_conversation(
                 conversation_file,
                 f"<agent-response>\n{llm_output}\n</agent-response>\n<system>{note}</system>",
@@ -2114,6 +2214,14 @@ def run_agent_loop(
             # the repetition can't become precedent. No sidecar needed.
             body = cleaned_body
         append_to_conversation(conversation_file, f"<agent-response>\n{body}\n</agent-response>")
+        if truncated_at:
+            # The turn parsed into runnable tags, but the provider still stopped
+            # it at the cap: whatever came after the last complete tag is gone.
+            # Record it so the next turn continues instead of assuming it acted
+            # on a whole plan.
+            append_to_conversation(
+                conversation_file, f"<system>{truncation_note(truncated_at)}</system>"
+            )
         if ignored:
             append_to_conversation(conversation_file, f"<system>{ignored_correction(ignored)}</system>")
         elif duplicates_removed:
@@ -2152,6 +2260,14 @@ def run_agent_loop(
             continue
 
         if should_continue:
+            continue
+
+        if truncated_at:
+            # The turn would end the run, but the provider cut it off — and
+            # parse_response captures an unclosed <nagent-response> to EOF, so
+            # "it parsed" is not evidence the answer is whole. The note is
+            # already in the conversation; go round again rather than hand a
+            # half-written answer to the caller as the result.
             continue
 
         if pending_message_paths(inbox):
@@ -2546,7 +2662,9 @@ def summarize_conversation(
         input_tokens = estimate_token_count(summary_prompt)
         output_tokens = estimate_token_count(summary)
     else:
-        summary, input_tokens, output_tokens = parsed
+        summary = parsed.text
+        input_tokens = parsed.input_tokens
+        output_tokens = parsed.output_tokens
         if input_tokens == 0:
             input_tokens = estimate_token_count(summary_prompt)
         if output_tokens == 0:

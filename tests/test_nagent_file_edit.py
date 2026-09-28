@@ -118,9 +118,15 @@ class FileEditNagentTests(unittest.TestCase):
             "conv",
         )
         self.assertIn("may write only inside your scratch directory", text)
-        self.assertIn("nagent-conv/briefing.md", text)  # scratch path interpolated for "conv"
         self.assertIn("nagent-file-edit", text)
         self.assertIn("nagent-file-read", text)
+        # The scratch path is named once, below Instance, and nowhere above it:
+        # the rules text has to stay byte-identical across conversations to be a
+        # shareable cached prefix.
+        self.assertIn("- scratch dir: /tmp/nagent-conv", text)
+        stable, volatile = text.split("\nInstance:", 1)
+        self.assertNotIn("/tmp/nagent-conv", stable)
+        self.assertIn("/tmp/nagent-conv", volatile)
 
     def test_file_edit_context_allows_specific_file(self):
         target = Path("/home/macton/nagent/bin/nagent")
@@ -132,11 +138,34 @@ class FileEditNagentTests(unittest.TestCase):
             file_edit_path=target,
             file_edit_id="2050:999",
         )
-        self.assertIn(f"You may use <nagent-write> on this file: {target}", text)
-        self.assertIn("segment files from a split of this file", text)
+        self.assertIn('named as "file-edit target" under Instance', text)
+        self.assertIn("segment files from a split of that file", text)
         self.assertIn("nagent-file-patch", text)
         context = text.split("</initial_context>", 1)[0]
         self.assertNotIn("may write only inside your scratch directory", context)
+        # The target is named once, below Instance. The rules above it carry no
+        # path, so they are byte-identical for every file-edit conversation.
+        _, volatile = text.split("\nInstance:", 1)
+        self.assertIn(f"- file-edit target: {target}", volatile)
+
+    def test_file_edit_stable_prefix_is_identical_across_target_files(self):
+        # Everything above Instance must be byte-for-byte equal between two
+        # file-edit conversations on different files, or the cached prefix that
+        # conversation_cache_boundaries marks cannot be shared between them.
+        def stable_prefix(name, target):
+            text = self.mod.create_initial_text(
+                Path("/tmp/nagent-root"),
+                NAGENT.resolve(),
+                "user",
+                name,
+                file_edit_path=target,
+                file_edit_id="2050:1",
+            )
+            return text.split("\nInstance:", 1)[0]
+
+        a = stable_prefix("conv-a", Path("/tmp/project/alpha.c"))
+        b = stable_prefix("conv-b", Path("/tmp/project/beta/other.py"))
+        self.assertEqual(a, b)
 
     def test_file_edit_context_includes_git_history_and_summary(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -229,6 +258,12 @@ class FileEditNagentTests(unittest.TestCase):
             self.assertIn("Do not edit them unless the user request or evidence requires it.", text)
             self.assertIn("{file-summary}", text)
             self.assertIn("Current file summary.", text)
+            # Per-file history and summary are volatile: they belong below
+            # Instance, outside the prefix shared across conversations.
+            stable, volatile = text.split("\nInstance:", 1)
+            self.assertNotIn("{file-history}", stable)
+            self.assertIn("{file-history}", volatile)
+            self.assertIn("{file-summary}", volatile)
 
     def test_file_edit_context_reuses_existing_history_until_new_commit(self):
         with tempfile.TemporaryDirectory() as tmp:

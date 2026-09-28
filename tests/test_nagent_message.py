@@ -148,7 +148,7 @@ class LoopDeliveryTests(unittest.TestCase):
             with unittest.mock.patch.object(
                 self.mod,
                 "call_llm",
-                return_value=("<nagent-response>done</nagent-response>", None),
+                return_value=("<nagent-response>done</nagent-response>", None, None),
             ):
                 code, responses = self.mod.run_agent_loop(
                     conversation,
@@ -178,7 +178,7 @@ class LoopDeliveryTests(unittest.TestCase):
                 if len(calls) == 1:
                     # Arrives while the first turn is in flight.
                     self.lib.enqueue_messages(inbox, ["late message"])
-                return "<nagent-response>ok</nagent-response>", None
+                return "<nagent-response>ok</nagent-response>", None, None
 
             with unittest.mock.patch.object(self.mod, "call_llm", fake_call_llm):
                 code, responses = self.mod.run_agent_loop(

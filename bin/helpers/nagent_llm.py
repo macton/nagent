@@ -18,6 +18,22 @@ PROVIDER_ALIASES = {"gemini": "google"}
 TOGETHER_BASE_URL = "https://api.together.ai/v1"
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
 
+# Output cap for the anthropic paths. Large because those requests are streamed,
+# so a big cap costs nothing until it is used and no longer risks an HTTP
+# timeout. 64000 is inside the 128K output limit of every current Claude model
+# and inside Haiku 4.5's lower one.
+# ASSUMPTION: no previous-generation model with an 8192 cap is in use here. One
+# would be rejected with a 400 naming its own limit — an explicit failure, not a
+# silent truncation, which is the point.
+ANTHROPIC_MAX_OUTPUT_TOKENS = 64000
+
+# Stop reasons that mean "the provider cut the reply off at the output cap", in
+# each provider's own vocabulary: anthropic says max_tokens, the
+# OpenAI-compatible chat APIs say length. This set is the only place that
+# knowledge lives; everything downstream reads the boolean derived from it, so a
+# consumer never has to learn a provider's spelling.
+TRUNCATION_STOP_REASONS = frozenset({"max_tokens", "length"})
+
 # For the claude-code provider, "default" means Claude Code's own configured
 # model: the SDK is invoked with model=None and Claude Code decides.
 CLAUDE_CODE_DEFAULT_MODEL = "default"
@@ -88,11 +104,29 @@ PACKAGE_HINTS = {
 }
 
 
+def output_was_truncated(stop_reason: str | None) -> bool:
+    """Whether the reply stopped because it hit the output cap, rather than
+    because the model finished. A truncated reply is not a short reply: its last
+    tag body is unfinished, so the caller must not treat it as a whole turn."""
+    return stop_reason in TRUNCATION_STOP_REASONS
+
+
 @dataclass
 class LlmResult:
     text: str
     input_tokens: int = 0
     output_tokens: int = 0
+    # Of input_tokens, the part the provider served from its prompt cache and the
+    # part it wrote into it. Both are zero for providers with no cache reporting,
+    # so input_tokens stays "tokens sent" everywhere and these two only ever
+    # explain it. They are the only ground truth that caching is working.
+    cache_read_tokens: int = 0
+    cache_write_tokens: int = 0
+    # The provider's own stop string, verbatim and un-normalized (anthropic:
+    # end_turn/max_tokens/refusal/...; OpenAI-compatible: stop/length/...).
+    # None on providers that do not report one. Read it through
+    # output_was_truncated() rather than comparing it yourself.
+    stop_reason: str | None = None
 
 
 def default_config_path() -> Path:
@@ -359,12 +393,19 @@ def _openai_compatible_chat(client, model, messages, reasoning=None):
     models (e.g. Together Qwen/Qwen3.7-Plus) ONLY support streaming and reject
     a non-streamed request; streaming is accepted by OpenRouter and the other
     compatible chat models used here. Accumulates delta text and returns
-    (text, usage); usage arrives in the final chunk via include_usage when the
-    provider supports it.
+    (text, usage, finish_reason); usage arrives in the final chunk via
+    include_usage when the provider supports it, and the finish reason in
+    whichever chunk carries one ("length" when the reply hit the output cap).
+
+    Only content deltas become text. reasoning_content, which some models
+    (Together's Qwen family) stream alongside it, is deliberately dropped: the
+    caller parses this text for protocol tags, and reasoning there would be a
+    protocol violation.
 
     reasoning, when set, is sent as the OpenAI-compatible reasoning_effort."""
     parts: list[str] = []
     usage = None
+    finish_reason = None
     extra = {"extra_body": {"reasoning_effort": reasoning}} if reasoning is not None else {}
     stream = client.chat.completions.create(
         model=model,
@@ -377,11 +418,13 @@ def _openai_compatible_chat(client, model, messages, reasoning=None):
         if getattr(chunk, "usage", None):
             usage = chunk.usage
         for choice in getattr(chunk, "choices", None) or []:
+            if getattr(choice, "finish_reason", None):
+                finish_reason = choice.finish_reason
             delta = getattr(choice, "delta", None)
             content = getattr(delta, "content", None) if delta is not None else None
             if content:
                 parts.append(content)
-    return "".join(parts), usage
+    return "".join(parts), usage, finish_reason
 
 
 def _together_chat(client, model, messages, reasoning=None):
@@ -559,13 +602,17 @@ def _usage_value(usage, *names: str) -> int:
     return 0
 
 
-def _result_with_usage(text: str, usage, input_text: str | None = None) -> LlmResult:
+def _result_with_usage(
+    text: str, usage, input_text: str | None = None, stop_reason: str | None = None
+) -> LlmResult:
     input_tokens = _usage_value(usage, "input_tokens", "prompt_tokens", "prompt_token_count")
     # Anthropic reports cached prompt tokens separately; fold them back in so
-    # input_tokens stays "tokens sent" across providers. Other providers lack
-    # these fields and contribute zero.
-    input_tokens += _usage_value(usage, "cache_read_input_tokens")
-    input_tokens += _usage_value(usage, "cache_creation_input_tokens")
+    # input_tokens stays "tokens sent" across providers, and keep them as their
+    # own fields so a caller can see whether the cache was hit. Other providers
+    # lack these fields and contribute zero.
+    cache_read_tokens = _usage_value(usage, "cache_read_input_tokens")
+    cache_write_tokens = _usage_value(usage, "cache_creation_input_tokens")
+    input_tokens += cache_read_tokens + cache_write_tokens
     output_tokens = _usage_value(
         usage,
         "output_tokens",
@@ -584,6 +631,9 @@ def _result_with_usage(text: str, usage, input_text: str | None = None) -> LlmRe
         text=text,
         input_tokens=input_tokens,
         output_tokens=output_tokens,
+        cache_read_tokens=cache_read_tokens,
+        cache_write_tokens=cache_write_tokens,
+        stop_reason=stop_reason,
     )
 
 
@@ -662,13 +712,21 @@ def _claude_code_generate(
 
 def cache_prefix_blocks(message: str, cache_boundaries: list[int] | None):
     """Split a message into content blocks at the given character offsets,
-    marking each prefix block with cache_control so providers that cache on
-    block boundaries can reuse stable prefixes. Returns the plain string when
-    no valid boundary exists. At most 3 prefix blocks (provider limit is 4
-    breakpoints per request)."""
+    marking each block that ends at a boundary with cache_control so providers
+    that cache on block boundaries can reuse stable prefixes. Returns the plain
+    string when no valid boundary exists.
+
+    A boundary at exactly len(message) marks the whole message, which is what a
+    caller wants when this request's message is itself the prefix of the next
+    one (an append-only conversation file): the tail written here is read back
+    on the next turn instead of being re-processed. Callers whose tail differs
+    per request (a batch of items, a one-shot question) must leave it off — the
+    mark would be a write premium nothing ever reads.
+
+    At most 4 marked blocks (the provider limit is 4 breakpoints per request)."""
     if not cache_boundaries:
         return message
-    points = sorted({b for b in cache_boundaries if 0 < b < len(message)})[:3]
+    points = sorted({b for b in cache_boundaries if 0 < b <= len(message)})[:4]
     if not points:
         return message
     blocks = []
@@ -682,7 +740,8 @@ def cache_prefix_blocks(message: str, cache_boundaries: list[int] | None):
             }
         )
         start = point
-    blocks.append({"type": "text", "text": message[start:]})
+    if start < len(message):
+        blocks.append({"type": "text", "text": message[start:]})
     return blocks
 
 
@@ -709,13 +768,24 @@ def generate_text_with_usage(
         anthropic = require_package(provider)
         client = anthropic.Anthropic()
         kwargs = {"output_config": {"effort": native}} if native is not None else {}
-        response = client.messages.create(
+        # Streamed, not because anything here consumes the deltas, but because
+        # the request cannot afford an HTTP timeout: the whole conversation goes
+        # up as one message, thinking models take minutes on a hard turn, and the
+        # SDK retries twice before giving up. get_final_message() hands back the
+        # same Message a non-streamed create() would have returned.
+        with client.messages.stream(
             model=model,
-            max_tokens=8192,
+            max_tokens=ANTHROPIC_MAX_OUTPUT_TOKENS,
             messages=[{"role": "user", "content": cache_prefix_blocks(message, cache_boundaries)}],
             **kwargs,
+        ) as stream:
+            response = stream.get_final_message()
+        return _result_with_usage(
+            _anthropic_text(response),
+            getattr(response, "usage", None),
+            message,
+            stop_reason=getattr(response, "stop_reason", None),
         )
-        return _result_with_usage(_anthropic_text(response), getattr(response, "usage", None), message)
 
     if provider == "google":
         genai = require_package(provider)
@@ -739,16 +809,20 @@ def generate_text_with_usage(
         # Responses API, so this path differs from the openai branch above.
         # cache_boundaries is ignored: Together has no block-cache API.
         client = _together_client()
-        text, usage = _together_chat(client, model, [{"role": "user", "content": message}], reasoning=native)
-        return _result_with_usage(text, usage, message)
+        text, usage, finish_reason = _together_chat(
+            client, model, [{"role": "user", "content": message}], reasoning=native
+        )
+        return _result_with_usage(text, usage, message, stop_reason=finish_reason)
 
     if provider == "openrouter":
         # OpenRouter implements the chat completions API, not the OpenAI
         # Responses API. cache_boundaries is ignored: OpenRouter has no
         # nagent-supported block-cache API.
         client = _openrouter_client()
-        text, usage = _openrouter_chat(client, model, [{"role": "user", "content": message}], reasoning=native)
-        return _result_with_usage(text, usage, message)
+        text, usage, finish_reason = _openrouter_chat(
+            client, model, [{"role": "user", "content": message}], reasoning=native
+        )
+        return _result_with_usage(text, usage, message, stop_reason=finish_reason)
 
     if provider == "claude-code":
         return _claude_code_generate(message, model)
@@ -854,9 +928,11 @@ def _anthropic_upload(path: Path, prompt: str, model: str) -> LlmResult:
             "source": {"type": "file", "file_id": uploaded.id},
         }
 
-    response = client.beta.messages.create(
+    # Streamed for the same reason as the text path, and sharing its cap: a
+    # whole uploaded document goes up with the prompt.
+    with client.beta.messages.stream(
         model=model,
-        max_tokens=8192,
+        max_tokens=ANTHROPIC_MAX_OUTPUT_TOKENS,
         betas=["files-api-2025-04-14"],
         messages=[
             {
@@ -867,8 +943,14 @@ def _anthropic_upload(path: Path, prompt: str, model: str) -> LlmResult:
                 ],
             }
         ],
+    ) as stream:
+        response = stream.get_final_message()
+    return _result_with_usage(
+        _anthropic_text(response),
+        getattr(response, "usage", None),
+        prompt,
+        stop_reason=getattr(response, "stop_reason", None),
     )
-    return _result_with_usage(_anthropic_text(response), getattr(response, "usage", None), prompt)
 
 
 def _google_wait_for_file(client, uploaded):

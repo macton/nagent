@@ -9,6 +9,7 @@ sys.path.insert(0, str(HELPERS_DIR))
 from nagent_llm import (
     add_llm_arguments,
     generate_text_with_usage,
+    output_was_truncated,
     reasoning_value_from_args,
     resolve_from_args,
 )
@@ -48,7 +49,9 @@ def main() -> None:
         metavar="N",
         help=(
             "Character offset ending a stable message prefix; may be repeated. "
-            "Providers that cache on block boundaries reuse the marked prefixes."
+            "Providers that cache on block boundaries reuse the marked prefixes. "
+            "An offset equal to the message length marks the whole message, for "
+            "a caller whose next request starts with this one."
         ),
     )
     add_llm_arguments(parser)
@@ -80,6 +83,15 @@ def main() -> None:
                 "response": result.text,
                 "input_tokens": result.input_tokens,
                 "output_tokens": result.output_tokens,
+                # Of input_tokens: served from the provider's prompt cache, and
+                # written into it. Zero on providers that report neither.
+                "cache_read_tokens": result.cache_read_tokens,
+                "cache_write_tokens": result.cache_write_tokens,
+                # The provider's own stop string, plus the one fact a consumer
+                # acts on. The vocabulary differs per provider; the boolean does
+                # not, so nothing downstream has to learn the spellings.
+                "stop_reason": result.stop_reason,
+                "truncated": output_was_truncated(result.stop_reason),
             }
         )
     else:

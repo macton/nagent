@@ -88,6 +88,34 @@ Code via the Claude Agent SDK and authenticates with Claude Code's own login,
 no API key in the environment. `together` is OpenAI-wire-compatible and reuses
 the `openai` SDK pointed at `https://api.together.ai/v1`.
 
+Some of those requests are streamed and some are not, and the split is a
+decision, not an accident. `anthropic` and the two OpenAI-wire providers
+(`together`, `openrouter`) stream; `claude-code` streams because the Agent SDK
+does; `openai`, `google`, and `cursor` block on one response. The reason to
+stream is never that anything here consumes the deltas — nothing does, the text
+is accumulated and returned whole. It is that a nagent request carries the
+entire conversation up as one message and a thinking model can spend minutes on
+a hard turn, which is exactly the shape an HTTP timeout kills; streamed, the
+output cap can then be large (`ANTHROPIC_MAX_OUTPUT_TOKENS`, one constant) so a
+turn that writes a real file is not cut in half. `together`'s Qwen models go
+further and reject a non-streamed request outright.
+
+A stopped reply is not a short reply. Every provider that says why it stopped
+has its own word for hitting the cap — anthropic `max_tokens`, the chat APIs
+`length` — so `nagent_llm.py` keeps that vocabulary in one frozenset, exposes
+`output_was_truncated()`, and puts both the raw `stop_reason` and a derived
+`truncated` boolean on the `--json` wire. The loop reads the boolean and, when
+it is set, writes the fact into the conversation as a `<system>` note instead of
+complaining about formatting. It matters because a cut-off turn ends with an
+unfinished tag body: told "invalid format", a model rewrites the same oversized
+turn and pays the full input again, three times, and then the run aborts with no
+record of why. Told "you hit a length limit, continue in smaller pieces", it
+continues. The note is appended even when the turn did parse and run, because
+whatever came after its last complete tag is gone either way — and a truncated
+turn is never allowed to end the run, since `parse_response` captures an
+unclosed `<nagent-response>` to EOF and would otherwise hand the caller half an
+answer as the result.
+
 `bin/nagent-llm-upload` is the sibling for artifacts that need upload APIs:
 images, PDFs, office files, code documents. It rejects `.zip`, enforces a
 50 MB limit, returns text or JSON.
@@ -191,12 +219,43 @@ project files are edited through per-file conversations (Part VI). Say it
 plainly: this is a convention-based reference implementation, not a sandbox.
 `<nagent-shell>` runs with your user's permissions.
 
-The loop passes the conversation's stable prefix boundaries to
+The loop passes the conversation's cacheable prefix boundaries to
 `nagent-llm-text` (`--cache-prefix-chars`), and providers that cache on block
-boundaries reuse the shared context each turn. `TokenStats` tracks turns,
-conversation input size, and recursive input/output tokens; child `--json`
-output rolls up into the parent's totals, and cached prompt tokens fold back
-into the counts, so accounting still means "tokens sent". No provider usage?
+boundaries reuse them each turn. There are two, and they split the initial
+context at `Instance:`: everything above it is byte-identical across
+conversations of the same mode and root (which is why no per-conversation path is
+interpolated up there — the scratch dir and the file-edit target are named once,
+below it), and everything up to `</initial_context>` is fixed for this
+conversation's whole run.
+
+There is an obvious third boundary that nagent does **not** use, and the reason
+is the more useful thing to know. The file is append-only within a run, so this
+turn's whole message is the prefix of the next turn's message; marking its end
+ought to let the next turn read the accumulated history back instead of re-sending
+it. Measured against `claude-opus-5`, it does not. On one real 12572-token
+conversation: with the two shipped boundaries a repeat reads 7917 tokens (the
+prefix through the context block); mark the file end too and a repeat reads
+12570, all of it — so the mark genuinely works; but send a *grown* message, which
+is what every turn actually sends, and the read drops back to 7917 whether the
+end is marked or not, and whether or not the previous turn's end is kept as a
+fourth breakpoint. Only a byte-identical repeat reads that entry, and nagent
+never sends one. So the mark would buy a cache write every turn against a read
+that does not happen, and `cache_prefix_blocks` keeps the capability (a boundary
+at `len(message)` marks the whole message) while `conversation_cache_boundaries`
+declines to use it. `tests/live/cache_probe.py` is the measurement, kept runnable:
+it spends money and needs a live key, so it is not in the unittest suite. Re-run
+it against the Anthropic API directly if you get a key there — this was measured
+through OpenRouter, the only Claude endpoint with credit on the machine where it
+was written.
+
+`TokenStats` tracks turns, conversation input size, and recursive input/output
+tokens; child `--json` output rolls up into the parent's totals. Cached prompt
+tokens fold into the input count, so accounting still means "tokens sent", and
+they are *also* carried separately — `cache_read_tokens`/`cache_write_tokens` on
+the result, `Cache-Read`/`Cache-Write` in the status line, `cache_read_total`/
+`cache_write_total` on every `<nagent-turn-status>`. Those two numbers are the
+only evidence that caching is working at all: a read total that stays 0 on a
+caching provider means something above the boundary changed. No provider usage?
 Estimate from character count.
 
 **Example**

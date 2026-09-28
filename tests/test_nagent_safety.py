@@ -320,13 +320,16 @@ class SafetyNetTests(unittest.TestCase):
 
     def test_turn_status_block_carries_utc_and_token_totals(self):
         stats = self.mod.TokenStats()
-        stats.add_llm_turn(input_tokens=120, output_tokens=30)
-        stats.add_llm_turn(input_tokens=200, output_tokens=45)
+        stats.add_llm_turn(input_tokens=120, output_tokens=30, cache_write_tokens=100)
+        stats.add_llm_turn(input_tokens=200, output_tokens=45, cache_read_tokens=100, cache_write_tokens=80)
         block = self.mod.turn_status_block(stats, NOW)
+        # The two cache totals are in the line the model reads: they are the only
+        # evidence in the conversation that the prompt cache is being hit.
         self.assertEqual(
             block,
             '<nagent-turn-status utc="2026-06-12T12:00:00Z" turn="2" '
-            'tokens_in_total="320" tokens_out_total="75" />',
+            'tokens_in_total="320" tokens_out_total="75" '
+            'cache_read_total="100" cache_write_total="180" />',
         )
 
     def test_invalid_content_is_stripped_to_a_sidecar(self):
