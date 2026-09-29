@@ -258,6 +258,49 @@ only evidence that caching is working at all: a read total that stays 0 on a
 caching provider means something above the boundary changed. No provider usage?
 Estimate from character count.
 
+nagent also refuses to act on output the model invented. A turn that writes one
+of nagent's own blocks — `<nagent-shell-result>`, `<nagent-turn-status>` and the
+rest — at the start of a line is the model continuing the transcript past its own
+turn: the conversation goes up as one message containing an interleaved script of
+model turns, driver results and telemetry, so writing the next speaker's lines is
+the locally likely continuation. `parse_response` cuts the turn there. Everything
+before the fabrication runs; everything after it is discarded unrun, because it
+was chosen from output that does not exist, and the `<system>` note names the tag
+so the correction is about a length limit of knowledge rather than "bad format".
+A *mention* — the tag in backticks, or a model quoting the tag list above — does
+not cut anything, which is why the rule is line-start: over 1193 real stripped
+turns in one project's conversations, 912 of 940 fabrications sat at line start
+and mentions did not. Replaying those turns, this stops 347 tags from running
+that used to run, including 77 terminal `<nagent-response>` turns — each one a run
+that ended on a completion claim composed after the model invented its evidence.
+`stripped_turns` and `fabricated_turns` count it, in the status line and on every
+`<nagent-turn-status>`.
+
+Two further defences, both optional and both cheap. `stop_sequences` are sent to
+the providers that take them, naming the four driver blocks the model most often
+writes — so generation halts at the boundary and the fabrication is never produced
+or billed, while the real action before it survives. (A provider can still emit a
+*prefix* of a stop sequence; `strip_trailing_stop_prefix()` trims it, because
+`<nagent-shell` with no `>` is a hard parse error that would discard the whole
+turn.) And `--hook-per-response CMD` is an exit gate: a command that must exit 0
+before a `<nagent-response>` is accepted as final. It runs against the tree, not
+the report — the loop's only check that does not read something the model produced
+— and on failure the answer is dropped, its verdict block is appended, and the run
+continues. Bounded at three refusals, because a gate can be unsatisfiable and an
+unbounded retry there spends money until someone notices.
+
+Bulk output is moved, never summarized. When a conversation is compacted or
+rebuilt, any driver-result body over 8 KB is written to a file beside the
+conversation and the block becomes a pointer: `<nagent-shell-result
+output="/path/..." bytes="N">`, keeping the `exit_code:` line. Nothing is
+shortened, excerpted or summarized — an excerpt would tell the model it is seeing
+a clipped observation, which is the belief that licenses filling the gap, and a
+summarized `exit_code: 0` is indistinguishable from an invented one. The model
+reads the path when it needs the content. Measured on a real 98 MB corpus of 6003
+result blocks, an 8 KB threshold moves one block in six and a fifth of the total
+bytes; rebuild spills before it slices its tail, so the retained window covers
+turns instead of one large command's output.
+
 **Example**
 
 ```text

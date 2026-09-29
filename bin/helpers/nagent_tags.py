@@ -17,7 +17,7 @@ tag wins. That is the protocol's contract, not a shortcut.
 """
 
 import string
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 NAME_START_CHARS = frozenset(string.ascii_letters + "_")
 NAME_CHARS = frozenset(string.ascii_letters + string.digits + "_-")
@@ -38,6 +38,7 @@ class TagNode:
     self_closing: bool
     start: int  # offset of "<" in the source text
     end: int  # offset just past the element
+    content_start: int = 0  # offset of `content` in the source text
 
 
 def parse_element(text: str, pos: int = 0, *, capture_to_eof_if_unclosed: bool = False) -> TagNode:
@@ -98,14 +99,18 @@ def parse_element(text: str, pos: int = 0, *, capture_to_eof_if_unclosed: bool =
         pos = value_end + 1
 
     if self_closing:
-        return TagNode(name=name, attrs=attrs, content="", self_closing=True, start=start, end=pos)
+        return TagNode(
+            name=name, attrs=attrs, content="", self_closing=True, start=start, end=pos,
+            content_start=pos,
+        )
 
     close_tag = f"</{name}>"
     close_at = text.find(close_tag, pos)
     if close_at == -1:
         if capture_to_eof_if_unclosed:
             return TagNode(
-                name=name, attrs=attrs, content=text[pos:], self_closing=False, start=start, end=len(text)
+                name=name, attrs=attrs, content=text[pos:], self_closing=False, start=start,
+                end=len(text), content_start=pos,
             )
         raise TagParseError(f"missing {close_tag}", start)
     return TagNode(
@@ -115,6 +120,7 @@ def parse_element(text: str, pos: int = 0, *, capture_to_eof_if_unclosed: bool =
         self_closing=False,
         start=start,
         end=close_at + len(close_tag),
+        content_start=pos,
     )
 
 
@@ -138,6 +144,7 @@ class IgnoredSpan:
     reason: str  # short label, e.g. "unknown tag <thought>"
     text: str  # the raw skipped text, for a snippet in the correction note
     start: int  # offset of the skipped text in its (sub-)document
+    name: str | None = None  # the tag name, when the span was a tag; None for prose
 
 
 def _read_tag_name(text: str, pos: int) -> str | None:
@@ -211,7 +218,7 @@ def scan_tag_document(
         except TagParseError:
             nxt = text.find("<", pos + 1)
             end = length if nxt == -1 else nxt
-            ignored.append(IgnoredSpan(f"malformed <{name}>", text[pos:end], pos))
+            ignored.append(IgnoredSpan(f"malformed <{name}>", text[pos:end], pos, name))
             pos = end
             continue
 
@@ -219,10 +226,19 @@ def scan_tag_document(
             inner_nodes, inner_ignored = scan_tag_document(
                 node.content, known_names, unwrap_names, eof_capture_names
             )
-            nodes.extend(inner_nodes)
-            ignored.extend(inner_ignored)
+            # Shift the inner offsets into this document. Without this they stay
+            # relative to the wrapper's body, and a caller that compares a node's
+            # position against an ignored span's — to decide what came first — is
+            # comparing positions in two different coordinate systems.
+            shift = node.content_start
+            nodes.extend(replace(inner, start=inner.start + shift, end=inner.end + shift,
+                                 content_start=inner.content_start + shift)
+                         for inner in inner_nodes)
+            ignored.extend(replace(span, start=span.start + shift) for span in inner_ignored)
         else:
-            ignored.append(IgnoredSpan(f"unknown tag <{name}>", text[node.start : node.end], node.start))
+            ignored.append(
+                IgnoredSpan(f"unknown tag <{name}>", text[node.start : node.end], node.start, name)
+            )
         pos = node.end
 
     return nodes, ignored

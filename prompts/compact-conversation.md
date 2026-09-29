@@ -38,7 +38,7 @@ Keep:
 
 Remove:
 - repeated reasoning
-- repeated shell output
+- repeated shell output (delete it; never paraphrase it)
 - repeated file reads
 - duplicated summaries
 - obsolete hypotheses
@@ -55,6 +55,23 @@ Remove deliberation.
 
 Keep state.
 Remove history.
+
+## Output Blocks Are Pointers, Not Prose
+
+Bulk command output has already been moved out of this conversation before you
+saw it. A result block carrying `output="..."` and `bytes="N"` is a pointer to a
+file holding that action's complete, unedited output.
+
+Keep those blocks and their paths verbatim.
+
+Never replace a pointer with a description of what the output contained. You have
+not read it, and a sentence about output you have not read is indistinguishable
+from an invented one. The path is how that output stays reachable; a summary of it
+is how it stops being evidence.
+
+The same rule holds for any output still inline: you may drop a result you judge
+no longer useful, but you may not rewrite one into a claim about what it said.
+Delete it or keep it. Do not paraphrase observations.
 
 ## Transformation Rules
 

@@ -115,6 +115,38 @@ _spinner_enabled = True
 # printed to the human user.
 USER_VISIBLE_WRAPPER_NAMES = ("nagent-response", "agent-response")
 
+# Tags only nagent writes. A model turn containing one is the model predicting
+# the transcript forward past its own turn — writing the result it expects, or
+# the telemetry line the driver appends. Measured over 1193 stripped turns in a
+# real 1206-conversation corpus: 824 (69%) fabricated a result tag, 693 of those
+# asserting exit_code: 0, and 767 echoed <nagent-turn-status>. It is not a lie so
+# much as a continuation: the conversation goes up as one message containing an
+# interleaved transcript, so continuing into the next speaker's lines is the
+# locally likely next token. The consequence is what matters. Replaying all 1193
+# of those turns through this parser: 921 are cut, and the tags that used to run
+# after the fabrication and now do not are 189 <nagent-shell>, 77
+# <nagent-response>, 54 <nagent-next>, 20 <nagent-read>, 4 <nagent-write> and 3
+# <nagent-conversation> — 347 in all. The 77 responses are the ones that matter:
+# each was a run ending on a completion claim composed after the model invented
+# its own evidence. Everything those turns did *before* the fabrication still
+# runs, which is the point of cutting rather than discarding the turn.
+DRIVER_OUTPUT_TAG_NAMES = frozenset(
+    {
+        "nagent-shell-result",
+        "nagent-read-result",
+        "nagent-file-read-result",
+        "nagent-write-result",
+        "nagent-file-patch-result",
+        "nagent-conversation-result",
+        "nagent-turn-status",
+        "nagent-next-input",
+        "hook-per-run",
+        "hook-per-file-edit",
+        "user-prompt",
+        "system",
+    }
+)
+
 # parse_response tolerates non-protocol content: it executes the valid tags it
 # finds and records the rest as "ignored". Echoed log frames (<agent-response>)
 # are unwrapped so a real tag nested inside one is still recovered; <nagent-*>
@@ -160,6 +192,12 @@ class TokenStats:
     # neither, so a zero read total is only evidence when the provider caches.
     recursive_cache_read_tokens: int = 0
     recursive_cache_write_tokens: int = 0
+    # Turns nagent had to clean, and the subset where the model wrote driver
+    # output itself. Counted because the second number is the hallucination rate
+    # this loop can actually see, and nothing measured it before: it took
+    # grepping a 1206-conversation corpus of sidecars after the fact.
+    stripped_turns: int = 0
+    fabricated_turns: int = 0
 
     def status_line(self) -> str:
         return (
@@ -168,7 +206,9 @@ class TokenStats:
             f"Tokens-In:{self.recursive_input_tokens} "
             f"Tokens-Out:{self.recursive_output_tokens} "
             f"Cache-Read:{self.recursive_cache_read_tokens} "
-            f"Cache-Write:{self.recursive_cache_write_tokens}]"
+            f"Cache-Write:{self.recursive_cache_write_tokens} "
+            f"Stripped:{self.stripped_turns} "
+            f"Fabricated:{self.fabricated_turns}]"
         )
 
     def add_llm_turn(
@@ -197,6 +237,8 @@ class TokenStats:
             "recursive_output_tokens": self.recursive_output_tokens,
             "recursive_cache_read_tokens": self.recursive_cache_read_tokens,
             "recursive_cache_write_tokens": self.recursive_cache_write_tokens,
+            "stripped_turns": self.stripped_turns,
+            "fabricated_turns": self.fabricated_turns,
         }
 
 
@@ -468,8 +510,8 @@ def git_commit_file_patch(repo_root: Path, commit_hash: str, rel_path: str) -> s
         fallback = _run_git(repo_root, ["show", "--format=%B", "--stat", "--patch", "--find-renames", commit_hash])
         if fallback.returncode != 0:
             return ""
-        return fallback.stdout[:12000]
-    return result.stdout[:12000]
+        return fallback.stdout
+    return result.stdout
 
 
 def parse_llm_summary_json(text: str) -> dict[str, str]:
@@ -495,13 +537,29 @@ def parse_llm_summary_json(text: str) -> dict[str, str]:
     return summaries
 
 
+# What one summarize-commits prompt may carry inline, and what one commit's diff
+# may carry inside that.
+COMMIT_PROMPT_BUDGET_BYTES = 60000
+COMMIT_PATCH_BUDGET_BYTES = 12000
+
+
 def summarize_new_file_commits(
     repo_root: Path,
     rel_path: str,
     commits: list[dict[str, str]],
     provider: str,
     model: str,
+    spill_dir: Path | None = None,
 ) -> dict[str, str]:
+    """One short summary per commit, for the file-edit history block.
+
+    Oversized diffs are moved to files under spill_dir and named by path, never
+    clipped. A clipped diff ends mid-hunk with nothing saying so, and a summary
+    written from it describes a partial change as if it were the whole one — the
+    same silent-truncation failure this codebase fixes everywhere else. With no
+    spill_dir the section says how large the diff was and how to reproduce it,
+    which is still honest; what it must never be is quietly incomplete.
+    """
     if not commits:
         return {}
 
@@ -509,19 +567,42 @@ def summarize_new_file_commits(
     total_size = 0
     for commit in commits:
         patch = git_commit_file_patch(repo_root, commit["hash"], rel_path)
+        body = f"Relevant diff/stat:\n{patch}\n"
+        if len(patch) > COMMIT_PATCH_BUDGET_BYTES:
+            short = commit["short"]
+            path = (
+                spill_text(patch, spill_dir, f"{short}-{slugify(Path(rel_path).stem)}.patch")
+                if spill_dir is not None
+                else None
+            )
+            where = (
+                f"the file {path}"
+                if path is not None
+                else f"`git -C {repo_root} show {commit['hash']} -- {rel_path}`"
+            )
+            body = (
+                f"Relevant diff/stat: {len(patch)} bytes, too large to include here. "
+                f"The whole diff, unedited, is in {where}. Summarize from the subject "
+                f"line above and say the diff was large; do not invent its contents.\n"
+            )
         section = (
             f"Commit: {commit['hash']}\n"
             f"Date: {commit['date']}\n"
             f"Author: {commit['author']} <{commit['email']}>\n"
             f"Subject: {commit['subject']}\n"
-            f"Relevant diff/stat:\n{patch}\n"
+            f"{body}"
         )
-        if total_size + len(section) > 60000:
-            section = section[: max(0, 60000 - total_size)]
+        if total_size + len(section) > COMMIT_PROMPT_BUDGET_BYTES:
+            # Stop on a whole section rather than cutting one in half: a section
+            # severed mid-diff is the same silent truncation, one level up.
+            remaining = len(commits) - len(sections)
+            sections.append(
+                f"({remaining} older commit{'' if remaining == 1 else 's'} omitted from this "
+                f"prompt for size; they have no summary rather than a guessed one.)\n"
+            )
+            break
         sections.append(section)
         total_size += len(section)
-        if total_size >= 60000:
-            break
 
     prompt = (
         "Summarize each git commit's effect on the target file in one short sentence. "
@@ -641,6 +722,7 @@ def file_edit_history_and_summary_block(
     model: str | None,
     config_path: Path | None,
     previous_initial_context: str | None,
+    spill_dir: Path | None = None,
 ) -> str:
     if provider is None or model is None:
         return ""
@@ -656,7 +738,9 @@ def file_edit_history_and_summary_block(
         rel_path = git_relative_path(repo_root, file_edit_path)
         commits = git_file_history(repo_root, rel_path)
         new_commits = [commit for commit in commits if commit["hash"] not in existing_commit_summaries]
-        new_summaries = summarize_new_file_commits(repo_root, rel_path, new_commits, provider, model)
+        new_summaries = summarize_new_file_commits(
+            repo_root, rel_path, new_commits, provider, model, spill_dir
+        )
         summaries = dict(existing_commit_summaries)
         for commit in new_commits:
             summaries[commit["hash"]] = new_summaries.get(commit["hash"], commit["subject"])
@@ -780,6 +864,7 @@ Campaign item worker (this session):
             model,
             config_path,
             previous_initial_context,
+            root / "commit-patches",
         )
         if file_edit_details:
             file_edit_detail_block = f"\n{file_edit_details}\n"
@@ -968,18 +1053,26 @@ def default_conversation_name(pid: str) -> str:
     return f"latest-{hostname}-{pid}"
 
 
-def parse_response(text: str) -> tuple[list[NagentTag], list[str], str | None]:
+def parse_response(text: str) -> tuple[list[NagentTag], list[str], str | None, str | None]:
     """Extract the valid protocol tags from one LLM turn.
 
-    Returns ``(tags, ignored, error)``:
+    Returns ``(tags, ignored, error, fabricated)``:
 
-    - ``tags`` — valid <nagent-*> tags, in order (may be empty).
+    - ``tags`` — valid <nagent-*> tags, in order (may be empty). Tags at or after
+      a fabricated driver-output tag are **dropped**, not returned: the model
+      chose them from output it invented, so running them acts on a false premise.
     - ``ignored`` — short notes for non-protocol content that was tolerated and
       skipped: prose, reasoning leaks (e.g. <thought>), unknown tags. The caller
       surfaces these to the model but still acts on ``tags``.
     - ``error`` — set only when a *known* nagent tag is present but malformed or
       misshapen (wrong attributes, missing body/close). That is a clear mistake
       to correct, not silent junk; ``tags``/``ignored`` are empty then.
+    - ``fabricated`` — a Fabrication naming the first DRIVER_OUTPUT_TAG_NAMES tag
+      the model wrote and how many of its tags were dropped, or None.
+
+    Ordinary junk (prose, a code fence, a <thought>) does not cut the turn; only
+    driver output does, because only driver output means the model has started
+    inventing its own observations.
     """
     try:
         nodes, ignored_spans = scan_tag_document(
@@ -987,7 +1080,7 @@ def parse_response(text: str) -> tuple[list[NagentTag], list[str], str | None]:
         )
     except TagParseError as exc:
         snippet = text[exc.offset : exc.offset + 80].replace("\n", "\\n")
-        return [], [], f"Unexpected content at offset {exc.offset}: {exc.message} near {snippet!r}"
+        return [], [], f"Unexpected content at offset {exc.offset}: {exc.message} near {snippet!r}", None
 
     nodes = dedupe_nodes(nodes)  # a stutter that repeats a tag runs it once
     tags: list[NagentTag] = []
@@ -996,34 +1089,34 @@ def parse_response(text: str) -> tuple[list[NagentTag], list[str], str | None]:
 
         if kind in ("response", "shell", "next"):
             if node.self_closing:
-                return [], [], f"<{node.name}> requires a body, not a self-closing tag"
+                return [], [], f"<{node.name}> requires a body, not a self-closing tag", None
             if node.attrs:
-                return [], [], f"<{node.name}> does not take attributes"
+                return [], [], f"<{node.name}> does not take attributes", None
             tags.append(NagentTag(kind=kind, content=node.content))
         elif kind in ("read", "file_read", "file_patch"):
             attr = "index" if kind == "file_patch" else "path"
             if not node.self_closing:
-                return [], [], f'<{node.name}> must be self-closing: <{node.name} {attr}="..." />'
+                return [], [], f'<{node.name}> must be self-closing: <{node.name} {attr}="..." />', None
             if set(node.attrs) != {attr}:
-                return [], [], f'<{node.name}> requires exactly one {attr}="..." attribute'
+                return [], [], f'<{node.name}> requires exactly one {attr}="..." attribute', None
             tags.append(NagentTag(kind=kind, content="", path=node.attrs[attr]))
         elif kind == "write":
             if node.self_closing:
-                return [], [], "<nagent-write> requires file content between open and close tags"
+                return [], [], "<nagent-write> requires file content between open and close tags", None
             if set(node.attrs) != {"path"}:
-                return [], [], '<nagent-write> requires exactly one path="..." attribute'
+                return [], [], '<nagent-write> requires exactly one path="..." attribute', None
             tags.append(NagentTag(kind=kind, content=node.content, path=node.attrs["path"]))
         else:  # conversation
             if node.self_closing:
-                return [], [], "<nagent-conversation> requires a prompt body"
+                return [], [], "<nagent-conversation> requires a prompt body", None
             for attr_name in node.attrs:
                 if attr_name not in ("conversation-file", "conversation-name"):
-                    return [], [], f"Unsupported <nagent-conversation> attribute: {attr_name}"
+                    return [], [], f"Unsupported <nagent-conversation> attribute: {attr_name}", None
             if "conversation-file" in node.attrs and "conversation-name" in node.attrs:
                 return [], [], (
                     "<nagent-conversation> supports only one of conversation-file "
                     "or conversation-name"
-                )
+                ), None
             tags.append(
                 NagentTag(
                     kind=kind,
@@ -1034,7 +1127,33 @@ def parse_response(text: str) -> tuple[list[NagentTag], list[str], str | None]:
             )
 
     ignored = [_ignored_note(span) for span in ignored_spans]
-    return tags, ignored, None
+
+    # Cut the turn at the first fabricated driver tag. Nodes and spans carry
+    # offsets into this same text, so "after" is a plain comparison.
+    #
+    # Only a tag at the start of its line counts. A driver tag mid-sentence is
+    # the model *talking about* the protocol — in backticks, or quoting the tag
+    # list in the initial context, which contains <nagent-turn-status ... />
+    # verbatim — and cutting the turn there would drop real work over a mention.
+    # Measured over 1193 real stripped turns: 912 of the 940 fabrications sit at
+    # line start, and the 28 that do not are preceded on the line by other junk
+    # ("human", "<tool>...", scaffolding leaks), so they are lost to this rule and
+    # left running. That is the trade: 97% of fabrications caught, no turn cut for
+    # discussing a tag. A driver tag alone on a line inside a fenced code block is
+    # still a false positive, and costs one corrected turn rather than a wrong
+    # action.
+    fabricated = None
+    for span in sorted(ignored_spans, key=lambda s: s.start):
+        if span.name not in DRIVER_OUTPUT_TAG_NAMES:
+            continue
+        line_start = text.rfind("\n", 0, span.start) + 1
+        if text[line_start : span.start].strip():
+            continue
+        kept = [tag for node, tag in zip(nodes, tags) if node.start < span.start]
+        fabricated = Fabrication(span.name, len(tags) - len(kept))
+        tags = kept
+        break
+    return tags, ignored, None, fabricated
 
 
 def _ignored_note(span) -> str:
@@ -1121,7 +1240,44 @@ def turn_status_block(token_stats: TokenStats, now: datetime, *, invalid_ref: st
         f'tokens_in_total="{token_stats.recursive_input_tokens}" '
         f'tokens_out_total="{token_stats.recursive_output_tokens}" '
         f'cache_read_total="{token_stats.recursive_cache_read_tokens}" '
-        f'cache_write_total="{token_stats.recursive_cache_write_tokens}"{invalid} />'
+        f'cache_write_total="{token_stats.recursive_cache_write_tokens}" '
+        f'stripped_turns="{token_stats.stripped_turns}" '
+        f'fabricated_turns="{token_stats.fabricated_turns}"{invalid} />'
+    )
+
+
+@dataclass(frozen=True)
+class Fabrication:
+    """A model turn that wrote nagent's own output. ``name`` is the tag it
+    invented; ``dropped`` is how many of its own valid tags were discarded for
+    sitting after it."""
+
+    name: str
+    dropped: int = 0
+
+
+def fabrication_note(fab: "Fabrication") -> str:
+    """What nagent tells the model when it wrote driver output itself.
+
+    Unlike ignored_correction(), this one names the tag. That function's docstring
+    argues naming the pattern biases the model toward repeating it — a reasonable
+    prior, but measured over a real corpus, 155 of the 244 conversations that
+    fabricated a result tag (64%) fabricated another one later in the same
+    conversation under the unnamed wording, so it is not preventing repetition
+    either. Naming it is the cheaper hypothesis and this is the place to test it.
+    """
+    tail = (
+        f" Everything after it in that turn was discarded unrun ({fab.dropped} "
+        f"tag{'' if fab.dropped == 1 else 's'}), because it was chosen from output that "
+        "does not exist."
+        if fab.dropped
+        else ""
+    )
+    return (
+        f"You wrote a <{fab.name}>. Only nagent writes that tag, and it appends it "
+        "after running your action — you cannot know a command's output, or your own "
+        f"turn's telemetry, before it is appended.{tail} Emit the action alone and "
+        "stop; the result will be appended for you, and only then do you know it."
     )
 
 
@@ -1138,6 +1294,23 @@ def truncation_note(stop_reason: str) -> str:
         "tag body is incomplete. This is a length limit, not a formatting mistake. "
         "Continue from where it stopped, in smaller pieces: emit fewer tags per turn, "
         "and for a large file write it in parts or delegate the write."
+    )
+
+
+def retry_attempt_note(conversation_file: Path, guid: str) -> str:
+    """The sentence that replaces a failed attempt's raw text in the conversation.
+
+    A retry used to append the raw attempt inline, where it stayed for the rest of
+    the run as a few-shot example of the mistake (issue 0001). It is now in a
+    sidecar instead, and this names the path — so the model that genuinely needs
+    to see what it sent can read it, and the model that does not is never shown
+    it. That is the difference between the attempt being *reachable* and it being
+    *in the prompt*, and only the second one teaches.
+    """
+    return (
+        f" Your raw turn is preserved at {invalid_sidecar_path(conversation_file, guid)} "
+        "and is deliberately not kept in this conversation; read it with "
+        "<nagent-read> only if you need to see exactly what you sent."
     )
 
 
@@ -1595,10 +1768,11 @@ def resolve_hooks(
     cli_per_run: str | None,
     cli_per_file_edit: str | None,
     config_path: Path | None,
-) -> tuple[str | None, str | None]:
-    """Resolve the two hook commands: CLI flag wins, then the config keys
-    'hook_per_run' / 'hook_per_file_edit', else disabled (None). Empty strings
-    in config mean disabled."""
+    cli_per_response: str | None = None,
+) -> tuple[str | None, str | None, str | None]:
+    """Resolve the three hook commands: CLI flag wins, then the config keys
+    'hook_per_run' / 'hook_per_file_edit' / 'hook_per_response', else disabled
+    (None). Empty strings in config mean disabled."""
     try:
         config = load_config(config_path)
     except ValueError:
@@ -1609,7 +1783,43 @@ def resolve_hooks(
         if cli_per_file_edit is not None
         else (config.get("hook_per_file_edit") or None)
     )
-    return per_run, per_file_edit
+    per_response = (
+        cli_per_response
+        if cli_per_response is not None
+        else (config.get("hook_per_response") or None)
+    )
+    return per_run, per_file_edit, per_response
+
+
+# A run may be refused this many times by the exit gate before nagent stops
+# asking. Bounded because the gate can be unsatisfiable — a validator that will
+# never pass, a condition the model cannot reach — and an unbounded loop there
+# spends money until someone notices.
+MAX_RESPONSE_GATE_REFUSALS = 3
+
+
+def response_gate_note(refusal: int) -> str:
+    """What the model is told when the exit gate refused its final answer.
+
+    The gate exists because of a measured failure: a model that fabricates work
+    also fabricates the verification of that work, in detail and with confidence,
+    so no instruction addressed to it can be the check. The gate is a command
+    nagent runs itself against the tree.
+
+    The note points at the <hook-per-response> block appended immediately above
+    rather than quoting it. The output is evidence and it belongs in the
+    conversation once; quoting it here as well doubled it, and a duplicated
+    observation is one more thing that can drift from its original.
+    """
+    return (
+        f"Your <nagent-response> was refused by this run's exit gate "
+        f"(attempt {refusal} of {MAX_RESPONSE_GATE_REFUSALS}). The gate is a command "
+        "nagent runs itself, against the tree, after you claim to be done; it does not "
+        "read your report. Its verdict is the <hook-per-response> block directly above "
+        "this note. Treat that block as the only account of whether the work is actually "
+        "finished, fix what it names, and answer again when it can pass — or say plainly "
+        "that it cannot and why."
+    )
 
 
 def execute_agent(
@@ -1775,6 +1985,106 @@ def process_tags(
             next_prompts.append(tag.content)
 
     return responses, next_prompts, should_continue
+
+
+# --- spilling bulk output to files ----------------------------------------
+#
+# A conversation's bulk is a few big tool results. Measured over a real corpus of
+# 1206 conversations (98 MB, 6003 driver result blocks), result-body sizes are
+# p50 2KB, p90 10KB, p99 36KB, max 246KB, and moving every body over a threshold
+# out to a file would remove this share of the whole corpus:
+#
+#     threshold   blocks moved   share of blocks   share of corpus
+#        2 KB          3089            51.5%            28.3%
+#        4 KB          2013            33.5%            25.1%
+#        8 KB          1002            16.7%            19.3%
+#       16 KB           337             5.6%            11.7%
+#       32 KB            97             1.6%             6.2%
+#
+# 8 KB is the knee: one block in six, a fifth of the bulk. Below it the block
+# count doubles for six more points.
+#
+# This exists so compaction never has to summarize tool output. Summarizing it
+# means an LLM rewriting observations, which is the one thing that must stay
+# verbatim — a summarized `exit_code: 0` is indistinguishable from an invented
+# one. Spilled output is not shortened and not summarized: it is moved, intact,
+# to a file beside the conversation, and the block that held it names the path.
+# The model can read it back with <nagent-read>, so nothing is lost; it just
+# stops costing context on every later turn.
+SPILL_THRESHOLD_BYTES = 8 * 1024
+
+# Driver blocks whose bodies are bulk output worth moving. <nagent-turn-status>
+# is absent on purpose: it is one short line and it is the run's index.
+SPILLABLE_RESULT_TAGS = (
+    "nagent-shell-result",
+    "nagent-read-result",
+    "nagent-file-read-result",
+    "nagent-conversation-result",
+    "hook-per-run",
+    "hook-per-file-edit",
+)
+
+
+def conversation_outputs_dir(conversation_file: Path) -> Path:
+    """Where this conversation's spilled output lives: beside it, so it is
+    exactly as durable as the conversation that points at it."""
+    return conversation_file.with_name(conversation_file.name + ".outputs")
+
+
+def spill_text(text: str, out_dir: Path, stem: str) -> Path | None:
+    """Write text to out_dir/stem, returning the path, or None if it cannot be
+    written. A failed spill is not an error: the caller keeps the text inline,
+    which is bigger but never wrong."""
+    try:
+        out_dir.mkdir(parents=True, exist_ok=True)
+        path = out_dir / stem
+        path.write_text(text, encoding="utf-8")
+        return path
+    except OSError:
+        return None
+
+
+def spill_large_results(
+    text: str, out_dir: Path, threshold: int = SPILL_THRESHOLD_BYTES
+) -> tuple[str, list[tuple[str, Path, int]]]:
+    """Move every oversized driver-result body out to a file, in one pass.
+
+    Returns the rewritten conversation text and one (tag, path, bytes) row per
+    body moved. Bodies at or under the threshold are left exactly as they are, so
+    running this twice is a no-op on its own output — the pointer it leaves is a
+    few dozen bytes.
+
+    The replacement keeps the tag, its attributes and any `exit_code:` line, and
+    replaces the body with the path. Deliberately no excerpt: a head-and-tail
+    view would tell the model it is seeing a clipped observation, which is the
+    belief that licenses filling the gap. Either the output is here or it is a
+    path — never a partial view presented as the whole.
+    """
+    names = "|".join(SPILLABLE_RESULT_TAGS)
+    pattern = re.compile(rf"<({names})((?:\s[^>]*)?)>\n?(.*?)</\1>", re.S)
+    spilled: list[tuple[str, Path, int]] = []
+
+    def replace(match: re.Match) -> str:
+        tag, attrs, body = match.group(1), match.group(2), match.group(3)
+        if len(body) <= threshold:
+            return match.group(0)
+        index = len(spilled) + 1
+        path = spill_text(body, out_dir, f"{index:04d}-{tag}.txt")
+        if path is None:
+            return match.group(0)
+        spilled.append((tag, path, len(body)))
+        exit_line = re.search(r"^exit_code:.*$", body, re.M)
+        kept = f"{exit_line.group(0)}\n" if exit_line else ""
+        return (
+            f"<{tag}{attrs} output=\"{path}\" bytes=\"{len(body)}\">\n"
+            f"{kept}"
+            f"The output of this action was moved to the file named above, whole and "
+            f"unedited — nothing was summarized, shortened or dropped. Read that path "
+            f"when you need it; do not guess at what it contains.\n"
+            f"</{tag}>"
+        )
+
+    return pattern.sub(replace, text), spilled
 
 
 # --- conversation safety net: checkpoints and rebuild ----------------------
@@ -2013,6 +2323,11 @@ def rebuild_conversation(
     body = content[span[1] :]
     preserved_prompts = unique_blocks_in_source_order(complete_literal_blocks(body, "user-prompt"))
     tail_body = remove_complete_literal_blocks(body, "user-prompt") if preserved_prompts else body
+    # Spill before slicing, not after: one 246KB shell result can otherwise eat
+    # the whole retained window, so the tail buys a handful of turns instead of
+    # many. The archive below is written from the on-disk original, so nothing is
+    # lost — only the live window gets denser.
+    tail_body, _ = spill_large_results(tail_body, conversation_outputs_dir(conversation_file))
     tail = tail_body[-tail_chars:]
     newline_at = tail.find("\n")
     if len(tail) < len(tail_body) and newline_at != -1:
@@ -2104,10 +2419,12 @@ def run_agent_loop(
     initial_read_paths: list[str] | None = None,
     safety_settings: dict | None = None,
     hook_per_run: str | None = None,
+    hook_per_response: str | None = None,
     hook_per_file_edit: str | None = None,
 ) -> tuple[int, list[str]]:
     nagent_path = Path(__file__).resolve()
     user_responses: list[str] = []
+    gate_refusals = 0  # exit-gate refusals so far; bounded, see MAX_RESPONSE_GATE_REFUSALS
     token_stats = token_stats or TokenStats()
     inbox = inbox_dir(conversation_file)
 
@@ -2130,6 +2447,7 @@ def run_agent_loop(
             append_to_conversation(
                 conversation_file, f"<user-prompt>\n{message}\n</user-prompt>"
             )
+        responses_before_turn = len(user_responses)
         if hook_per_run:
             # Fresh ground-truth status at the top of every turn, before the
             # model speaks — so the next response is grounded in measured state
@@ -2150,21 +2468,34 @@ def run_agent_loop(
                 )
                 continue
 
-            tags, ignored, parse_error = parse_response(llm_output)
+            tags, ignored, parse_error, fabricated = parse_response(llm_output)
+            if ignored:
+                token_stats.stripped_turns += 1
+            if fabricated:
+                token_stats.fabricated_turns += 1
             if parse_error is not None:
                 # A known tag was malformed: ask the model to fix it and retry.
                 # A cut-off turn lands here too, and its cause is not a format
                 # mistake — say so, or the model retries the same oversized turn.
-                note = (
-                    truncation_note(truncated_at)
-                    if truncated_at
-                    else f"Invalid nagent response format: {parse_error}. "
-                    "Respond only with valid nagent tags."
+                if fabricated:
+                    note = fabrication_note(fabricated)
+                elif truncated_at:
+                    note = truncation_note(truncated_at)
+                else:
+                    note = (
+                        f"Invalid nagent response format: {parse_error}. "
+                        "Respond only with valid nagent tags."
+                    )
+                guid = write_invalid_sidecar(
+                    conversation_file,
+                    llm_output,
+                    [f"retry {attempt + 1}: {parse_error}"],
+                    token_stats.turn_count,
+                    datetime.now(timezone.utc),
                 )
                 append_to_conversation(
                     conversation_file,
-                    f"<agent-response>\n{llm_output}\n</agent-response>\n"
-                    f"<system>{note}</system>",
+                    f"<system>{note}{retry_attempt_note(conversation_file, guid)}</system>",
                 )
                 continue
             if tags:
@@ -2173,13 +2504,22 @@ def run_agent_loop(
             # No actionable tag. If the provider cut the turn off, that is the
             # reason and the model needs it; if we tolerated junk, say what we
             # ignored; otherwise the turn was empty. Either way, retry.
-            if truncated_at:
+            if fabricated:
+                note = fabrication_note(fabricated)
+            elif truncated_at:
                 note = truncation_note(truncated_at)
             else:
                 note = ignored_correction(ignored) if ignored else "Response contains no nagent tags."
+            guid = write_invalid_sidecar(
+                conversation_file,
+                llm_output,
+                ignored or [f"retry {attempt + 1}: no actionable tags"],
+                token_stats.turn_count,
+                datetime.now(timezone.utc),
+            )
             append_to_conversation(
                 conversation_file,
-                f"<agent-response>\n{llm_output}\n</agent-response>\n<system>{note}</system>",
+                f"<system>{note}{retry_attempt_note(conversation_file, guid)}</system>",
             )
         else:
             if error is not None:
@@ -2214,6 +2554,13 @@ def run_agent_loop(
             # the repetition can't become precedent. No sidecar needed.
             body = cleaned_body
         append_to_conversation(conversation_file, f"<agent-response>\n{body}\n</agent-response>")
+        if fabricated:
+            # The turn ran, but it also invented driver output. parse_response
+            # already dropped whatever followed it; record why, so the next turn
+            # does not assume the rest of its plan happened.
+            append_to_conversation(
+                conversation_file, f"<system>{fabrication_note(fabricated)}</system>"
+            )
         if truncated_at:
             # The turn parsed into runnable tags, but the provider still stopped
             # it at the cap: whatever came after the last complete tag is gone.
@@ -2269,6 +2616,23 @@ def run_agent_loop(
             # already in the conversation; go round again rather than hand a
             # half-written answer to the caller as the result.
             continue
+
+        if hook_per_response and gate_refusals < MAX_RESPONSE_GATE_REFUSALS:
+            # The exit gate: a command nagent runs against the tree once the model
+            # says it is done. It is the only check in this loop that does not read
+            # something the model produced, which — measured across two fabricated
+            # completion reports — is the only kind that has ever caught one.
+            gate = run_hook(hook_per_response, "hook-per-response")
+            append_to_conversation(conversation_file, gate)
+            if 'exit_code="0"' not in gate.split("\n", 1)[0]:
+                gate_refusals += 1
+                append_to_conversation(
+                    conversation_file,
+                    f"<system>{response_gate_note(gate_refusals)}</system>",
+                )
+                # Drop the refused answer: it has not earned being the result.
+                user_responses = user_responses[:responses_before_turn]
+                continue
 
         if pending_message_paths(inbox):
             # A message landed while this turn ran: answer it now instead of
@@ -2848,11 +3212,41 @@ def compact_conversation(
         print(f"Error: {exc}", file=sys.stderr)
         return 1
 
+    # Move bulk tool output to files before the model sees the conversation.
+    # Two reasons, and the second is the important one: it does most of the
+    # shrinking for free, and it takes the observations off the table. Asking a
+    # model to compact a conversation containing command output invites it to
+    # summarize that output, and a summarized result is indistinguishable from an
+    # invented one. What is left to compact is reasoning and prose, which is what
+    # compaction is actually for.
+    spilled: list[tuple[str, Path, int]] = []
+    try:
+        original = conversation_file.read_text(encoding="utf-8")
+    except OSError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
+    rewritten, spilled = spill_large_results(
+        original, conversation_outputs_dir(conversation_file)
+    )
+    if spilled:
+        moved = sum(n for _, _, n in spilled)
+        conversation_file.write_text(rewritten, encoding="utf-8")
+        if not json_mode:
+            print(
+                f"compact: moved {moved} bytes of output from {len(spilled)} "
+                f"block{'' if len(spilled) == 1 else 's'} to "
+                f"{conversation_outputs_dir(conversation_file)}"
+            )
+
     prompt = (
         f"{compact_guidance}\n\n"
         "Compact this conversation now, following the guidance above. "
         "Rewrite it in place so it is substantially smaller while preserving "
-        "future capability."
+        "future capability.\n"
+        "Bulk command output has already been moved to files: a result block "
+        "carrying output=\"...\" is a pointer to its own complete output. Keep those "
+        "pointers verbatim — path and all — and never replace one with a description "
+        "of what the output contained. They are how that output is still reachable."
     )
     return edit_conversation(
         conversation_file,
@@ -3073,6 +3467,17 @@ def main() -> int:
         type=Path,
         metavar="PATH",
         help="Edit a specific file using its per-file conversation (see nagent-file-edit).",
+    )
+    parser.add_argument(
+        "--hook-per-response",
+        metavar="CMD",
+        help=(
+            "Command that must exit 0 before a <nagent-response> is accepted as final. "
+            "Runs against the tree, not the report: its output is appended and the run "
+            "continues when it fails. Overrides config 'hook_per_response'. A model that "
+            "fabricates work fabricates its verification too, so this is the only check "
+            "here that can catch one."
+        ),
     )
     parser.add_argument(
         "--hook-per-run",
@@ -3452,8 +3857,8 @@ def main() -> int:
             campaign_item_dir=campaign_item_dir,
         )
 
-    hook_per_run, hook_per_file_edit = resolve_hooks(
-        args.hook_per_run, args.hook_per_file_edit, args.config
+    hook_per_run, hook_per_file_edit, hook_per_response = resolve_hooks(
+        args.hook_per_run, args.hook_per_file_edit, args.config, args.hook_per_response
     )
     safety_settings = load_safety_settings(args.config)
     if safety_settings["context_window_tokens"] <= 0:
@@ -3481,6 +3886,7 @@ def main() -> int:
             initial_read_paths=args.read,
             safety_settings=safety_settings,
             hook_per_run=hook_per_run,
+            hook_per_response=hook_per_response,
             hook_per_file_edit=hook_per_file_edit,
         )
     except KeyboardInterrupt:

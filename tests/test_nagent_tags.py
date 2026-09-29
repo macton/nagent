@@ -233,3 +233,23 @@ class UnwrapTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class UnwrapOffsetTests(unittest.TestCase):
+    """Offsets stay in one coordinate system across an unwrap."""
+
+    def test_inner_offsets_are_shifted_into_the_outer_document(self):
+        text = "<wrap>\n<known />\n<other>x</other>\n</wrap>"
+        nodes, ignored = scan_tag_document(
+            text, frozenset({"known"}), frozenset({"wrap"}), frozenset()
+        )
+        self.assertEqual([n.name for n in nodes], ["known"])
+        # The node really is at that offset in `text`, not in the wrapper's body.
+        self.assertEqual(text[nodes[0].start : nodes[0].end], "<known />")
+        self.assertEqual([span.name for span in ignored], ["other"])
+        self.assertEqual(text[ignored[0].start : ignored[0].start + 7], "<other>")
+
+    def test_content_start_points_at_the_body(self):
+        node = parse_element('<a b="c">body</a>')
+        self.assertEqual(node.content, "body")
+        self.assertEqual('<a b="c">body</a>'[node.content_start :], "body</a>")

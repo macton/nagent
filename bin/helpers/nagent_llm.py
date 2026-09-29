@@ -27,12 +27,36 @@ OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
 # silent truncation, which is the point.
 ANTHROPIC_MAX_OUTPUT_TOKENS = 64000
 
+# The four driver-output prefixes worth handing a provider as stop sequences, so
+# generation halts at the boundary instead of continuing into nagent's lines. The
+# ReAct convention is exactly this: stop at the observation marker so observations
+# can only come from execution. Chosen by measured frequency over 1193 real
+# stripped turns in one project's conversations — 1066 <nagent-shell-result, 1022
+# <nagent-turn-status, 57 <nagent-read-result, 38 <nagent-write-result, which is
+# 98% of the 2219 occurrences. Four because Anthropic's limit is four.
+#
+# The loop already refuses to act on what follows a fabrication; this stops the
+# provider generating it at all, so the tokens are never billed and the real
+# action that preceded it survives untouched.
+DRIVER_OUTPUT_STOP_SEQUENCES = [
+    "<nagent-shell-result",
+    "<nagent-turn-status",
+    "<nagent-read-result",
+    "<nagent-write-result",
+]
+
 # Stop reasons that mean "the provider cut the reply off at the output cap", in
 # each provider's own vocabulary: anthropic says max_tokens, the
 # OpenAI-compatible chat APIs say length. This set is the only place that
 # knowledge lives; everything downstream reads the boolean derived from it, so a
 # consumer never has to learn a provider's spelling.
 TRUNCATION_STOP_REASONS = frozenset({"max_tokens", "length"})
+
+# A reply cut short by one of DRIVER_OUTPUT_STOP_SEQUENCES. Not truncation: the
+# model finished what it was entitled to say, and nagent stopped it from writing
+# nagent's own output. output_was_truncated() must stay False for it, or the loop
+# would tell the model it hit a length limit when it did not.
+STOP_SEQUENCE_STOP_REASONS = frozenset({"stop_sequence"})
 
 # For the claude-code provider, "default" means Claude Code's own configured
 # model: the SDK is invoked with model=None and Claude Code decides.
@@ -102,6 +126,28 @@ PACKAGE_HINTS = {
     "together": "openai",
     "openrouter": "openai",
 }
+
+
+def strip_trailing_stop_prefix(text: str, stops: list[str] = DRIVER_OUTPUT_STOP_SEQUENCES) -> str:
+    """Trim a dangling partial stop sequence off the end of a generated reply.
+
+    A provider that halts on a stop sequence can still have emitted the first few
+    characters of it — measured live against Together: asked to fabricate a result
+    block, the reply came back ending `...</nagent-shell>\n<nagent-shell`, the
+    prefix of `<nagent-shell-result`. That fragment is a provider artifact, not
+    model output, and left in place it is fatal: `<nagent-shell` is a known tag
+    name with no `>`, so the parser raises a hard error and discards the whole
+    turn — including the real action that preceded it. Stopping the fabrication
+    would then cost more than allowing it.
+
+    Only a *proper* prefix is trimmed, longest first, so a complete tag is never
+    touched. A turn genuinely ending mid-tag was unusable anyway.
+    """
+    for stop in stops:
+        for length in range(len(stop) - 1, 0, -1):
+            if text.endswith(stop[:length]):
+                return text[:-length]
+    return text
 
 
 def output_was_truncated(stop_reason: str | None) -> bool:
@@ -380,6 +426,17 @@ def _openai_compatible_client(provider: str, api_key_env: str, base_url: str):
     return OpenAI(api_key=os.environ[api_key_env], base_url=base_url)
 
 
+def _forwards_anthropic_cache_control(model: str) -> bool:
+    """Whether this OpenRouter model takes Anthropic-style cache_control blocks.
+
+    OpenRouter routes to the upstream provider, so the block form is honoured only
+    where upstream honours it. Keyed on the `anthropic/` prefix its model ids
+    carry (`anthropic/claude-opus-5`) rather than on a maintained list, because a
+    new Claude appearing there should work on the day it appears.
+    """
+    return model.startswith("anthropic/")
+
+
 def _together_client():
     return _openai_compatible_client("together", "TOGETHER_API_KEY", TOGETHER_BASE_URL)
 
@@ -412,6 +469,7 @@ def _openai_compatible_chat(client, model, messages, reasoning=None):
         messages=messages,
         stream=True,
         stream_options={"include_usage": True},
+        stop=DRIVER_OUTPUT_STOP_SEQUENCES,
         **extra,
     )
     for chunk in stream:
@@ -424,7 +482,7 @@ def _openai_compatible_chat(client, model, messages, reasoning=None):
             content = getattr(delta, "content", None) if delta is not None else None
             if content:
                 parts.append(content)
-    return "".join(parts), usage, finish_reason
+    return strip_trailing_stop_prefix("".join(parts)), usage, finish_reason
 
 
 def _together_chat(client, model, messages, reasoning=None):
@@ -493,6 +551,10 @@ def resolve_from_args(args) -> tuple[str, str]:
 
 def list_models(provider: str) -> list[str]:
     if provider == "openai":
+        # cache_boundaries is not passed: OpenAI caches long prompt prefixes
+        # automatically and exposes no breakpoint control, so the only thing that
+        # buys a hit is the stable-first ordering the callers already build. The
+        # offset is computed and dropped, which costs nothing.
         OpenAI = require_package(provider)
         client = OpenAI()
         return sorted({model.id for model in client.models.list()})
@@ -758,6 +820,10 @@ def generate_text_with_usage(
     native = resolve_reasoning(provider, reasoning).native
 
     if provider == "openai":
+        # cache_boundaries is not passed: OpenAI caches long prompt prefixes
+        # automatically and exposes no breakpoint control, so the only thing that
+        # buys a hit is the stable-first ordering the callers already build. The
+        # offset is computed and dropped, which costs nothing.
         OpenAI = require_package(provider)
         client = OpenAI()
         kwargs = {"reasoning": {"effort": native}} if native is not None else {}
@@ -776,12 +842,13 @@ def generate_text_with_usage(
         with client.messages.stream(
             model=model,
             max_tokens=ANTHROPIC_MAX_OUTPUT_TOKENS,
+            stop_sequences=DRIVER_OUTPUT_STOP_SEQUENCES,
             messages=[{"role": "user", "content": cache_prefix_blocks(message, cache_boundaries)}],
             **kwargs,
         ) as stream:
             response = stream.get_final_message()
         return _result_with_usage(
-            _anthropic_text(response),
+            strip_trailing_stop_prefix(_anthropic_text(response)),
             getattr(response, "usage", None),
             message,
             stop_reason=getattr(response, "stop_reason", None),
@@ -807,7 +874,8 @@ def generate_text_with_usage(
     if provider == "together":
         # Together implements the chat completions API, not the OpenAI
         # Responses API, so this path differs from the openai branch above.
-        # cache_boundaries is ignored: Together has no block-cache API.
+        # cache_boundaries is ignored: Together exposes no prefix-cache control
+        # on its wire format, so there is nothing to mark.
         client = _together_client()
         text, usage, finish_reason = _together_chat(
             client, model, [{"role": "user", "content": message}], reasoning=native
@@ -816,11 +884,21 @@ def generate_text_with_usage(
 
     if provider == "openrouter":
         # OpenRouter implements the chat completions API, not the OpenAI
-        # Responses API. cache_boundaries is ignored: OpenRouter has no
-        # nagent-supported block-cache API.
+        # Responses API. It does forward cache_control on content blocks to
+        # Anthropic-family models — measured 2026-09-28 against
+        # anthropic/claude-opus-5 on a 12572-token conversation: no markers read
+        # 0 tokens, a marker at the context boundary read 7917, all three read
+        # 12570. For any other model on OpenRouter the boundaries are dropped
+        # rather than guessed at, because an unsupported block shape is a 400 and
+        # a silent miss is the only other outcome worth having.
         client = _openrouter_client()
+        content = (
+            cache_prefix_blocks(message, cache_boundaries)
+            if _forwards_anthropic_cache_control(model)
+            else message
+        )
         text, usage, finish_reason = _openrouter_chat(
-            client, model, [{"role": "user", "content": message}], reasoning=native
+            client, model, [{"role": "user", "content": content}], reasoning=native
         )
         return _result_with_usage(text, usage, message, stop_reason=finish_reason)
 

@@ -329,7 +329,8 @@ class SafetyNetTests(unittest.TestCase):
             block,
             '<nagent-turn-status utc="2026-06-12T12:00:00Z" turn="2" '
             'tokens_in_total="320" tokens_out_total="75" '
-            'cache_read_total="100" cache_write_total="180" />',
+            'cache_read_total="100" cache_write_total="180" '
+            'stripped_turns="0" fabricated_turns="0" />',
         )
 
     def test_invalid_content_is_stripped_to_a_sidecar(self):

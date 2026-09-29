@@ -434,7 +434,7 @@ class ParseResponseTests(unittest.TestCase):
             '<nagent-conversation conversation-file="existing-conv">continue file</nagent-conversation>\n'
             '<nagent-conversation conversation-name="saved-conv">continue saved</nagent-conversation>'
         )
-        tags, ignored, err = self.mod.parse_response(text)
+        tags, ignored, err, fab = self.mod.parse_response(text)
         self.assertIsNone(err)
         self.assertEqual(ignored, [])
         self.assertEqual(
@@ -462,13 +462,13 @@ class ParseResponseTests(unittest.TestCase):
         self.assertEqual(tags[7].conversation_name, "saved-conv")
 
     def test_conversation_tag_rejects_unsupported_options(self):
-        tags, ignored, err = self.mod.parse_response(
+        tags, ignored, err, fab = self.mod.parse_response(
             '<nagent-conversation unknown="conv">delegate</nagent-conversation>'
         )
         self.assertEqual(tags, [])
         self.assertIn("Unsupported <nagent-conversation> attribute", err)
 
-        tags, ignored, err = self.mod.parse_response(
+        tags, ignored, err, fab = self.mod.parse_response(
             '<nagent-conversation conversation-file="conv" conversation-name="saved">'
             "delegate</nagent-conversation>"
         )
@@ -477,7 +477,7 @@ class ParseResponseTests(unittest.TestCase):
 
     def test_write_tag_carries_raw_content(self):
         body = 'line1\nif a < b && c: print("&")\nline3\n'
-        tags, ignored, err = self.mod.parse_response(
+        tags, ignored, err, fab = self.mod.parse_response(
             f'<nagent-write path="/tmp/out.py">{body}</nagent-write>'
         )
         self.assertIsNone(err)
@@ -488,16 +488,16 @@ class ParseResponseTests(unittest.TestCase):
     def test_read_tag_requires_exactly_path_attribute(self):
         # A *known* tag with a bad shape is a hard error (clear intent, fixable),
         # not silently ignored.
-        tags, ignored, err = self.mod.parse_response("<nagent-read />")
+        tags, ignored, err, fab = self.mod.parse_response("<nagent-read />")
         self.assertEqual(tags, [])
         self.assertIn('requires exactly one path="..."', err)
 
-        tags, ignored, err = self.mod.parse_response('<nagent-read path="/tmp/f" extra="x" />')
+        tags, ignored, err, fab = self.mod.parse_response('<nagent-read path="/tmp/f" extra="x" />')
         self.assertEqual(tags, [])
         self.assertIn('requires exactly one path="..."', err)
 
     def test_shell_tag_rejects_attributes(self):
-        tags, ignored, err = self.mod.parse_response('<nagent-shell mode="x">ls</nagent-shell>')
+        tags, ignored, err, fab = self.mod.parse_response('<nagent-shell mode="x">ls</nagent-shell>')
         self.assertEqual(tags, [])
         self.assertIn("does not take attributes", err)
 
@@ -505,7 +505,7 @@ class ParseResponseTests(unittest.TestCase):
         # write/shell stay strict: an unclosed body could carry content that
         # must never run, so it is a hard error, not an EOF capture.
         for text in ("<nagent-shell>ls", '<nagent-write path="/tmp/f">data'):
-            tags, ignored, err = self.mod.parse_response(text)
+            tags, ignored, err, fab = self.mod.parse_response(text)
             self.assertEqual(tags, [], text)
             self.assertIn("missing </nagent-", err, text)
 
@@ -517,20 +517,20 @@ class ParseResponseTests(unittest.TestCase):
             "<thought\nEverything is done. Reporting now."
             "<nagent-response>All 181 tests pass; 95x speedup."
         )
-        tags, ignored, err = self.mod.parse_response(text)
+        tags, ignored, err, fab = self.mod.parse_response(text)
         self.assertIsNone(err)
         self.assertEqual([t.kind for t in tags], ["response"])
         self.assertEqual(tags[0].content, "All 181 tests pass; 95x speedup.")
 
     def test_closed_response_still_parses_normally(self):
-        tags, ignored, err = self.mod.parse_response(
+        tags, ignored, err, fab = self.mod.parse_response(
             "<nagent-response>done</nagent-response>"
         )
         self.assertIsNone(err)
         self.assertEqual(tags[0].content, "done")
 
     def test_leading_prose_is_ignored_not_rejected(self):
-        tags, ignored, err = self.mod.parse_response(
+        tags, ignored, err, fab = self.mod.parse_response(
             "oops <nagent-response>Hi</nagent-response>"
         )
         self.assertIsNone(err)
@@ -545,7 +545,7 @@ class ParseResponseTests(unittest.TestCase):
             "<thought>Okay, let's think.</thought>",
             "<thought Okay, let's think.",  # malformed: looks like a bad attribute
         ):
-            tags, ignored, err = self.mod.parse_response(
+            tags, ignored, err, fab = self.mod.parse_response(
                 f"{thought}\n<nagent-shell>ls</nagent-shell>"
             )
             self.assertIsNone(err, thought)
@@ -553,7 +553,7 @@ class ParseResponseTests(unittest.TestCase):
             self.assertTrue(ignored, thought)
 
     def test_trailing_prose_after_valid_tag_is_ignored(self):
-        tags, ignored, err = self.mod.parse_response(
+        tags, ignored, err, fab = self.mod.parse_response(
             "<nagent-shell>find .</nagent-shell> Standard input linter is used."
         )
         self.assertIsNone(err)
@@ -561,7 +561,7 @@ class ParseResponseTests(unittest.TestCase):
         self.assertTrue(any("Standard input linter" in note for note in ignored))
 
     def test_echoed_agent_response_wrapper_is_unwrapped(self):
-        tags, ignored, err = self.mod.parse_response(
+        tags, ignored, err, fab = self.mod.parse_response(
             "<agent-response>\n<nagent-conversation>do it</nagent-conversation>\n</agent-response>"
         )
         self.assertIsNone(err)
@@ -570,13 +570,13 @@ class ParseResponseTests(unittest.TestCase):
         self.assertEqual(ignored, [])
 
     def test_pure_reasoning_yields_no_tags(self):
-        tags, ignored, err = self.mod.parse_response("<thought>just thinking</thought>")
+        tags, ignored, err, fab = self.mod.parse_response("<thought>just thinking</thought>")
         self.assertIsNone(err)
         self.assertEqual(tags, [])
         self.assertTrue(ignored)
 
     def test_empty_response_has_no_tags_and_no_error(self):
-        tags, ignored, err = self.mod.parse_response("   ")
+        tags, ignored, err, fab = self.mod.parse_response("   ")
         self.assertIsNone(err)
         self.assertEqual(tags, [])
         self.assertEqual(ignored, [])
@@ -600,7 +600,7 @@ class ParseResponseTests(unittest.TestCase):
             "<nagent-shell>ls</nagent-shell>"
             "<nagent-next>go</nagent-next>"
         ) * 4
-        tags, ignored, err = self.mod.parse_response(turn)
+        tags, ignored, err, fab = self.mod.parse_response(turn)
         self.assertIsNone(err)
         self.assertEqual([t.kind for t in tags], ["read", "shell", "next"])  # deduped
         cleaned, dupes = self.mod.cleaned_response_text(turn)
@@ -612,7 +612,7 @@ class ParseResponseTests(unittest.TestCase):
 
     def test_distinct_tags_are_not_deduped(self):
         # Same kind, different content/attrs -> both kept.
-        tags, ignored, err = self.mod.parse_response(
+        tags, ignored, err, fab = self.mod.parse_response(
             "<nagent-next>a</nagent-next><nagent-next>b</nagent-next>"
             '<nagent-read path="/tmp/x" /><nagent-read path="/tmp/y" />'
         )
@@ -713,6 +713,537 @@ class ActionTests(unittest.TestCase):
         self.assertEqual(stats.recursive_input_tokens, 500)
         self.assertEqual(stats.recursive_cache_read_tokens, 400)
         self.assertEqual(stats.recursive_cache_write_tokens, 50)
+
+    # ---- fabricated driver output ------------------------------------------
+
+    def test_fabricated_result_tag_cuts_the_turn_and_drops_what_follows(self):
+        # The measured shape: a real action, then the result the model expected,
+        # then more actions chosen from that invented output. The real action runs;
+        # everything after the fabrication is discarded unrun.
+        turn = (
+            "<nagent-shell>ls /build</nagent-shell>\n"
+            "<nagent-shell-result>\nexit_code: 0\nstdout:\nbuild ok\n</nagent-shell-result>\n"
+            "<nagent-shell>make install</nagent-shell>\n"
+            "<nagent-response>build verified, installed</nagent-response>"
+        )
+        tags, ignored, err, fab = self.mod.parse_response(turn)
+        self.assertIsNone(err)
+        self.assertEqual([t.kind for t in tags], ["shell"])
+        self.assertEqual(tags[0].content, "ls /build")
+        self.assertEqual(fab.name, "nagent-shell-result")
+        self.assertEqual(fab.dropped, 2)
+        self.assertTrue(any("nagent-shell-result" in note for note in ignored))
+
+    def test_echoed_turn_status_telemetry_also_cuts_the_turn(self):
+        # 767 of 1193 stripped turns in the corpus echoed this tag. It is driver
+        # output like any other: past it, the model is writing the transcript.
+        turn = (
+            "<nagent-shell>true</nagent-shell>\n"
+            '<nagent-turn-status utc="2026-01-01T00:00:00Z" turn="3" />\n'
+            "<nagent-response>done</nagent-response>"
+        )
+        tags, _ignored, err, fab = self.mod.parse_response(turn)
+        self.assertIsNone(err)
+        self.assertEqual([t.kind for t in tags], ["shell"])
+        self.assertEqual(fab.name, "nagent-turn-status")
+
+    def test_ordinary_junk_does_not_cut_the_turn(self):
+        # Prose, fences and reasoning leaks are tolerated exactly as before: they
+        # are noise, not evidence that the model started inventing observations.
+        turn = (
+            "Let me check the build.\n"
+            "<thought>probably fine</thought>\n"
+            "```\n"
+            "<nagent-shell>ls</nagent-shell>\n"
+            "<nagent-response>ok</nagent-response>"
+        )
+        tags, ignored, err, fab = self.mod.parse_response(turn)
+        self.assertIsNone(err)
+        self.assertEqual([t.kind for t in tags], ["shell", "response"])
+        self.assertIsNone(fab)
+        self.assertTrue(ignored)
+
+    # ---- the exit gate ------------------------------------------------------
+
+    def test_exit_gate_refuses_a_response_until_the_tree_agrees(self):
+        # The gate reads the tree, not the report. A fabricated completion claim
+        # is refused, its evidence is quoted into the conversation, and the run
+        # continues instead of returning the claim.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "conversations").mkdir()
+            conversation = root / "conversations" / "c"
+            conversation.write_text("", encoding="utf-8")
+            marker = root / "done"
+            gate = f"test -f {marker}"
+
+            calls = []
+
+            def call_llm(*args, **kwargs):
+                calls.append(1)
+                if len(calls) == 1:
+                    # A claim with nothing behind it: the gate will refuse it.
+                    return (
+                        "<nagent-response>step 8 complete and verified</nagent-response>",
+                        None,
+                        None,
+                    )
+                # Having been refused, it does the work, then answers again.
+                marker.write_text("", encoding="utf-8")
+                return ("<nagent-response>step 8 done, validator passes</nagent-response>", None, None)
+
+            with unittest.mock.patch.object(self.mod, "call_llm", call_llm), \
+                unittest.mock.patch.object(self.mod, "run_safety_net", lambda *a, **k: None):
+                code, responses = self.mod.run_agent_loop(
+                    conversation,
+                    root,
+                    self.mod.LlmSettings(provider="anthropic", model="claude-opus-5"),
+                    "do step 8",
+                    "1",
+                    json_mode=True,
+                    hook_per_response=gate,
+                )
+            text = conversation.read_text(encoding="utf-8")
+
+        self.assertEqual(code, 0)
+        self.assertEqual(len(calls), 2)
+        # The refused claim is not what the caller got.
+        self.assertEqual(responses, ["step 8 done, validator passes"])
+        self.assertNotIn("step 8 complete and verified", responses)
+        # The gate ran twice and its verdicts are in the conversation.
+        self.assertEqual(text.count('<hook-per-response exit_code='), 2)
+        self.assertIn("refused by this run's exit gate", text)
+        self.assertIn("against the tree", text)
+
+    def test_exit_gate_that_can_never_pass_stops_asking(self):
+        # An unsatisfiable gate must not loop forever spending tokens.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "conversations").mkdir()
+            conversation = root / "conversations" / "c"
+            conversation.write_text("", encoding="utf-8")
+            call_llm = unittest.mock.Mock(
+                return_value=("<nagent-response>done</nagent-response>", None, None)
+            )
+            with unittest.mock.patch.object(self.mod, "call_llm", call_llm), \
+                unittest.mock.patch.object(self.mod, "run_safety_net", lambda *a, **k: None):
+                code, responses = self.mod.run_agent_loop(
+                    conversation,
+                    root,
+                    self.mod.LlmSettings(provider="anthropic", model="claude-opus-5"),
+                    "go",
+                    "1",
+                    json_mode=True,
+                    hook_per_response="false",
+                )
+            text = conversation.read_text(encoding="utf-8")
+        # Bounded: refused MAX times, then the answer is allowed through with the
+        # gate's failures on the record rather than the run hanging.
+        self.assertEqual(call_llm.call_count, self.mod.MAX_RESPONSE_GATE_REFUSALS + 1)
+        self.assertEqual(code, 0)
+        self.assertEqual(responses[-1], "done")
+        self.assertEqual(
+            text.count("refused by this run's exit gate"), self.mod.MAX_RESPONSE_GATE_REFUSALS
+        )
+
+    def test_a_passing_exit_gate_is_invisible(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "conversations").mkdir()
+            conversation = root / "conversations" / "c"
+            conversation.write_text("", encoding="utf-8")
+            call_llm = unittest.mock.Mock(
+                return_value=("<nagent-response>done</nagent-response>", None, None)
+            )
+            with unittest.mock.patch.object(self.mod, "call_llm", call_llm), \
+                unittest.mock.patch.object(self.mod, "run_safety_net", lambda *a, **k: None):
+                code, responses = self.mod.run_agent_loop(
+                    conversation, root,
+                    self.mod.LlmSettings(provider="anthropic", model="claude-opus-5"),
+                    "go", "1", json_mode=True, hook_per_response="true",
+                )
+            text = conversation.read_text(encoding="utf-8")
+        self.assertEqual((code, responses), (0, ["done"]))
+        self.assertEqual(call_llm.call_count, 1)
+        self.assertIn('<hook-per-response exit_code="0">', text)   # recorded
+        self.assertNotIn("refused", text)                  # but not in the way
+
+    def test_a_failed_attempt_is_sidecarred_not_left_in_the_conversation(self):
+        # Issue 0001. A retry used to append its raw attempt inline, where it
+        # stayed for the rest of the run as an example of the mistake. With the
+        # fabrication cut that attempt can be a forged observation, which is the
+        # worst possible thing to leave in the file the next turn reads.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "conversations").mkdir()
+            conversation = root / "conversations" / "c"
+            conversation.write_text("", encoding="utf-8")
+            forged = (
+                "<nagent-shell-result>\nexit_code: 0\nstdout:\nall 8 validators pass\n"
+                "</nagent-shell-result>\n"
+                "<nagent-response>step 8 complete and verified</nagent-response>"
+            )
+            call_llm = unittest.mock.Mock(
+                side_effect=[
+                    (forged, None, None),
+                    ("<nagent-response>3 of 8 pass</nagent-response>", None, None),
+                ]
+            )
+            with unittest.mock.patch.object(self.mod, "call_llm", call_llm), \
+                unittest.mock.patch.object(self.mod, "run_safety_net", lambda *a, **k: None):
+                self.mod.run_agent_loop(
+                    conversation,
+                    root,
+                    self.mod.LlmSettings(provider="anthropic", model="claude-opus-5"),
+                    "do step 8",
+                    "1",
+                    json_mode=True,
+                )
+            text = conversation.read_text(encoding="utf-8")
+            sidecars = list((root / "conversations").glob("c.invalid.*"))
+
+            # Nothing the model invented survives in the conversation.
+            self.assertNotIn("exit_code: 0", text)
+            self.assertNotIn("all 8 validators pass", text)
+            self.assertNotIn("step 8 complete and verified", text)
+            # It is recoverable, and the conversation says where from.
+            self.assertEqual(len(sidecars), 1)
+            self.assertIn("all 8 validators pass", sidecars[0].read_text(encoding="utf-8"))
+            self.assertIn(sidecars[0].name, text)
+            self.assertIn("read it with <nagent-read>", text)
+
+    def test_a_malformed_tag_retry_also_sidecars_its_attempt(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "conversations").mkdir()
+            conversation = root / "conversations" / "c"
+            conversation.write_text("", encoding="utf-8")
+            call_llm = unittest.mock.Mock(
+                side_effect=[
+                    # Hard parse error: a known tag with a bad attribute.
+                    ('<nagent-shell mode="x">ls</nagent-shell>', None, None),
+                    ("<nagent-response>ok</nagent-response>", None, None),
+                ]
+            )
+            with unittest.mock.patch.object(self.mod, "call_llm", call_llm), \
+                unittest.mock.patch.object(self.mod, "run_safety_net", lambda *a, **k: None):
+                self.mod.run_agent_loop(
+                    conversation,
+                    root,
+                    self.mod.LlmSettings(provider="anthropic", model="claude-opus-5"),
+                    "go",
+                    "1",
+                    json_mode=True,
+                )
+            text = conversation.read_text(encoding="utf-8")
+            sidecars = list((root / "conversations").glob("c.invalid.*"))
+        self.assertNotIn('mode="x"', text)
+        self.assertIn("Invalid nagent response format", text)
+        self.assertEqual(len(sidecars), 1)
+
+    def test_talking_about_a_driver_tag_does_not_cut_the_turn(self):
+        # A model discussing the protocol is not fabricating. The initial context
+        # itself lists <nagent-turn-status ... /> verbatim, so a model that quotes
+        # its own instructions must not lose its work over it. Measured: 912 of
+        # 940 real fabrications sit at the start of a line; mentions do not.
+        for label, turn in (
+            ("backticked mid-sentence", "A `<nagent-shell-result>` is driver output.\n<nagent-shell>ls</nagent-shell>"),
+            ("quoting the tag list", 'nagent appends <nagent-turn-status utc="..." turn="N" />\n<nagent-shell>ls</nagent-shell>'),
+            ("a bullet about it", '- <nagent-turn-status utc="..." /> is telemetry\n<nagent-shell>ls</nagent-shell>'),
+        ):
+            with self.subTest(label):
+                tags, _ignored, err, fab = self.mod.parse_response(turn)
+                self.assertIsNone(err)
+                self.assertIsNone(fab, "a mention must not cut the turn")
+                self.assertEqual([t.kind for t in tags], ["shell"])
+
+    def test_fabrication_is_found_inside_an_echoed_agent_response_wrapper(self):
+        # Models sometimes echo nagent's own <agent-response> frame. The scanner
+        # unwraps it; the offsets inside have to be shifted into this document or
+        # the comparison that decides what came first is meaningless.
+        turn = (
+            "<agent-response>\n"
+            "<nagent-shell>ls</nagent-shell>\n"
+            "<nagent-shell-result>\nexit_code: 0\nstdout:\nok\n</nagent-shell-result>\n"
+            "<nagent-response>all good</nagent-response>\n"
+            "</agent-response>"
+        )
+        tags, _ignored, err, fab = self.mod.parse_response(turn)
+        self.assertIsNone(err)
+        self.assertEqual(fab.name, "nagent-shell-result")
+        self.assertEqual([t.kind for t in tags], ["shell"])
+        self.assertEqual(fab.dropped, 1)
+
+    def test_a_turn_that_is_only_fabrication_yields_no_tags(self):
+        turn = "<nagent-shell-result>\nexit_code: 0\nstdout:\nall tests pass\n</nagent-shell-result>"
+        tags, _ignored, err, fab = self.mod.parse_response(turn)
+        self.assertIsNone(err)
+        self.assertEqual(tags, [])
+        self.assertEqual(fab.name, "nagent-shell-result")
+        self.assertEqual(fab.dropped, 0)
+
+    def test_a_fabricating_turn_cannot_end_the_run(self):
+        # The 86 cases: a terminal response written after inventing tool output.
+        # The response is dropped, so the loop asks again instead of returning it.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            conversation = root / "conversation"
+            conversation.write_text("", encoding="utf-8")
+            call_llm = unittest.mock.Mock(
+                side_effect=[
+                    (
+                        "<nagent-shell-result>\nexit_code: 0\nstdout:\n8 validators pass\n"
+                        "</nagent-shell-result>\n"
+                        "<nagent-response>step 8 complete and verified</nagent-response>",
+                        None,
+                        None,
+                    ),
+                    ("<nagent-response>actually checked: 3 of 8 pass</nagent-response>", None, None),
+                ]
+            )
+            with unittest.mock.patch.object(self.mod, "call_llm", call_llm), \
+                unittest.mock.patch.object(self.mod, "run_safety_net", lambda *a, **k: None):
+                code, responses = self.mod.run_agent_loop(
+                    conversation,
+                    root,
+                    self.mod.LlmSettings(provider="anthropic", model="claude-opus-5"),
+                    "do step 8",
+                    "4242",
+                    json_mode=True,
+                )
+            text = conversation.read_text(encoding="utf-8")
+        self.assertEqual(code, 0)
+        self.assertEqual(call_llm.call_count, 2)
+        # The fabricated completion is not what the caller got.
+        self.assertEqual(responses[-1], "actually checked: 3 of 8 pass")
+        self.assertNotIn("step 8 complete and verified", responses)
+        # And the conversation says what happened, naming the tag.
+        self.assertIn("You wrote a <nagent-shell-result>", text)
+        self.assertIn("Only nagent writes that tag", text)
+
+    def test_fabrications_are_counted_in_the_telemetry(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            conversation = root / "conversation"
+            conversation.write_text("", encoding="utf-8")
+            call_llm = unittest.mock.Mock(
+                side_effect=[
+                    (
+                        "<nagent-shell>true</nagent-shell>\n"
+                        "<nagent-shell-result>\nexit_code: 0\n</nagent-shell-result>",
+                        None,
+                        None,
+                    ),
+                    ("<nagent-response>done</nagent-response>", None, None),
+                ]
+            )
+            with unittest.mock.patch.object(self.mod, "call_llm", call_llm), \
+                unittest.mock.patch.object(self.mod, "run_safety_net", lambda *a, **k: None):
+                self.mod.run_agent_loop(
+                    conversation,
+                    root,
+                    self.mod.LlmSettings(provider="anthropic", model="claude-opus-5"),
+                    "go",
+                    "4242",
+                    json_mode=True,
+                )
+            text = conversation.read_text(encoding="utf-8")
+        self.assertIn('fabricated_turns="1"', text)
+        self.assertIn('stripped_turns="1"', text)
+
+    # ---- spilling bulk output to files --------------------------------------
+
+    def test_spill_moves_oversized_result_bodies_and_leaves_small_ones(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out_dir = Path(tmp) / "conv.outputs"
+            big = "line\n" * 4000
+            text = (
+                "<initial_context>\nrules\n</initial_context>\n"
+                f"<nagent-shell-result>\nexit_code: 0\nstdout:\n{big}</nagent-shell-result>\n"
+                "<nagent-shell-result>\nexit_code: 1\nstderr:\nboom\n</nagent-shell-result>\n"
+            )
+            out, spilled = self.mod.spill_large_results(text, out_dir)
+
+            self.assertEqual(len(spilled), 1)
+            tag, path, size = spilled[0]
+            self.assertEqual(tag, "nagent-shell-result")
+            # Moved whole and unedited — the file is the body, byte for byte.
+            self.assertTrue(path.is_file())
+            self.assertEqual(path.read_text(encoding="utf-8"), f"exit_code: 0\nstdout:\n{big}")
+            self.assertEqual(size, len(f"exit_code: 0\nstdout:\n{big}"))
+            self.assertLess(len(out), len(text) // 10)
+            # The pointer keeps the exit code and names the path.
+            self.assertIn(f'output="{path}"', out)
+            self.assertIn("exit_code: 0", out)
+            self.assertIn("nothing was summarized", out)
+            # The small block is untouched, and so is the initial context.
+            self.assertIn("exit_code: 1\nstderr:\nboom", out)
+            self.assertIn("<initial_context>\nrules\n</initial_context>", out)
+
+    def test_spill_is_idempotent(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out_dir = Path(tmp) / "conv.outputs"
+            text = f"<hook-per-run exit_code=\"0\">\n{'z' * 20000}\n</hook-per-run>\n"
+            once, first = self.mod.spill_large_results(text, out_dir)
+            twice, second = self.mod.spill_large_results(once, out_dir)
+            self.assertEqual(len(first), 1)
+            self.assertEqual(second, [])
+            self.assertEqual(twice, once)
+            # Attributes already on the block survive the rewrite.
+            self.assertIn('exit_code="0"', once)
+
+    def test_spill_leaves_text_alone_when_the_directory_cannot_be_written(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            blocker = Path(tmp) / "not-a-dir"
+            blocker.write_text("x", encoding="utf-8")
+            text = f"<nagent-shell-result>\nexit_code: 0\n{'q' * 20000}\n</nagent-shell-result>"
+            out, spilled = self.mod.spill_large_results(text, blocker / "outputs")
+        self.assertEqual(spilled, [])
+        self.assertEqual(out, text)  # bigger, but never wrong
+
+    def test_turn_status_is_never_spilled(self):
+        # It is one line and it is the run's index; there is nothing to move.
+        text = '<nagent-turn-status utc="x" turn="1" />' + "\n"
+        with tempfile.TemporaryDirectory() as tmp:
+            out, spilled = self.mod.spill_large_results(text, Path(tmp) / "o")
+        self.assertEqual((out, spilled), (text, []))
+
+    def test_rebuild_spills_before_slicing_so_the_tail_covers_more_turns(self):
+        # One huge result would otherwise consume the whole retained window.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "conversations").mkdir()
+            conversation = root / "conversations" / "conv"
+            huge = "output\n" * 30000
+            turns = "".join(
+                f"<agent-response>\nturn {i}\n</agent-response>\n"
+                f"<nagent-shell-result>\nexit_code: 0\nstdout:\n{huge}</nagent-shell-result>\n"
+                for i in range(6)
+            )
+            conversation.write_text(
+                f"<initial_context>\nrules\n</initial_context>\n{turns}", encoding="utf-8"
+            )
+            with unittest.mock.patch.object(self.mod, "write_checkpoint", lambda *a, **k: None):
+                archived = self.mod.rebuild_conversation(
+                    conversation, root, self.mod.LlmSettings("anthropic", "claude-opus-5")
+                )
+            rebuilt = conversation.read_text(encoding="utf-8")
+            self.assertIsNotNone(archived)
+            # The archive still holds every byte of the original.
+            self.assertIn(huge, Path(archived).read_text(encoding="utf-8"))
+            # The live window holds pointers, not bulk, so every turn survives.
+            self.assertNotIn(huge, rebuilt)
+            for i in range(6):
+                self.assertIn(f"turn {i}", rebuilt)
+            self.assertIn("output=", rebuilt)
+
+    def test_oversized_commit_diff_is_named_by_path_not_clipped(self):
+        # The summarizer must never be handed a diff that ends mid-hunk with
+        # nothing saying so; it would describe a partial change as the whole one.
+        captured = {}
+
+        def fake_patch(repo_root, commit_hash, rel_path):
+            return "@@ -1 +1 @@\n" + ("+x\n" * 9000)
+
+        def fake_generate(prompt, provider, model):
+            captured["prompt"] = prompt
+            return '{"summaries":[{"commit":"abc123","summary":"big change"}]}'
+
+        commits = [
+            {
+                "hash": "abc123",
+                "short": "abc123",
+                "date": "2026-01-01",
+                "author": "A",
+                "email": "a@example.com",
+                "subject": "rework the loop",
+            }
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            spill_dir = Path(tmp) / "commit-patches"
+            with unittest.mock.patch.object(self.mod, "git_commit_file_patch", fake_patch), \
+                unittest.mock.patch.object(self.mod, "generate_text", fake_generate):
+                summaries = self.mod.summarize_new_file_commits(
+                    Path("/repo"), "src/loop.c", commits, "anthropic", "claude-opus-5", spill_dir
+                )
+            written = list(spill_dir.glob("*.patch"))
+            self.assertEqual(len(written), 1)
+            self.assertIn("+x", written[0].read_text(encoding="utf-8"))
+            self.assertEqual(len(written[0].read_text(encoding="utf-8")), len(fake_patch(None, None, None)))
+            self.assertIn(str(written[0]), captured["prompt"])
+        self.assertEqual(summaries, {"abc123": "big change"})
+        # The subject is still there to summarize from, and the prompt says the
+        # diff is elsewhere rather than presenting a fragment as the diff.
+        self.assertIn("rework the loop", captured["prompt"])
+        self.assertIn("too large to include here", captured["prompt"])
+        self.assertIn("do not invent its contents", captured["prompt"])
+        self.assertNotIn("+x\n" * 100, captured["prompt"])
+
+    def test_oversized_commit_diff_without_a_spill_dir_names_the_command(self):
+        def fake_patch(repo_root, commit_hash, rel_path):
+            return "+y\n" * 9000
+
+        captured = {}
+
+        def fake_generate(prompt, provider, model):
+            captured["prompt"] = prompt
+            return "{}"
+
+        commits = [
+            {
+                "hash": "def456",
+                "short": "def456",
+                "date": "2026-01-01",
+                "author": "B",
+                "email": "b@example.com",
+                "subject": "s",
+            }
+        ]
+        with unittest.mock.patch.object(self.mod, "git_commit_file_patch", fake_patch), \
+            unittest.mock.patch.object(self.mod, "generate_text", fake_generate):
+            self.mod.summarize_new_file_commits(
+                Path("/repo"), "f.c", commits, "anthropic", "claude-opus-5"
+            )
+        self.assertIn("git -C /repo show def456 -- f.c", captured["prompt"])
+
+    def test_compact_spills_bulk_output_before_the_model_sees_it(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "conversations").mkdir()
+            conversation = root / "conversations" / "conv"
+            huge = "build log line\n" * 3000
+            conversation.write_text(
+                "<initial_context>\nrules\n</initial_context>\n"
+                f"<nagent-shell-result>\nexit_code: 0\nstdout:\n{huge}</nagent-shell-result>\n",
+                encoding="utf-8",
+            )
+            (root / "prompts").mkdir()
+            (root / "prompts" / "compact-conversation.md").write_text("Compact it.", encoding="utf-8")
+
+            seen = {}
+
+            def fake_edit(conv_file, *args, **kwargs):
+                # What the compacting model is handed.
+                seen["text"] = conv_file.read_text(encoding="utf-8")
+                seen["prompt"] = args[6] if len(args) > 6 else kwargs.get("prompt", "")
+                return 0
+
+            with unittest.mock.patch.object(self.mod, "edit_conversation", fake_edit):
+                code = self.mod.compact_conversation(
+                    conversation, root, NAGENT.resolve(), "user", "conv", "4242",
+                    None, "anthropic", "claude-opus-5", None, json_mode=True,
+                )
+
+            self.assertEqual(code, 0)
+            # The bulk is gone from the conversation and intact in a file.
+            self.assertNotIn(huge, seen["text"])
+            self.assertIn("output=", seen["text"])
+            outputs = list(self.mod.conversation_outputs_dir(conversation).glob("*"))
+            self.assertEqual(len(outputs), 1)
+            self.assertIn(huge, outputs[0].read_text(encoding="utf-8"))
+            # And the model is told not to turn a pointer into a description.
+            self.assertIn("Keep those", seen["prompt"])
+            self.assertIn("never replace one with a description", seen["prompt"])
 
     def test_call_llm_reports_a_truncated_turn_with_its_stop_reason(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -890,7 +1421,7 @@ class ActionTests(unittest.TestCase):
             with tempfile.TemporaryDirectory() as tmp:
                 conv = Path(tmp) / "conv"
                 conv.write_text("", encoding="utf-8")
-                tags, _ignored, err = self.mod.parse_response(turn)
+                tags, _ignored, err, _fab = self.mod.parse_response(turn)
                 self.assertIsNone(err)
                 _resp, next_prompts, _cont = self.mod.process_tags(
                     tags, conv, Path(tmp), None, NAGENT, "pid", self.mod.TokenStats()
@@ -1139,7 +1670,7 @@ class ActionTests(unittest.TestCase):
             root = Path(tmp)
             conversation = root / "conversation"
             conversation.write_text("", encoding="utf-8")
-            tags, _ignored, err = self.mod.parse_response(
+            tags, _ignored, err, _fab = self.mod.parse_response(
                 '<nagent-file-patch index="/tmp/nonexistent-index.json" />'
             )
             self.assertIsNone(err)
@@ -1165,18 +1696,27 @@ class ActionTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             config = Path(tmp) / "config.json"
             config.write_text(
-                json.dumps({"hook_per_run": "cfg-run", "hook_per_file_edit": ""}),
+                json.dumps(
+                    {
+                        "hook_per_run": "cfg-run",
+                        "hook_per_file_edit": "",
+                        "hook_per_response": "cfg-gate",
+                    }
+                ),
                 encoding="utf-8",
             )
-            # Config supplies per-run; empty per-file-edit string means disabled.
-            self.assertEqual(self.mod.resolve_hooks(None, None, config), ("cfg-run", None))
-            # CLI wins over config.
+            # Config supplies per-run and the gate; empty string means disabled.
             self.assertEqual(
-                self.mod.resolve_hooks("cli-run", "cli-edit", config), ("cli-run", "cli-edit")
+                self.mod.resolve_hooks(None, None, config), ("cfg-run", None, "cfg-gate")
             )
-            # No CLI, no config file at all -> both disabled.
+            # CLI wins over config, for all three.
             self.assertEqual(
-                self.mod.resolve_hooks(None, None, Path(tmp) / "missing.json"), (None, None)
+                self.mod.resolve_hooks("cli-run", "cli-edit", config, "cli-gate"),
+                ("cli-run", "cli-edit", "cli-gate"),
+            )
+            # No CLI, no config file at all -> all disabled.
+            self.assertEqual(
+                self.mod.resolve_hooks(None, None, Path(tmp) / "missing.json"), (None, None, None)
             )
 
     def test_default_pid_prefers_screen_window(self):
@@ -1536,11 +2076,13 @@ class ActionTests(unittest.TestCase):
             recursive_output_tokens=40,
             recursive_cache_read_tokens=120,
             recursive_cache_write_tokens=25,
+            stripped_turns=1,
+            fabricated_turns=1,
         )
         self.assertEqual(
             stats.status_line(),
             "[Turns:2 Conversation-Tokens:100 Tokens-In:150 Tokens-Out:40 "
-            "Cache-Read:120 Cache-Write:25]",
+            "Cache-Read:120 Cache-Write:25 Stripped:1 Fabricated:1]",
         )
 
     def test_call_llm_wait_spinner_names_provider_and_model(self):
@@ -1609,7 +2151,7 @@ class ActionTests(unittest.TestCase):
                 [
                     "done",
                     "[Turns:2 Conversation-Tokens:100 Tokens-In:150 Tokens-Out:40 "
-                    "Cache-Read:0 Cache-Write:0]",
+                    "Cache-Read:0 Cache-Write:0 Stripped:0 Fabricated:0]",
                 ],
             )
 
@@ -2016,7 +2558,7 @@ class ActionTests(unittest.TestCase):
                 [
                     "summary ok",
                     "[Turns:1 Conversation-Tokens:5 Tokens-In:30 Tokens-Out:4 "
-                    "Cache-Read:0 Cache-Write:0]",
+                    "Cache-Read:0 Cache-Write:0 Stripped:0 Fabricated:0]",
                 ],
             )
 
@@ -3420,6 +3962,96 @@ class NagentLlmConfigTests(unittest.TestCase):
         self.assertEqual(result.text, "ok")
         self.assertEqual(captured["max_tokens"], self.mod.ANTHROPIC_MAX_OUTPUT_TOKENS)
         self.assertGreater(self.mod.ANTHROPIC_MAX_OUTPUT_TOKENS, 8192)
+
+    def test_stop_sequences_stop_the_model_at_nagent_s_own_output(self):
+        # Belt and braces with the loop-side cut: the loop refuses to act on what
+        # follows a fabrication, this stops the provider generating it at all.
+        captured: dict = {}
+        fake = self._fake_anthropic(captured, blocks=[self._text_block("ok")])
+        with unittest.mock.patch.object(self.mod, "require_package", return_value=fake):
+            self.mod.generate_text_with_usage("hi", "anthropic", "claude-opus-5")
+        self.assertEqual(captured["stop_sequences"], self.mod.DRIVER_OUTPUT_STOP_SEQUENCES)
+        # Anthropic permits four; exceeding it is a 400.
+        self.assertLessEqual(len(self.mod.DRIVER_OUTPUT_STOP_SEQUENCES), 4)
+        self.assertIn("<nagent-shell-result", self.mod.DRIVER_OUTPUT_STOP_SEQUENCES)
+        self.assertIn("<nagent-turn-status", self.mod.DRIVER_OUTPUT_STOP_SEQUENCES)
+
+    def test_openrouter_forwards_cache_control_to_anthropic_models_only(self):
+        # Issue 0003 question 3: which providers can actually honour the boundary.
+        self.assertTrue(self.mod._forwards_anthropic_cache_control("anthropic/claude-opus-5"))
+        self.assertTrue(self.mod._forwards_anthropic_cache_control("anthropic/claude-fable-5.1"))
+        for other in ("openai/gpt-5.5", "google/gemini-2.5-flash", "stealth/ox-alpha"):
+            self.assertFalse(self.mod._forwards_anthropic_cache_control(other))
+
+        captured: dict = {}
+        with unittest.mock.patch.object(
+            self.mod, "require_package", return_value=self._fake_stream([self._chunk(content="ok")], captured)
+        ), unittest.mock.patch.dict(os.environ, {"OPENROUTER_API_KEY": "k"}, clear=False):
+            self.mod.generate_text_with_usage(
+                "s" * 100, "openrouter", "anthropic/claude-opus-5", cache_boundaries=[30, 60]
+            )
+        content = captured["messages"][0]["content"]
+        self.assertIsInstance(content, list)
+        self.assertEqual(len(content), 3)
+        self.assertEqual(content[0]["cache_control"], {"type": "ephemeral"})
+        self.assertEqual("".join(b["text"] for b in content), "s" * 100)
+
+        # A non-Anthropic model on the same provider gets a plain string: an
+        # unsupported block shape is a 400, and a silent miss is no better.
+        captured.clear()
+        with unittest.mock.patch.object(
+            self.mod, "require_package", return_value=self._fake_stream([self._chunk(content="ok")], captured)
+        ), unittest.mock.patch.dict(os.environ, {"OPENROUTER_API_KEY": "k"}, clear=False):
+            self.mod.generate_text_with_usage(
+                "s" * 100, "openrouter", "openai/gpt-5.5", cache_boundaries=[30, 60]
+            )
+        self.assertEqual(captured["messages"][0]["content"], "s" * 100)
+
+    def test_openai_compatible_stream_also_stops_at_driver_output(self):
+        _result, captured = self._stream_result([self._chunk(content="ok")])
+        self.assertEqual(captured["stop"], self.mod.DRIVER_OUTPUT_STOP_SEQUENCES)
+
+    def test_a_dangling_partial_stop_sequence_is_trimmed(self):
+        # Measured live: Together halted on <nagent-shell-result but had already
+        # emitted "<nagent-shell". Left in, that is a known tag name with no ">",
+        # so the parser hard-errors and the whole turn — including the real action
+        # before it — is discarded. Stopping the fabrication would cost more than
+        # allowing it.
+        strip = self.mod.strip_trailing_stop_prefix
+        self.assertEqual(
+            strip("<nagent-shell>seq 1 3</nagent-shell>\n<nagent-shell"),
+            "<nagent-shell>seq 1 3</nagent-shell>\n",
+        )
+        self.assertEqual(strip("done <"), "done ")
+        self.assertEqual(strip("done <nagent-turn"), "done ")
+        # A complete tag is never touched.
+        self.assertEqual(
+            strip("<nagent-shell>ls</nagent-shell>"), "<nagent-shell>ls</nagent-shell>"
+        )
+        self.assertEqual(strip("plain text"), "plain text")
+        # The whole stop sequence, if a provider ever includes it, is left alone:
+        # the loop's own cut handles that, and trimming it would hide a real
+        # fabrication from the counters.
+        self.assertEqual(strip("x<nagent-shell-result"), "x<nagent-shell-result")
+
+    def test_the_trimmed_turn_parses_as_the_action_alone(self):
+        # The end-to-end property: the fabrication never arrives, the real action
+        # survives, and the loop sees a clean turn rather than a parse error.
+        text = self.mod.strip_trailing_stop_prefix("<nagent-shell>seq 1 3</nagent-shell>\n<nagent-shell")
+        nagent = load_nagent_module()
+        tags, _ignored, err, fab = nagent.parse_response(text)
+        self.assertIsNone(err)
+        self.assertIsNone(fab)
+        self.assertEqual([t.kind for t in tags], ["shell"])
+        self.assertEqual(tags[0].content, "seq 1 3")
+
+    def test_a_stop_sequence_hit_is_not_reported_as_truncation(self):
+        # The model said all it was entitled to say. Calling that a length limit
+        # would send the loop's truncation note, which would be a lie.
+        self.assertFalse(self.mod.output_was_truncated("stop_sequence"))
+        self.assertIn("stop_sequence", self.mod.STOP_SEQUENCE_STOP_REASONS)
+        fab = self.mod.TRUNCATION_STOP_REASONS & self.mod.STOP_SEQUENCE_STOP_REASONS
+        self.assertEqual(fab, frozenset())
 
     def test_anthropic_reports_the_stop_reason_and_whether_it_truncated(self):
         captured: dict = {}
