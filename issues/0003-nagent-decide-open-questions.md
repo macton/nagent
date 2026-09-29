@@ -1,6 +1,6 @@
 # 0003 — nagent-decide / nagent-classify: open questions
 
-Status: open
+Status: resolved 2026-09-28 — 2, 3 and 4 answered; 1 answered as 'not knowable yet' and documented as such
 Filed: 2026-09-22
 Area: `bin/nagent-decide`, `bin/nagent-classify`, and their `_lib.py` files
 
@@ -77,3 +77,84 @@ exercises the path live, and its results are committed under `runs/`.
 
 **What would settle it:** if the CLI grows any logic between `load_request` and
 `decide`, the calculus changes and the seam is worth adding.
+
+---
+
+# Resolutions — 2026-09-28
+
+## 1. `confidence` — measured, and it cannot be calibrated from what exists
+
+Scored every answer in the committed `examples/monitor-github/runs/` against
+`expected.json`, reusing that example's own matcher so the comparison is the one
+the example makes (`tests/live/decide_confidence_calibration.py`, which spends
+nothing). 68 answers carry a confidence value:
+
+    low (<0.90)         1/1   correct
+    mid (0.90-0.96)    22/23  correct  (96%)
+    high (>=0.97)      44/44  correct  (100%)
+
+The buckets are ordered the right way and that is all that can be said, because
+there is exactly **one** wrong answer in the whole corpus. An ordering resting on
+n=1 is not calibration, and quoting those percentages as if it were would be the
+precise failure this issue was filed to avoid.
+
+So the field keeps its name and its default, and the docs now say what is true:
+`nagent_decide_lib`'s header carries **DO NOT THRESHOLD ON IT**, this measurement,
+and the fact that `"confidence": false` drops it. That is the "rename it so no one
+thresholds on it" branch, executed as documentation rather than a rename, because
+the name is accurate — it is the model's confidence — and only its authority was
+ever in question. Settling it properly still needs the example requests run enough
+times to accumulate tens of errors; the script is there to re-run when they are.
+
+## 2. Batch size — measured to 50 items, no positional decay
+
+`tests/live/decide_batch_scaling.py` against `anthropic/claude-opus-5`: the same
+question set at 5, 10, 25 and 50 items, with known answers, scored by quarter of
+the batch, at two difficulties. The easy variant states its own answer, so a miss
+can only be inattention; the hard variant needs arithmetic and an elimination, so
+a miss is a real error.
+
+    easy  5/5  10/10  25/25  50/50     every quarter clean
+    hard  5/5  10/10  25/25  50/50     every quarter clean
+
+180/180. Nothing suggests a late item is answered more carelessly at these sizes,
+so no chunk size is introduced — a hidden one was never wanted and a caller-visible
+one has nothing to fix. What remains unknown is above 50 and on weaker models; the
+script takes a model argument and a caller with 200 rows should run it before
+trusting the answer, which is a cheaper habit than a parameter nobody tuned.
+
+## 3. Cache boundary — answered per provider, and one of them now honours it
+
+- **openrouter**: forwards `cache_control` on content blocks to Anthropic-family
+  models. Measured 2026-09-28 against `anthropic/claude-opus-5` on a 12572-token
+  conversation — no markers read 0 tokens, a marker at the context boundary read
+  7917, all three read 12570. So it is implemented:
+  `_forwards_anthropic_cache_control(model)` gates it on the `anthropic/` prefix,
+  and any other model on that provider gets a plain string rather than a block
+  shape its upstream may reject.
+- **openai**: no breakpoint control exists. It caches long prompt prefixes
+  automatically, so the only thing that buys a hit is the stable-first ordering
+  `render_prompt` already produces. The offset is computed and dropped, which costs
+  nothing; the comment in `nagent_llm.py` now says so instead of leaving it
+  looking like an oversight.
+- **together**: exposes no prefix-cache control on its wire format. Nothing to
+  mark, and the comment says that rather than "ignored".
+
+So the answer to "whether they expose a prefix-cache control" is: one of the three
+does, it is wired up and measured, and the other two are documented with the reason.
+
+## 4. CLI provider seam — covered, with no production seam added
+
+The question was whether covering the executable's real `generate_text_with_usage`
+call requires a provider-injection seam in production code. It does not. The test
+now loads `bin/nagent-decide` as a module and patches the symbol *it* imported,
+which is a test-only concern and leaves the executable exactly as shipped
+(`CliProviderSeamTests`). Two tests: that the CLI forwards provider, model,
+reasoning and the cache boundary, and that a provider exception becomes
+`EXIT_PROVIDER`.
+
+The trigger this issue named — "if the CLI grows any logic between `load_request`
+and `decide`" — had in fact been met (the empty-batch short-circuit and
+`--prompt-out` both sit there), which is a second reason not to have left the line
+uncovered. The boundary assertion also pins what the ordering is *for*: the
+evidence lands before the offset and the items after it.

@@ -1,10 +1,13 @@
 #!/usr/bin/python3
 
+import contextlib
+import io
 import json
 import subprocess
 import sys
 import tempfile
 import unittest
+import unittest.mock
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -26,6 +29,25 @@ from nagent_decide_lib import (  # noqa: E402
     validate_answers,
     validate_request,
 )
+
+
+def load_decide_cli():
+    """bin/nagent-decide as an importable module.
+
+    Issue 0003 question 4 asked whether covering the CLI's real
+    generate_text_with_usage call needs a provider-injection seam in production
+    code. It does not: loading the executable here and patching the symbol it
+    imported is a test-only concern, and it leaves the executable exactly as
+    shipped. So the line is covered and nothing was added to production for it.
+    """
+    import importlib.machinery
+    import importlib.util
+
+    loader = importlib.machinery.SourceFileLoader("nagent_decide_cli", str(NAGENT_DECIDE))
+    spec = importlib.util.spec_from_loader("nagent_decide_cli", loader)
+    module = importlib.util.module_from_spec(spec)
+    loader.exec_module(module)
+    return module
 
 
 class FakeResult:
@@ -943,3 +965,94 @@ class ToolDiscoveryTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class CliProviderSeamTests(unittest.TestCase):
+    """The one line tests/test_nagent_decide.py used not to reach: the CLI's real
+    call into the provider, and what it forwards."""
+
+    def test_the_cli_forwards_provider_model_reasoning_and_the_cache_boundary(self):
+        mod = load_decide_cli()
+        request = {
+            "context": "the build is red",
+            "questions": {
+                "act": {
+                    "question": "What should happen?",
+                    "type": "choice",
+                    "options": {"fix": "fix it forward", "revert": "revert the commit"},
+                }
+            },
+            "items": [{"id": "i1", "context": "commit abc"}],
+        }
+        captured = {}
+
+        def fake_generate(text, provider, model, cache_boundaries=None, reasoning=None):
+            captured.update(
+                text=text, provider=provider, model=model,
+                cache_boundaries=cache_boundaries, reasoning=reasoning,
+            )
+            return FakeResult(
+                json.dumps(
+                    {"decisions": [{"item": "i1", "answers": {"act": {"choice": "fix"}}}]}
+                )
+            )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "req.json"
+            path.write_text(json.dumps(request), encoding="utf-8")
+            with unittest.mock.patch.object(mod, "generate_text_with_usage", fake_generate), \
+                unittest.mock.patch.object(
+                    mod, "resolve_from_args", lambda args: ("anthropic", "claude-opus-5")
+                ), \
+                unittest.mock.patch.object(mod, "reasoning_value_from_args", lambda args: 3), \
+                unittest.mock.patch.object(sys, "argv", ["nagent-decide", "--input", str(path)]), \
+                contextlib.redirect_stdout(io.StringIO()) as out:
+                code = mod.main()
+
+        self.assertEqual(code, 0)
+        self.assertEqual(captured["provider"], "anthropic")
+        self.assertEqual(captured["model"], "claude-opus-5")
+        self.assertEqual(captured["reasoning"], 3)
+        # The boundary really is the end of the stable section, with the items
+        # after it — the ordering the whole prompt layout exists to produce.
+        (boundary,) = captured["cache_boundaries"]
+        self.assertEqual(captured["text"][:boundary], render_prompt(load_request(json.dumps(request)))[0][:boundary])
+        self.assertIn("the build is red", captured["text"][:boundary])
+        self.assertIn("commit abc", captured["text"][boundary:])
+        payload = json.loads(out.getvalue())
+        self.assertEqual(payload["provider"], "anthropic")
+        self.assertEqual(payload["decisions"][0]["item"], "i1")
+        self.assertEqual(payload["decisions"][0]["answers"]["act"]["choice"], "fix")
+
+    def test_a_provider_failure_becomes_the_provider_exit_code(self):
+        mod = load_decide_cli()
+
+        def boom(*args, **kwargs):
+            raise RuntimeError("provider exploded")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "req.json"
+            path.write_text(
+                json.dumps(
+                    {
+                        "questions": {
+                            "q": {
+                                "question": "a or b?",
+                                "type": "choice",
+                                "options": {"a": "the first", "b": "the second"},
+                            }
+                        },
+                        "items": [{"id": "i1", "context": "something"}],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            with unittest.mock.patch.object(mod, "generate_text_with_usage", boom), \
+                unittest.mock.patch.object(
+                    mod, "resolve_from_args", lambda args: ("anthropic", "claude-opus-5")
+                ), \
+                unittest.mock.patch.object(sys, "argv", ["nagent-decide", "--input", str(path)]), \
+                contextlib.redirect_stderr(io.StringIO()) as err:
+                code = mod.main()
+        self.assertEqual(code, mod.EXIT_PROVIDER)
+        self.assertIn("provider exploded", err.getvalue())

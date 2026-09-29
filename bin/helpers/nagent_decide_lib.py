@@ -43,7 +43,12 @@ BATCH TRANSFORM CONTRACT
   Valid ranges: option names in an answer are members of that question's declared
   option set, compared exactly. `level` names are members of `levels`. `level_index`
   is the 0-based position in `levels`. `confidence` is a number in [0.0, 1.0] — a
-  model SELF-REPORT, not a calibrated or measured probability.
+  model SELF-REPORT, not a calibrated or measured probability. DO NOT THRESHOLD ON
+  IT. An attempt to calibrate it against the committed example runs
+  (tests/live/decide_confidence_calibration.py, 2026-09-28) found 68 answers
+  carrying a confidence and exactly ONE wrong answer among them, so the buckets
+  cannot separate right from wrong at that sample size — the field is not known to
+  be useful and is not known to be useless. `"confidence": false` drops it.
 
 OUT-OF-RANGE BEHAVIOUR (explicit at every boundary)
 
